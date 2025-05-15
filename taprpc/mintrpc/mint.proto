@@ -16,6 +16,24 @@ service Mint {
     */
     rpc MintAsset (MintAssetRequest) returns (MintAssetResponse);
 
+    /* tapcli `assets mint fund`
+    FundBatch will attempt to fund the current pending batch with a genesis
+    input, or create a new funded batch if no batch exists yet. This RPC is only
+    needed if a custom witness is needed to finalize the batch. Otherwise,
+    FinalizeBatch can be called directly.
+    */
+    rpc FundBatch (FundBatchRequest) returns (FundBatchResponse);
+
+    /* tapcli `assets mint seal`
+    SealBatch will attempt to seal the current pending batch by creating and
+    validating asset group witness for all assets in the batch. If a witness
+    is not provided, a signature will be derived to serve as the witness. This
+    RPC is only needed if any assets in the batch have a custom asset group key
+    that require an external signer. Otherwise, FinalizeBatch can be called
+    directly.
+    */
+    rpc SealBatch (SealBatchRequest) returns (SealBatchResponse);
+
     /* tapcli: `assets mint finalize`
     FinalizeBatch will attempt to finalize the current pending batch.
     */
@@ -31,6 +49,13 @@ service Mint {
     pending and cancelled batches.
     */
     rpc ListBatches (ListBatchRequest) returns (ListBatchResponse);
+
+    /* tapcli: `events mint`
+    SubscribeMintEvents allows a caller to subscribe to mint events for asset
+    creation batches.
+    */
+    rpc SubscribeMintEvents (SubscribeMintEventsRequest)
+        returns (stream MintEvent);
 }
 
 message PendingAsset {
@@ -61,7 +86,7 @@ message PendingAsset {
     */
     bool new_grouped_asset = 6;
 
-    // The specific group key this asset should be minted with.
+    // The specific existing group key this asset should be minted with.
     bytes group_key = 7;
 
     /*
@@ -69,6 +94,39 @@ message PendingAsset {
     This asset will be minted with the same group key as the anchor asset.
     */
     string group_anchor = 8;
+
+    /*
+    The optional key that will be used as the internal key for an asset group
+    created with this asset.
+    */
+    taprpc.KeyDescriptor group_internal_key = 9;
+
+    /*
+    The optional root of a tapscript tree that will be used when constructing a
+    new asset group key. This enables future issuance authorized with a script
+    witness.
+    */
+    bytes group_tapscript_root = 10;
+
+    /*
+    The optional script key to use for the new asset. If no script key is given,
+    a BIP-86 key will be derived from the underlying wallet.
+    */
+    taprpc.ScriptKey script_key = 11;
+}
+
+message UnsealedAsset {
+    // The pending asset with an unsealed asset group.
+    PendingAsset asset = 1;
+
+    // The group key request for the asset.
+    taprpc.GroupKeyRequest group_key_request = 2;
+
+    // The group virtual transaction for the asset.
+    taprpc.GroupVirtualTx group_virtual_tx = 3;
+
+    // The byte serialized PSBT equivalent of the group virtual transaction.
+    string group_virtual_psbt = 4;
 }
 
 message MintAsset {
@@ -105,7 +163,7 @@ message MintAsset {
     */
     bool grouped_asset = 7;
 
-    // The specific group key this asset should be minted with.
+    // The specific existing group key this asset should be minted with.
     bytes group_key = 8;
 
     /*
@@ -113,6 +171,73 @@ message MintAsset {
     This asset will be minted with the same group key as the anchor asset.
     */
     string group_anchor = 9;
+
+    /*
+    The optional key that will be used as the internal key for an asset group
+    created with this asset.
+
+    If this field is set then external_group_key must be unset, and vice versa.
+    */
+    taprpc.KeyDescriptor group_internal_key = 10;
+
+    /*
+    An optional root of a Tapscript tree used when constructing a new asset
+    group key. This allows for future asset issuance authorized using a
+    script witness.
+
+    If an external group key is provided, the V1 scheme for group key script
+    construction will be used, which supports PSBT signing. In this scheme,
+    the user-supplied Tapscript root is extended by two levels of Tapscript
+    siblings that commit to the group anchor's asset ID. As a result, the
+    provided Tapscript root becomes a branch within a larger Tapscript tree,
+    and the final Tapscript root will differ from the one specified here.
+    */
+    bytes group_tapscript_root = 11;
+
+    /*
+    The optional script key to use for the new asset. If no script key is given,
+    a BIP-86 key will be derived from the underlying wallet.
+    */
+    taprpc.ScriptKey script_key = 12;
+
+    /*
+    Decimal display dictates the number of decimal places to shift the amount to
+    the left converting from Taproot Asset integer representation to a
+    UX-recognizable fractional quantity.
+
+    For example, if the decimal_display value is 2 and there's 100 of those
+    assets, then a wallet would display the amount as "1.00". This field is
+    intended as information for wallets that display balances and has no impact
+    on the behavior of the daemon or any other part of the protocol. This value
+    is encoded in the MetaData field as a JSON field, therefore it is only
+    compatible with assets that have a JSON MetaData field.
+    */
+    uint32 decimal_display = 13;
+
+    /*
+    The external group key is an optional field that allows specifying an
+    external signing key for the group virtual transaction during minting.
+    This key enables signing operations to be performed externally, outside
+    the daemon.
+
+    If this field is set then group_internal_key must be unset, and vice versa.
+    */
+    taprpc.ExternalKey external_group_key = 14;
+
+    /*
+    Enabling this flag allows the creation of universe commitments for a new
+    asset group.
+
+    Universe commitments are minter-controlled, on-chain attestations that
+    anchor and verify the state of an asset group.
+
+    This flag imposes restrictions on the minting process by limiting the batch
+    to assets within the same universe, meaning they share the same group key.
+    This option is applicable only for the creation of a new asset group
+    (i.e., the first minting tranche of an asset group) and ensures that the
+    batch is limited to a single asset group.
+    */
+    bool universe_commitments = 15;
 }
 
 message MintAssetRequest {
@@ -153,6 +278,24 @@ message MintingBatch {
 
     // The assets that are part of the batch.
     repeated PendingAsset assets = 4;
+
+    // The time the batch was created as a Unix timestamp (in seconds).
+    int64 created_at = 5;
+
+    // The current height of the block chain at the time of the batch creation.
+    uint32 height_hint = 6;
+
+    // The genesis transaction as a PSBT packet. Only populated if the batch has
+    // been committed.
+    bytes batch_psbt = 7;
+}
+
+message VerboseBatch {
+    // The minting batch, without any assets.
+    MintingBatch batch = 1;
+
+    // The assets that are part of the batch.
+    repeated UnsealedAsset unsealed_assets = 2;
 }
 
 enum BatchState {
@@ -167,6 +310,63 @@ enum BatchState {
     BATCH_STATE_SPROUT_CANCELLED = 8;
 }
 
+message FundBatchRequest {
+    /*
+    If true, then the assets currently in the batch won't be returned in the
+    response. This is mainly to avoid a lot of data being transmitted and
+    possibly printed on the command line in the case of a very large batch.
+    */
+    bool short_response = 1;
+
+    // The optional fee rate to use for the minting transaction, in sat/kw.
+    uint32 fee_rate = 2;
+
+    /*
+    The optional tapscript sibling that will be used when deriving the genesis
+    output for the batch. This sibling is a tapscript tree, which allows the
+    minter to encumber future transfers of assets in the batch with Tapscript.
+    */
+    oneof batch_sibling {
+        /*
+        An ordered list of TapLeafs, which will be used to construct a
+        Tapscript tree.
+        */
+        taprpc.TapscriptFullTree full_tree = 3;
+
+        // A TapBranch that represents a Tapscript tree managed externally.
+        taprpc.TapBranch branch = 4;
+    }
+}
+
+message FundBatchResponse {
+    // The funded batch.
+    VerboseBatch batch = 1;
+}
+
+message SealBatchRequest {
+    /*
+    If true, then the assets currently in the batch won't be returned in the
+    response. This is mainly to avoid a lot of data being transmitted and
+    possibly printed on the command line in the case of a very large batch.
+    */
+    bool short_response = 1;
+
+    // The assetID, witness pairs that authorize asset membership in a group.
+    // This field should not be used in conjunction with
+    // `signed_group_virtual_psbts`; use one or the other.
+    repeated taprpc.GroupWitness group_witnesses = 2;
+
+    // The base64 encoded signed group virtual PSBTs.
+    // This field should not be used in conjunction with `group_witnesses`;
+    // use one or the other.
+    repeated string signed_group_virtual_psbts = 3;
+}
+
+message SealBatchResponse {
+    // The sealed batch.
+    MintingBatch batch = 1;
+}
+
 message FinalizeBatchRequest {
     /*
     If true, then the assets currently in the batch won't be returned in the
@@ -177,6 +377,22 @@ message FinalizeBatchRequest {
 
     // The optional fee rate to use for the minting transaction, in sat/kw.
     uint32 fee_rate = 2;
+
+    /*
+    The optional tapscript sibling that will be used when deriving the genesis
+    output for the batch. This sibling is a tapscript tree, which allows the
+    minter to encumber future transfers of assets in the batch with Tapscript.
+    */
+    oneof batch_sibling {
+        /*
+        An ordered list of TapLeafs, which will be used to construct a
+        Tapscript tree.
+        */
+        taprpc.TapscriptFullTree full_tree = 3;
+
+        // A TapBranch that represents a Tapscript tree managed externally.
+        taprpc.TapBranch branch = 4;
+    }
 }
 
 message FinalizeBatchResponse {
@@ -203,8 +419,37 @@ message ListBatchRequest {
         // encoded string (use this for REST).
         string batch_key_str = 2;
     }
+
+    // If true, pending asset group details will be included for any funded,
+    // non-empty pending batch. Unfunded or empty batches will be excluded.
+    bool verbose = 3;
 }
 
 message ListBatchResponse {
-    repeated MintingBatch batches = 1;
+    repeated VerboseBatch batches = 1;
+}
+
+message SubscribeMintEventsRequest {
+    /*
+    If true, then the assets currently in the batch won't be returned in the
+    event's batch. This is mainly to avoid a lot of data being transmitted and
+    possibly printed on the command line in the case of a very large batch.
+    */
+    bool short_response = 1;
+}
+
+message MintEvent {
+    // Execute timestamp (Unix timestamp in microseconds).
+    int64 timestamp = 1;
+
+    // The last state of the batch that was successfully executed. If error
+    // below is set, then the batch_state is the state that lead to the error
+    // during its execution.
+    BatchState batch_state = 2;
+
+    // The batch that the event is for.
+    MintingBatch batch = 3;
+
+    // An optional error, indicating that executing the batch_state failed.
+    string error = 4;
 }

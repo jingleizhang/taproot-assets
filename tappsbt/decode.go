@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcec/v2/schnorr"
@@ -15,6 +16,7 @@ import (
 	"github.com/lightninglabs/taproot-assets/address"
 	"github.com/lightninglabs/taproot-assets/asset"
 	"github.com/lightninglabs/taproot-assets/commitment"
+	"github.com/lightninglabs/taproot-assets/proof"
 	"github.com/lightningnetwork/lnd/tlv"
 )
 
@@ -50,12 +52,6 @@ func NewFromRawBytes(r io.Reader, b64 bool) (*VPacket, error) {
 // NewFromPsbt returns a new instance of a VPacket struct created by reading the
 // custom fields on the given PSBT packet.
 func NewFromPsbt(packet *psbt.Packet) (*VPacket, error) {
-	// Make sure we have the correct markers for a virtual transaction.
-	if len(packet.Unknowns) != 3 {
-		return nil, fmt.Errorf("expected 3 global unknown fields, "+
-			"got %d", len(packet.Unknowns))
-	}
-
 	// We want an explicit "isVirtual" boolean marker.
 	isVirtual, err := findCustomFieldsByKeyPrefix(
 		packet.Unknowns, PsbtKeyTypeGlobalTapIsVirtualTx,
@@ -81,17 +77,25 @@ func NewFromPsbt(packet *psbt.Packet) (*VPacket, error) {
 			"params HRP: %w", err)
 	}
 
-	// The version is currently optional, as it's not used anywhere.
-	var version uint8
+	// We also need the VPacket version.
 	versionField, err := findCustomFieldsByKeyPrefix(
 		packet.Unknowns, PsbtKeyTypeGlobalTapPsbtVersion,
 	)
-	if err == nil {
-		version = versionField.Value[0]
+	if err != nil {
+		return nil, fmt.Errorf("error finding virtual tx version: %w",
+			err)
+	}
+
+	version := versionField.Value[0]
+	switch version {
+	case uint8(V0), uint8(V1):
+	default:
+		return nil, fmt.Errorf("%w: %d", ErrInvalidVPacketVersion,
+			version)
 	}
 
 	vPkt := &VPacket{
-		Version:     version,
+		Version:     VPacketVersion(version),
 		ChainParams: chainParams,
 		Inputs:      make([]*VInput, len(packet.Inputs)),
 		Outputs:     make([]*VOutput, len(packet.Outputs)),
@@ -168,7 +172,10 @@ func (i *VInput) decode(pIn psbt.PInput) error {
 		decoder: assetDecoder(&i.asset),
 	}, {
 		key:     PsbtKeyTypeInputTapAssetProof,
-		decoder: tlvDecoder(&i.proof, tlv.DVarBytes),
+		decoder: proofDecoder(&i.Proof),
+	}, {
+		key:     PsbtKeyTypeInputAltLeaves,
+		decoder: altLeavesDecoder(&i.AltLeaves),
 	}}
 
 	for idx := range mapping {
@@ -278,12 +285,30 @@ func (o *VOutput) decode(pOut psbt.POutput, txOut *wire.TxOut) error {
 			),
 		},
 		{
-			key: PsbtKeyTypeOutputAssetVersion,
+			key: PsbtKeyTypeOutputTapAssetVersion,
 			decoder: tlvDecoder(
 				&o.AssetVersion, vOutputAssetVersionDecoder,
 			),
 		},
-	}
+		{
+			key:     PsbtKeyTypeOutputTapProofDeliveryAddress,
+			decoder: urlDecoder(&o.ProofDeliveryAddress),
+		},
+		{
+			key:     PsbtKeyTypeOutputTapAssetProofSuffix,
+			decoder: proofDecoder(&o.ProofSuffix),
+		},
+		{
+			key:     PsbtKeyTypeOutputTapAssetLockTime,
+			decoder: tlvDecoder(&o.LockTime, tlv.DUint64),
+		},
+		{
+			key:     PsbtKeyTypeOutputTapAssetRelativeLockTime,
+			decoder: tlvDecoder(&o.RelativeLockTime, tlv.DUint64),
+		}, {
+			key:     PsbtKeyTypeOutputTapAltLeaves,
+			decoder: altLeavesDecoder(&o.AltLeaves),
+		}}
 
 	for idx := range mapping {
 		unknown, err := findCustomFieldsByKeyPrefix(
@@ -309,7 +334,7 @@ func (o *VOutput) decode(pOut psbt.POutput, txOut *wire.TxOut) error {
 	return nil
 }
 
-// tlvDecoder returns a function that encodes the given byte slice using the
+// tlvDecoder returns a function that decodes the given byte slice using the
 // given TLV tlvDecoder.
 func tlvDecoder(val any, dec tlv.Decoder) decoderFunc {
 	return func(_, byteVal []byte) error {
@@ -323,6 +348,31 @@ func tlvDecoder(val any, dec tlv.Decoder) decoderFunc {
 		}
 
 		return nil
+	}
+}
+
+// proofDecoder returns a decoder function that can handle nil proofs.
+func proofDecoder(p **proof.Proof) decoderFunc {
+	return func(key, byteVal []byte) error {
+		if len(byteVal) == 0 {
+			return nil
+		}
+
+		if *p == nil {
+			*p = &proof.Proof{}
+		}
+		return (*p).Decode(bytes.NewReader(byteVal))
+	}
+}
+
+// altLeavesDecoder returns a decoder function that can handle nil alt leaves.
+func altLeavesDecoder(a *[]asset.AltLeaf[asset.Asset]) decoderFunc {
+	return func(key, byteVal []byte) error {
+		if len(byteVal) == 0 {
+			return nil
+		}
+
+		return tlvDecoder(a, asset.AltLeavesDecoder)(key, byteVal)
 	}
 }
 
@@ -462,4 +512,18 @@ func vOutputAssetVersionDecoder(r io.Reader, val any, buf *[8]byte,
 		return nil
 	}
 	return tlv.NewTypeForDecodingErr(val, "VOutputAssetVersion", 8, l)
+}
+
+// urlDecoder returns a decoder function that can handle nil URLs.
+func urlDecoder(u **url.URL) decoderFunc {
+	return func(key, byteVal []byte) error {
+		if len(byteVal) == 0 {
+			return nil
+		}
+
+		if *u == nil {
+			*u = &url.URL{}
+		}
+		return tlvDecoder(*u, asset.UrlDecoder)(key, byteVal)
+	}
 }

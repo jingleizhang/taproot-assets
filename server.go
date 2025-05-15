@@ -9,20 +9,41 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/btcsuite/btcd/btcutil"
+	"github.com/btcsuite/btcd/chaincfg/chainhash"
+	"github.com/btcsuite/btcd/wire"
 	proxy "github.com/grpc-ecosystem/grpc-gateway/v2/runtime"
 	"github.com/lightninglabs/lndclient"
+	"github.com/lightninglabs/taproot-assets/address"
 	"github.com/lightninglabs/taproot-assets/fn"
 	"github.com/lightninglabs/taproot-assets/monitoring"
-	"github.com/lightninglabs/taproot-assets/perms"
+	"github.com/lightninglabs/taproot-assets/rfqmsg"
 	"github.com/lightninglabs/taproot-assets/rpcperms"
+	"github.com/lightninglabs/taproot-assets/tapchannel"
+	cmsg "github.com/lightninglabs/taproot-assets/tapchannelmsg"
 	"github.com/lightninglabs/taproot-assets/taprpc"
 	"github.com/lightningnetwork/lnd"
 	"github.com/lightningnetwork/lnd/build"
+	"github.com/lightningnetwork/lnd/channeldb"
+	lfn "github.com/lightningnetwork/lnd/fn/v2"
+	"github.com/lightningnetwork/lnd/funding"
+	"github.com/lightningnetwork/lnd/htlcswitch"
+	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/lncfg"
 	"github.com/lightningnetwork/lnd/lnrpc"
+	"github.com/lightningnetwork/lnd/lntypes"
+	"github.com/lightningnetwork/lnd/lnutils"
+	"github.com/lightningnetwork/lnd/lnwallet"
+	lnwl "github.com/lightningnetwork/lnd/lnwallet"
+	"github.com/lightningnetwork/lnd/lnwallet/chancloser"
+	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/macaroons"
+	"github.com/lightningnetwork/lnd/msgmux"
+	"github.com/lightningnetwork/lnd/sweep"
+	"github.com/lightningnetwork/lnd/tlv"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/keepalive"
+	"google.golang.org/protobuf/proto"
 	"gopkg.in/macaroon-bakery.v2/bakery"
 )
 
@@ -32,6 +53,12 @@ import (
 type Server struct {
 	started  int32
 	shutdown int32
+
+	// ready is a channel that is closed once the server is ready to do its
+	// work.
+	ready chan bool
+
+	chainParams *address.ChainParams
 
 	cfg *Config
 
@@ -43,11 +70,19 @@ type Server struct {
 }
 
 // NewServer creates a new server given the passed config.
-func NewServer(cfg *Config) *Server {
+func NewServer(chainParams *address.ChainParams, cfg *Config) *Server {
 	return &Server{
-		cfg:  cfg,
-		quit: make(chan struct{}, 1),
+		chainParams: chainParams,
+		cfg:         cfg,
+		ready:       make(chan bool),
+		quit:        make(chan struct{}, 1),
 	}
+}
+
+// UpdateConfig updates the server's configuration. This MUST be called before
+// the server is started.
+func (s *Server) UpdateConfig(cfg *Config) {
+	s.cfg = cfg
 }
 
 // initialize creates and initializes an instance of the macaroon service and
@@ -57,12 +92,20 @@ func NewServer(cfg *Config) *Server {
 //
 // NOTE: the rpc server is not registered with any grpc server in this function.
 func (s *Server) initialize(interceptorChain *rpcperms.InterceptorChain) error {
+	var ready bool
+
+	// If by the time this function exits we haven't yet given the ready
+	// signal, we detect it here and signal that the daemon should quit.
+	defer func() {
+		if !ready {
+			close(s.quit)
+		}
+	}()
+
 	// Show version at startup.
 	srvrLog.Infof("Version: %s, build=%s, logging=%s, "+
-		"debuglevel=%s", Version(), build.Deployment,
-		build.LoggingType, s.cfg.DebugLevel)
-
-	srvrLog.Infof("Active network: %v", s.cfg.ChainParams.Name)
+		"debuglevel=%s, active_network=%v", Version(), build.Deployment,
+		build.LoggingType, s.cfg.DebugLevel, s.cfg.ChainParams.Name)
 
 	// Depending on how far we got in initializing the server, we might need
 	// to clean up certain services that were already started. Keep track of
@@ -72,12 +115,12 @@ func (s *Server) initialize(interceptorChain *rpcperms.InterceptorChain) error {
 		for serviceName, shutdownFn := range shutdownFuncs {
 			if err := shutdownFn(); err != nil {
 				srvrLog.Errorf("Error shutting down %s "+
-					"service: %w", serviceName, err)
+					"service: %v", serviceName, err)
 			}
 		}
 	}()
 
-	// If we're usign macaroons, then go ahead and instantiate the main
+	// If we're using macaroons, then go ahead and instantiate the main
 	// macaroon service.
 	if !s.cfg.RPCConfig.NoMacaroons {
 		var err error
@@ -89,12 +132,12 @@ func (s *Server) initialize(interceptorChain *rpcperms.InterceptorChain) error {
 				Checkers: []macaroons.Checker{
 					macaroons.IPLockChecker,
 				},
-				RequiredPerms: perms.RequiredPermissions,
+				RequiredPerms: taprpc.RequiredPermissions,
 			},
 		)
 		if err != nil {
 			return fmt.Errorf("unable to create macaroon "+
-				"service: %v", err)
+				"service: %w", err)
 		}
 		rpcsLog.Infof("Validating RPC requests based on macaroon "+
 			"at: %v", s.cfg.MacaroonPath)
@@ -114,7 +157,7 @@ func (s *Server) initialize(interceptorChain *rpcperms.InterceptorChain) error {
 
 			// Register all our known permission with the macaroon
 			// service.
-			for method, ops := range perms.RequiredPermissions {
+			for method, ops := range taprpc.RequiredPermissions {
 				err := interceptorChain.AddPermission(
 					method, ops,
 				)
@@ -132,44 +175,69 @@ func (s *Server) initialize(interceptorChain *rpcperms.InterceptorChain) error {
 		s.cfg.SignalInterceptor, interceptorChain, s.cfg,
 	)
 	if err != nil {
-		return fmt.Errorf("unable to create rpc server: %v", err)
+		return fmt.Errorf("unable to create rpc server: %w", err)
 	}
 
 	// First, we'll start the main batched asset minter.
 	if err := s.cfg.AssetMinter.Start(); err != nil {
-		return fmt.Errorf("unable to start asset minter: %v", err)
+		return fmt.Errorf("unable to start asset minter: %w", err)
 	}
 
 	// Next, we'll start the asset custodian.
 	if err := s.cfg.AssetCustodian.Start(); err != nil {
-		return fmt.Errorf("unable to start asset custodian: %v", err)
+		return fmt.Errorf("unable to start asset custodian: %w", err)
 	}
 
 	if err := s.cfg.ReOrgWatcher.Start(); err != nil {
-		return fmt.Errorf("unable to start re-org watcher: %v", err)
+		return fmt.Errorf("unable to start re-org watcher: %w", err)
 	}
 
 	if err := s.cfg.ChainPorter.Start(); err != nil {
-		return fmt.Errorf("unable to start chain porter: %v", err)
+		return fmt.Errorf("unable to start chain porter: %w", err)
 	}
 
 	if err := s.cfg.UniverseFederation.Start(); err != nil {
 		return fmt.Errorf("unable to start universe "+
-			"federation: %v", err)
+			"federation: %w", err)
 	}
 
-	if s.cfg.UniversePublicAccess {
-		err := s.cfg.UniverseFederation.SetAllowPublicAccess()
+	// Start the request for quote (RFQ) manager.
+	if err := s.cfg.RfqManager.Start(); err != nil {
+		return fmt.Errorf("unable to start RFQ manager: %w", err)
+	}
+
+	// Start the auxiliary components.
+	if err := s.cfg.AuxLeafSigner.Start(); err != nil {
+		return fmt.Errorf("unable to start aux leaf signer: %w", err)
+	}
+	if err := s.cfg.AuxFundingController.Start(); err != nil {
+		return fmt.Errorf("unable to start aux funding controller: %w",
+			err)
+	}
+	if err := s.cfg.AuxTrafficShaper.Start(); err != nil {
+		return fmt.Errorf("unable to start aux traffic shaper %w", err)
+	}
+	if err := s.cfg.AuxInvoiceManager.Start(); err != nil {
+		return fmt.Errorf("unable to start aux invoice mgr: %w", err)
+	}
+	if err := s.cfg.AuxSweeper.Start(); err != nil {
+		return fmt.Errorf("unable to start aux sweeper mgr: %w", err)
+	}
+
+	// If the server is configured to sync all assets by default, we'll set
+	// the universe federation to allow public access.
+	if s.cfg.UniFedSyncAllAssets {
+		err := s.cfg.UniverseFederation.SetConfigSyncAllAssets()
 		if err != nil {
 			return fmt.Errorf("unable to set public access "+
-				"for universe federation: %v", err)
+				"for universe federation: %w", err)
 		}
 	}
 
 	// Now we have created all dependencies necessary to populate and
 	// start the RPC server.
 	if err := s.rpcServer.Start(); err != nil {
-		return fmt.Errorf("unable to start RPC server: %v", err)
+		return fmt.Errorf("unable to start RPC server: %w", err)
 	}
 
 	// This does have no effect if starting the rpc server is the last step
@@ -181,6 +249,9 @@ func (s *Server) initialize(interceptorChain *rpcperms.InterceptorChain) error {
 	shutdownFuncs["rpcServer"] = s.rpcServer.Stop
 
 	shutdownFuncs = nil
+
+	close(s.ready)
+	ready = true
 
 	return nil
 }
@@ -223,7 +294,9 @@ func (s *Server) RunUntilShutdown(mainErrChan <-chan error) error {
 				return mkErr("unable to listen on %s: %v",
 					grpcEndpoint, err)
 			}
-			defer lis.Close()
+			defer func() {
+				_ = lis.Close()
+			}()
 
 			grpcListeners = append(
 				grpcListeners, &lnd.ListenerWithSignal{
@@ -237,7 +310,9 @@ func (s *Server) RunUntilShutdown(mainErrChan <-chan error) error {
 	serverOpts := s.cfg.GrpcServerOpts
 
 	// Get RPC endpoints which don't require macaroons.
-	macaroonWhitelist := perms.MacaroonWhitelist(
+	macaroonWhitelist := taprpc.MacaroonWhitelist(
+		s.cfg.UniversePublicAccess.IsReadAccessGranted(),
+		s.cfg.UniversePublicAccess.IsWriteAccessGranted(),
 		s.cfg.RPCConfig.AllowPublicUniProofCourier,
 		s.cfg.RPCConfig.AllowPublicStats,
 	)
@@ -382,7 +457,7 @@ func (s *Server) RunUntilShutdown(mainErrChan <-chan error) error {
 // register to an existing one.
 func (s *Server) StartAsSubserver(lndGrpc *lndclient.GrpcLndServices) error {
 	if err := s.initialize(nil); err != nil {
-		return fmt.Errorf("unable to initialize RPC server: %v", err)
+		return fmt.Errorf("unable to initialize RPC server: %w", err)
 	}
 
 	return nil
@@ -586,6 +661,26 @@ func (s *Server) Stop() error {
 		return err
 	}
 
+	if err := s.cfg.RfqManager.Stop(); err != nil {
+		return err
+	}
+
+	if err := s.cfg.AuxLeafSigner.Stop(); err != nil {
+		return err
+	}
+	if err := s.cfg.AuxFundingController.Stop(); err != nil {
+		return err
+	}
+	if err := s.cfg.AuxTrafficShaper.Stop(); err != nil {
+		return err
+	}
+	if err := s.cfg.AuxInvoiceManager.Stop(); err != nil {
+		return err
+	}
+	if err := s.cfg.AuxSweeper.Stop(); err != nil {
+		return err
+	}
+
 	if s.macaroonService != nil {
 		err := s.macaroonService.Stop()
 		if err != nil {
@@ -598,4 +693,505 @@ func (s *Server) Stop() error {
 	s.wg.Wait()
 
 	return nil
+}
+
+// A compile-time check to ensure that Server fully implements the
+// lnwallet.AuxLeafStore, lnd.AuxDataParser, lnwallet.AuxSigner,
+// msgmux.Endpoint, funding.AuxFundingController, htlcswitch.AuxTrafficShaper
+// and chancloser.AuxChanCloser interfaces.
+var _ lnwl.AuxLeafStore = (*Server)(nil)
+var _ lnd.AuxDataParser = (*Server)(nil)
+var _ lnwl.AuxSigner = (*Server)(nil)
+var _ msgmux.Endpoint = (*Server)(nil)
+var _ funding.AuxFundingController = (*Server)(nil)
+var _ htlcswitch.AuxTrafficShaper = (*Server)(nil)
+var _ chancloser.AuxChanCloser = (*Server)(nil)
+var _ lnwl.AuxContractResolver = (*Server)(nil)
+var _ sweep.AuxSweeper = (*Server)(nil)
+
+// waitForReady blocks until the server is ready to serve requests. If the
+// server is shutting down before we ever become ready, an error is returned.
+func (s *Server) waitForReady() error {
+	// We just need to wait for the server to be ready (but not block
+	// shutdown in case of a startup error). If we shut down after passing
+	// this part of the code, the called component will handle the quit
+	// signal.
+
+	// In order to give priority to the quit signal, we wrap the blocking
+	// select so that we give a chance to the quit signal to be read first.
+	// This is needed as there is currently no wait to un-set the ready
+	// signal, so we would have a race between the 2 channels.
+	select {
+	case <-s.quit:
+		return fmt.Errorf("tapd is shutting down")
+
+	default:
+		// We now wait for either signal to be provided.
+		select {
+		case <-s.ready:
+			return nil
+		case <-s.quit:
+			return fmt.Errorf("tapd is shutting down")
+		}
+	}
+}
+
+// FetchLeavesFromView attempts to fetch the auxiliary leaves that correspond to
+// the passed aux blob, and pending fully evaluated HTLC view.
+//
+// NOTE: This method is part of the lnwallet.AuxLeafStore interface.
+func (s *Server) FetchLeavesFromView(
+	in lnwl.CommitDiffAuxInput) lfn.Result[lnwl.CommitDiffAuxResult] {
+
+	srvrLog.Debugf("FetchLeavesFromView called, whoseCommit=%v, "+
+		"ourBalance=%v, theirBalance=%v, numOurUpdates=%d, "+
+		"numTheirUpdates=%d", in.WhoseCommit, in.OurBalance,
+		in.TheirBalance, len(in.UnfilteredView.Updates.Local),
+		len(in.UnfilteredView.Updates.Remote))
+
+	// The aux leaf creator is fully stateless, and we don't need to wait
+	// for the server to be started before being able to use it.
+	return tapchannel.FetchLeavesFromView(s.chainParams, in)
+}
+
+// FetchLeavesFromCommit attempts to fetch the auxiliary leaves that
+// correspond to the passed aux blob, and an existing channel
+// commitment.
+//
+// NOTE: This method is part of the lnwallet.AuxLeafStore interface.
+// nolint:lll
+func (s *Server) FetchLeavesFromCommit(chanState lnwl.AuxChanState,
+	com channeldb.ChannelCommitment, keys lnwl.CommitmentKeyRing,
+	whoseCommit lntypes.ChannelParty) lfn.Result[lnwl.CommitDiffAuxResult] {
+
+	srvrLog.Debugf("FetchLeavesFromCommit called, ourBalance=%v, "+
+		"theirBalance=%v, numHtlcs=%d", com.LocalBalance,
+		com.RemoteBalance, len(com.Htlcs))
+
+	// The aux leaf creator is fully stateless, and we don't need to wait
+	// for the server to be started before being able to use it.
+	return tapchannel.FetchLeavesFromCommit(
+		s.chainParams, chanState, com, keys, whoseCommit,
+	)
+}
+
+// FetchLeavesFromRevocation attempts to fetch the auxiliary leaves
+// from a channel revocation that stores balance + blob information.
+//
+// NOTE: This method is part of the lnwallet.AuxLeafStore interface.
+func (s *Server) FetchLeavesFromRevocation(
+	r *channeldb.RevocationLog) lfn.Result[lnwl.CommitDiffAuxResult] {
+
+	srvrLog.Debugf("FetchLeavesFromRevocation called, ourBalance=%v, "+
+		"teirBalance=%v, numHtlcs=%d", r.OurBalance, r.TheirBalance,
+		len(r.HTLCEntries))
+
+	// The aux leaf creator is fully stateless, and we don't need to wait
+	// for the server to be started before being able to use it.
+	return tapchannel.FetchLeavesFromRevocation(r)
+}
+
+// ApplyHtlcView serves as the state transition function for the custom
+// channel's blob. Given the old blob, and an HTLC view, then a new
+// blob should be returned that reflects the pending updates.
+//
+// NOTE: This method is part of the lnwallet.AuxLeafStore interface.
+func (s *Server) ApplyHtlcView(
+	in lnwl.CommitDiffAuxInput) lfn.Result[lfn.Option[tlv.Blob]] {
+
+	srvrLog.Debugf("ApplyHtlcView called, whoseCommit=%v, "+
+		"ourBalance=%v, theirBalance=%v, numOurUpdates=%d, "+
+		"numTheirUpdates=%d", in.WhoseCommit, in.OurBalance,
+		in.TheirBalance, len(in.UnfilteredView.Updates.Local),
+		len(in.UnfilteredView.Updates.Remote))
+
+	// The aux leaf creator is fully stateless, and we don't need to wait
+	// for the server to be started before being able to use it.
+	return tapchannel.ApplyHtlcView(s.chainParams, in)
+}
+
+// InlineParseCustomData replaces any custom data binary blob in the given RPC
+// message with its corresponding JSON formatted data. This transforms the
+// binary (likely TLV encoded) data to a human-readable JSON representation
+// (still as byte slice).
+//
+// NOTE: This method is part of the lnd.AuxDataParser interface.
+func (s *Server) InlineParseCustomData(msg proto.Message) error {
+	srvrLog.Tracef("InlineParseCustomData called with %T", msg)
+
+	// We don't need to wait for the server to be ready here, as the
+	// following function is fully stateless.
+	return cmsg.ParseCustomChannelData(msg)
+}
+
+// Name returns the name of this endpoint. This MUST be unique across all
+// registered endpoints.
+//
+// NOTE: This method is part of the msgmux.MsgEndpoint interface.
+func (s *Server) Name() msgmux.EndpointName {
+	return tapchannel.MsgEndpointName
+}
+
+// CanHandle returns true if the target message can be routed to this endpoint.
+//
+// NOTE: This method is part of the msgmux.MsgEndpoint interface.
+func (s *Server) CanHandle(msg msgmux.PeerMsg) bool {
+	err := s.waitForReady()
+	if err != nil {
+		srvrLog.Debugf("Can't handle PeerMsg, server not ready %v",
+			err)
+		return false
+	}
+	return s.cfg.AuxFundingController.CanHandle(msg)
+}
+
+// SendMessage handles the target message, and returns true if the message was
+// able to be processed.
+//
+// NOTE: This method is part of the msgmux.MsgEndpoint interface.
+func (s *Server) SendMessage(ctx context.Context, msg msgmux.PeerMsg) bool {
+	err := s.waitForReady()
+	if err != nil {
+		srvrLog.Debugf("Failed to send PeerMsg, server not ready %v",
+			err)
+		return false
+	}
+	return s.cfg.AuxFundingController.SendMessage(ctx, msg)
+}
+
+// SubmitSecondLevelSigBatch takes a batch of aux sign jobs and processes them
+// asynchronously.
+//
+// NOTE: This method is part of the lnwallet.AuxSigner interface.
+func (s *Server) SubmitSecondLevelSigBatch(chanState lnwl.AuxChanState,
+	commitTx *wire.MsgTx, sigJob []lnwl.AuxSigJob) error {
+
+	srvrLog.Debugf("SubmitSecondLevelSigBatch called, numSigs=%d",
+		len(sigJob))
+
+	if err := s.waitForReady(); err != nil {
+		return err
+	}
+
+	return s.cfg.AuxLeafSigner.SubmitSecondLevelSigBatch(
+		chanState, commitTx, sigJob,
+	)
+}
+
+// PackSigs takes a series of aux signatures and packs them into a single blob
+// that can be sent alongside the CommitSig messages.
+//
+// NOTE: This method is part of the lnwallet.AuxSigner interface.
+func (s *Server) PackSigs(
+	blob []lfn.Option[tlv.Blob]) lfn.Result[lfn.Option[tlv.Blob]] {
+
+	srvrLog.Debugf("PackSigs called")
+
+	// We don't need to wait for the server to be ready here, as the
+	// PackSigs method is fully stateless.
+	return tapchannel.PackSigs(blob)
+}
+
+// UnpackSigs takes a packed blob of signatures and returns the original
+// signatures for each HTLC, keyed by HTLC index.
+//
+// NOTE: This method is part of the lnwallet.AuxSigner interface.
+func (s *Server) UnpackSigs(
+	blob lfn.Option[tlv.Blob]) lfn.Result[[]lfn.Option[tlv.Blob]] {
+
+	srvrLog.Debugf("UnpackSigs called")
+
+	// We don't need to wait for the server to be ready here, as the
+	// UnpackSigs method is fully stateless.
+	return tapchannel.UnpackSigs(blob)
+}
+
+// VerifySecondLevelSigs attempts to synchronously verify a batch of aux sig
+// jobs.
+//
+// NOTE: This method is part of the lnwallet.AuxSigner interface.
+func (s *Server) VerifySecondLevelSigs(chanState lnwl.AuxChanState,
+	commitTx *wire.MsgTx, verifyJob []lnwl.AuxVerifyJob) error {
+
+	srvrLog.Debugf("VerifySecondLevelSigs called")
+
+	// We don't need to wait for the server to be ready here, as the
+	// VerifySecondLevelSigs method is fully stateless.
+	return tapchannel.VerifySecondLevelSigs(
+		s.chainParams, chanState, commitTx, verifyJob,
+	)
+}
+
+// DescFromPendingChanID takes a pending channel ID, that may already be
+// known due to prior custom channel messages, and maybe returns an aux
+// funding desc which can be used to modify how a channel is funded.
+//
+// NOTE: This method is part of the funding.AuxFundingController interface.
+func (s *Server) DescFromPendingChanID(pid funding.PendingChanID,
+	chanState lnwl.AuxChanState,
+	keyRing lntypes.Dual[lnwl.CommitmentKeyRing],
+	initiator bool) funding.AuxFundingDescResult {
+
+	srvrLog.Debugf("DescFromPendingChanID called")
+
+	if err := s.waitForReady(); err != nil {
+		return lfn.Err[lfn.Option[lnwl.AuxFundingDesc]](err)
+	}
+
+	return s.cfg.AuxFundingController.DescFromPendingChanID(
+		pid, chanState, keyRing, initiator,
+	)
+}
+
+// DeriveTapscriptRoot takes a pending channel ID and maybe returns a
+// tapscript root that should be used when creating any MuSig2 sessions
+// for a channel.
+//
+// NOTE: This method is part of the funding.AuxFundingController interface.
+func (s *Server) DeriveTapscriptRoot(
+	pid funding.PendingChanID) funding.AuxTapscriptResult {
+
+	srvrLog.Debugf("DeriveTapscriptRoot called")
+
+	if err := s.waitForReady(); err != nil {
+		return lfn.Err[lfn.Option[chainhash.Hash]](err)
+	}
+
+	return s.cfg.AuxFundingController.DeriveTapscriptRoot(pid)
+}
+
+// ChannelReady is called when a channel has been fully opened and is ready to
+// be used. This can be used to perform any final setup or cleanup.
+//
+// NOTE: This method is part of the funding.AuxFundingController interface.
+func (s *Server) ChannelReady(openChan lnwl.AuxChanState) error {
+	srvrLog.Debugf("ChannelReady called")
+
+	if err := s.waitForReady(); err != nil {
+		return err
+	}
+
+	return s.cfg.AuxFundingController.ChannelReady(openChan)
+}
+
+// ChannelFinalized is called once we receive the commit sig from a remote
+// party and find it to be valid.
+//
+// NOTE: This method is part of the funding.AuxFundingController interface.
+func (s *Server) ChannelFinalized(pid funding.PendingChanID) error {
+	srvrLog.Debugf("ChannelFinalized called")
+
+	if err := s.waitForReady(); err != nil {
+		return err
+	}
+
+	return s.cfg.AuxFundingController.ChannelFinalized(pid)
+}
+
+// ShouldHandleTraffic is called in order to check if the channel identified by
+// the provided channel ID is handled by the traffic shaper implementation. If
+// it is handled by the traffic shaper, then the normal bandwidth calculation
+// can be skipped and the bandwidth returned by PaymentBandwidth should be used
+// instead.
+//
+// NOTE: This method is part of the routing.TlvTrafficShaper interface.
+func (s *Server) ShouldHandleTraffic(cid lnwire.ShortChannelID,
+	fundingBlob, htlcBlob lfn.Option[tlv.Blob]) (bool, error) {
+
+	srvrLog.Debugf("HandleTraffic called, cid=%v, fundingBlob=%v, "+
+		"htlcBlob=%v", cid, lnutils.SpewLogClosure(fundingBlob),
+		lnutils.SpewLogClosure(htlcBlob))
+
+	if err := s.waitForReady(); err != nil {
+		return false, err
+	}
+
+	return s.cfg.AuxTrafficShaper.ShouldHandleTraffic(
+		cid, fundingBlob, htlcBlob,
+	)
+}
+
+// PaymentBandwidth returns the available bandwidth for a custom channel decided
+// by the given channel aux blob and HTLC blob. A return value of 0 means there
+// is no bandwidth available. To find out if a channel is a custom channel that
+// should be handled by the traffic shaper, the HandleTraffic method should be
+// called first.
+//
+// NOTE: This method is part of the routing.TlvTrafficShaper interface.
+func (s *Server) PaymentBandwidth(fundingBlob, htlcBlob,
+	commitmentBlob lfn.Option[tlv.Blob], linkBandwidth,
+	htlcAmt lnwire.MilliSatoshi,
+	htlcView lnwallet.AuxHtlcView) (lnwire.MilliSatoshi, error) {
+
+	srvrLog.Debugf("PaymentBandwidth called, fundingBlob=%v, htlcBlob=%v, "+
+		"commitmentBlob=%v", lnutils.SpewLogClosure(fundingBlob),
+		lnutils.SpewLogClosure(htlcBlob),
+		lnutils.SpewLogClosure(commitmentBlob))
+
+	if err := s.waitForReady(); err != nil {
+		return 0, err
+	}
+
+	return s.cfg.AuxTrafficShaper.PaymentBandwidth(
+		fundingBlob, htlcBlob, commitmentBlob, linkBandwidth, htlcAmt,
+		htlcView,
+	)
+}
+
+// ProduceHtlcExtraData is a function that, based on the previous custom record
+// blob of an HTLC, may produce a different blob or modify the amount of bitcoin
+// this HTLC should carry.
+//
+// NOTE: This method is part of the routing.TlvTrafficShaper interface.
+func (s *Server) ProduceHtlcExtraData(totalAmount lnwire.MilliSatoshi,
+	htlcCustomRecords lnwire.CustomRecords) (lnwire.MilliSatoshi,
+	lnwire.CustomRecords, error) {
+
+	srvrLog.Debugf("ProduceHtlcExtraData called, totalAmount=%d, "+
+		"htlcBlob=%v", totalAmount,
+		lnutils.SpewLogClosure(htlcCustomRecords))
+
+	if err := s.waitForReady(); err != nil {
+		return 0, nil, err
+	}
+
+	return s.cfg.AuxTrafficShaper.ProduceHtlcExtraData(
+		totalAmount, htlcCustomRecords,
+	)
+}
+
+// IsCustomHTLC returns true if the HTLC carries the set of relevant custom
+// records to put it under the purview of the traffic shaper, meaning that it's
+// from a custom channel.
+//
+// NOTE: This method is part of the routing.TlvTrafficShaper interface.
+func (s *Server) IsCustomHTLC(htlcRecords lnwire.CustomRecords) bool {
+	// We don't need to wait for server ready here since this operation can
+	// be done completely stateless.
+	return rfqmsg.HasAssetHTLCCustomRecords(htlcRecords)
+}
+
+// AuxCloseOutputs returns the set of close outputs to use for this co-op close
+// attempt. We'll add some extra outputs to the co-op close transaction, and
+// also give the caller a custom sorting routine.
+//
+// NOTE: This method is part of the chancloser.AuxChanCloser interface.
+func (s *Server) AuxCloseOutputs(
+	desc chancloser.AuxCloseDesc) (lfn.Option[chancloser.AuxCloseOutputs],
+	error) {
+
+	srvrLog.Tracef("AuxCloseOutputs called, desc=%v",
+		lnutils.SpewLogClosure(desc))
+
+	if err := s.waitForReady(); err != nil {
+		return lfn.None[chancloser.AuxCloseOutputs](), err
+	}
+
+	return s.cfg.AuxChanCloser.AuxCloseOutputs(desc)
+}
+
+// ShutdownBlob returns the set of custom records that should be included in
+// the shutdown message.
+//
+// NOTE: This method is part of the chancloser.AuxChanCloser interface.
+func (s *Server) ShutdownBlob(
+	req chancloser.AuxShutdownReq) (lfn.Option[lnwire.CustomRecords],
+	error) {
+
+	srvrLog.Tracef("ShutdownBlob called, req=%v",
+		lnutils.SpewLogClosure(req))
+
+	if err := s.waitForReady(); err != nil {
+		return lfn.None[lnwire.CustomRecords](), err
+	}
+
+	return s.cfg.AuxChanCloser.ShutdownBlob(req)
+}
+
+// FinalizeClose is called once the co-op close transaction has been agreed
+// upon. We'll finalize the exclusion proofs, then send things off to the
+// custodian or porter to finish sending/receiving the proofs.
+//
+// NOTE: This method is part of the chancloser.AuxChanCloser interface.
+func (s *Server) FinalizeClose(desc chancloser.AuxCloseDesc,
+	closeTx *wire.MsgTx) error {
+
+	srvrLog.Tracef("FinalizeClose called, desc=%v, closeTx=%v",
+		lnutils.SpewLogClosure(desc), lnutils.SpewLogClosure(closeTx))
+
+	if err := s.waitForReady(); err != nil {
+		return err
+	}
+
+	return s.cfg.AuxChanCloser.FinalizeClose(desc, closeTx)
+}
+
+// ResolveContract attempts to obtain a resolution blob for the specified
+// contract.
+//
+// NOTE: This method is part of the lnwallet.AuxContractResolver interface.
+func (s *Server) ResolveContract(req lnwl.ResolutionReq) lfn.Result[tlv.Blob] {
+	srvrLog.Tracef("ResolveContract called, req=%v",
+		lnutils.SpewLogClosure(req))
+
+	if err := s.waitForReady(); err != nil {
+		return lfn.Err[tlv.Blob](err)
+	}
+
+	return s.cfg.AuxSweeper.ResolveContract(req)
+}
+
+// DeriveSweepAddr takes a set of inputs, and the change address we'd use to
+// sweep them, and maybe results in an extra sweep output that we should add to
+// the sweeping transaction.
+//
+// NOTE: This method is part of the sweep.AuxSweeper interface.
+func (s *Server) DeriveSweepAddr(inputs []input.Input,
+	change lnwl.AddrWithKey) lfn.Result[sweep.SweepOutput] {
+
+	srvrLog.Tracef("DeriveSweepAddr called, inputs=%v, change=%v",
+		lnutils.SpewLogClosure(inputs), lnutils.SpewLogClosure(change))
+
+	if err := s.waitForReady(); err != nil {
+		return lfn.Err[sweep.SweepOutput](err)
+	}
+
+	return s.cfg.AuxSweeper.DeriveSweepAddr(inputs, change)
+}
+
+// ExtraBudgetForInputs takes a set of inputs and maybe returns an extra budget
+// that should be added to the sweep transaction.
+//
+// NOTE: This method is part of the sweep.AuxSweeper interface.
+func (s *Server) ExtraBudgetForInputs(
+	inputs []input.Input) lfn.Result[btcutil.Amount] {
+
+	srvrLog.Tracef("ExtraBudgetForInputs called, inputs=%v",
+		lnutils.SpewLogClosure(inputs))
+
+	if err := s.waitForReady(); err != nil {
+		return lfn.Err[btcutil.Amount](err)
+	}
+
+	return s.cfg.AuxSweeper.ExtraBudgetForInputs(inputs)
+}
+
+// NotifyBroadcast is used to notify external callers of the broadcast of a
+// sweep transaction, generated by the passed BumpRequest.
+//
+// NOTE: This method is part of the sweep.AuxSweeper interface.
+func (s *Server) NotifyBroadcast(req *sweep.BumpRequest,
+	tx *wire.MsgTx, fee btcutil.Amount,
+	outpointToTxIndex map[wire.OutPoint]int) error {
+
+	srvrLog.Tracef("NotifyBroadcast called, req=%v, tx=%v, fee=%v, "+
+		"out_index=%v", lnutils.SpewLogClosure(req),
+		lnutils.SpewLogClosure(tx), fee,
+		lnutils.SpewLogClosure(outpointToTxIndex))
+
+	if err := s.waitForReady(); err != nil {
+		return err
+	}
+
+	return s.cfg.AuxSweeper.NotifyBroadcast(req, tx, fee, outpointToTxIndex)
 }

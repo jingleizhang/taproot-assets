@@ -73,7 +73,7 @@ type ReOrgWatcherConfig struct {
 	// NonBuriedAssetFetcher is a function that returns all assets that are
 	// not yet sufficiently deep buried.
 	NonBuriedAssetFetcher func(ctx context.Context,
-		minHeight int32) ([]*asset.Asset, error)
+		minHeight int32) ([]*asset.ChainAsset, error)
 
 	// SafeDepth is the number of confirmations we require before we
 	// consider a transaction to be safely buried in the chain.
@@ -159,12 +159,15 @@ func (w *ReOrgWatcher) Start() error {
 			locator := proof.Locator{
 				AssetID:   fn.Ptr(assets[idx].ID()),
 				ScriptKey: *assets[idx].ScriptKey.PubKey,
+				OutPoint:  &assets[idx].AnchorOutpoint,
 			}
 			blob, err := w.cfg.ProofArchive.FetchProof(ctx, locator)
 			if err != nil {
 				startErr = fmt.Errorf("unable to fetch proof "+
-					"for asset %v: %w", assets[idx].ID(),
-					err)
+					"for asset_id=%v, script_key=%x, "+
+					"outpoint=%v: %w", assets[idx].ID(),
+					locator.ScriptKey.SerializeCompressed(),
+					locator.OutPoint, err)
 				return
 			}
 
@@ -275,11 +278,16 @@ func (w *ReOrgWatcher) waitForConf(ctx context.Context, txHash chainhash.Hash,
 				// in a new block in the re-organized chain.
 
 			case err := <-errChan:
-				if !fn.IsCanceled(err) {
+				if !fn.IsRpcErr(
+					err,
+					chainntnfs.ErrChainNotifierShuttingDown,
+				) && !fn.IsCanceled(err) {
+
 					w.reportErr(fmt.Errorf("error while "+
 						"waiting for conf: %w", err))
-					return
 				}
+
+				return
 
 			case <-ctx.Done():
 				if !fn.IsCanceled(ctx.Err()) {
@@ -461,8 +469,14 @@ func (w *ReOrgWatcher) watchTransactions() {
 			}
 
 		case err := <-blockErr:
-			w.reportErr(fmt.Errorf("unable to receive new block "+
-				"notifications: %w", err))
+			if !fn.IsRpcErr(
+				err, chainntnfs.ErrChainNotifierShuttingDown,
+			) && !fn.IsCanceled(err) {
+
+				w.reportErr(fmt.Errorf("unable to receive "+
+					"new block notifications: %w", err))
+			}
+
 			return
 
 		case <-w.Quit:
@@ -566,11 +580,17 @@ func (w *ReOrgWatcher) DefaultUpdateCallback() proof.UpdateCallback {
 		ctxt, cancel := w.CtxBlocking()
 		defer cancel()
 
-		headerVerifier := GenHeaderVerifier(ctxt, w.cfg.ChainBridge)
+		vCtx := proof.VerifierCtx{
+			HeaderVerifier: GenHeaderVerifier(
+				ctxt, w.cfg.ChainBridge,
+			),
+			MerkleVerifier: proof.DefaultMerkleVerifier,
+			GroupVerifier:  w.cfg.GroupVerifier,
+			ChainLookupGen: w.cfg.ChainBridge,
+		}
 		for idx := range proofs {
 			err := proof.ReplaceProofInBlob(
-				ctxt, proofs[idx], w.cfg.ProofArchive,
-				headerVerifier, w.cfg.GroupVerifier,
+				ctxt, proofs[idx], w.cfg.ProofArchive, vCtx,
 			)
 			if err != nil {
 				return fmt.Errorf("unable to update proofs: %w",

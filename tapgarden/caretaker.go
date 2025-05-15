@@ -21,7 +21,7 @@ import (
 	"github.com/lightninglabs/taproot-assets/commitment"
 	"github.com/lightninglabs/taproot-assets/fn"
 	"github.com/lightninglabs/taproot-assets/proof"
-	"github.com/lightninglabs/taproot-assets/tapscript"
+	"github.com/lightninglabs/taproot-assets/tapsend"
 	"github.com/lightninglabs/taproot-assets/universe"
 	"github.com/lightningnetwork/lnd/chainntnfs"
 	"github.com/lightningnetwork/lnd/lnwallet/chainfee"
@@ -59,10 +59,10 @@ const (
 // BatchCaretakerConfig houses all the items that the BatchCaretaker needs to
 // carry out its duties.
 type BatchCaretakerConfig struct {
-	// Batch is the minting batch that this caretaker is responsible for?
+	// Batch is the minting batch that this caretaker is responsible for.
 	Batch *MintingBatch
 
-	// BatchFeeRate is an optional manually-set feerate specified when
+	// BatchFeeRate is an optional manually-set fee rate specified when
 	// finalizing a batch.
 	BatchFeeRate *chainfee.SatPerKWeight
 
@@ -96,6 +96,9 @@ type BatchCaretakerConfig struct {
 	// itself, because its job is already done at the point that a re-org
 	// can happen (the batch is finalized after a single confirmation).
 	UpdateMintingProofs func([]*proof.Proof) error
+
+	// PublishMintEvent is used to publish a mint event to all subscribers.
+	PublishMintEvent func(event fn.Event)
 
 	// ErrChan is the main error channel the caretaker will report back
 	// critical errors to the main server.
@@ -195,7 +198,15 @@ func (b *BatchCaretaker) Cancel() error {
 		if err != nil {
 			err = fmt.Errorf("BatchCaretaker(%x), batch state(%v), "+
 				"cancel failed: %w", batchKey, batchState, err)
+
+			b.cfg.PublishMintEvent(newAssetMintErrorEvent(
+				err, BatchStateSeedlingCancelled, b.cfg.Batch,
+			))
 		}
+
+		b.cfg.PublishMintEvent(newAssetMintEvent(
+			BatchStateSeedlingCancelled, b.cfg.Batch),
+		)
 
 		cancelResp = CancelResp{true, err}
 
@@ -207,7 +218,15 @@ func (b *BatchCaretaker) Cancel() error {
 		if err != nil {
 			err = fmt.Errorf("BatchCaretaker(%x), batch state(%v), "+
 				"cancel failed: %w", batchKey, batchState, err)
+
+			b.cfg.PublishMintEvent(newAssetMintErrorEvent(
+				err, BatchStateSproutCancelled, b.cfg.Batch,
+			))
 		}
+
+		b.cfg.PublishMintEvent(newAssetMintEvent(
+			BatchStateSproutCancelled, b.cfg.Batch,
+		))
 
 		cancelResp = CancelResp{true, err}
 
@@ -272,9 +291,19 @@ func (b *BatchCaretaker) advanceStateUntil(currentState,
 
 		nextState, err := b.stateStep(currentState)
 		if err != nil {
+			b.cfg.PublishMintEvent(newAssetMintErrorEvent(
+				err, currentState, b.cfg.Batch,
+			))
+
 			return 0, fmt.Errorf("unable to advance state "+
 				"machine: %w", err)
 		}
+
+		// We only want to notify _after_ executing the state step
+		// successfully.
+		b.cfg.PublishMintEvent(newAssetMintEvent(
+			currentState, b.cfg.Batch,
+		))
 
 		// We've reached a terminal state once the next state is our
 		// current state (state machine loops back to the current
@@ -383,63 +412,7 @@ func (b *BatchCaretaker) assetCultivator() {
 	}
 }
 
-// fundGenesisPsbt generates a PSBT packet we'll use to create an asset.  In
-// order to be able to create an asset, we need an initial genesis outpoint. To
-// obtain this we'll ask the wallet to fund a PSBT template for GenesisAmtSats
-// (all outputs need to hold some BTC to not be dust), and with a dummy script.
-// We need to use a dummy script as we can't know the actual script key since
-// that's dependent on the genesis outpoint.
-func (b *BatchCaretaker) fundGenesisPsbt(ctx context.Context) (*FundedPsbt, error) {
-	log.Infof("BatchCaretaker(%x): attempting to fund GenesisPacket",
-		b.batchKey[:])
-
-	txTemplate := wire.NewMsgTx(2)
-	txTemplate.AddTxOut(tapscript.CreateDummyOutput())
-	genesisPkt, err := psbt.NewFromUnsignedTx(txTemplate)
-	if err != nil {
-		return nil, fmt.Errorf("unable to make psbt packet: %w", err)
-	}
-
-	log.Infof("BatchCaretaker(%x): creating skeleton PSBT", b.batchKey[:])
-	log.Tracef("PSBT: %v", spew.Sdump(genesisPkt))
-
-	var feeRate chainfee.SatPerKWeight
-	switch {
-	// If a fee rate was manually assigned for this batch, use that instead
-	// of a fee rate estimate.
-	case b.cfg.BatchFeeRate != nil:
-		feeRate = *b.cfg.BatchFeeRate
-		log.Infof("BatchCaretaker(%x): using manual fee rate: %s, %d "+
-			"sat/vB", b.batchKey[:], feeRate.String(),
-			feeRate.FeePerKVByte()/1000)
-
-	default:
-		feeRate, err = b.cfg.ChainBridge.EstimateFee(
-			ctx, GenesisConfTarget,
-		)
-		if err != nil {
-			return nil, fmt.Errorf("unable to estimate fee: %w",
-				err)
-		}
-
-		log.Infof("BatchCaretaker(%x): estimated fee rate: %s",
-			b.batchKey[:], feeRate.FeePerKVByte().String())
-	}
-
-	fundedGenesisPkt, err := b.cfg.Wallet.FundPsbt(
-		ctx, genesisPkt, 1, feeRate,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("unable to fund psbt: %w", err)
-	}
-
-	log.Infof("BatchCaretaker(%x): funded GenesisPacket", b.batchKey[:])
-	log.Tracef("GenesisPacket: %v", spew.Sdump(fundedGenesisPkt))
-
-	return &fundedGenesisPkt, nil
-}
-
-// extractGenesisOutpoint extracts the genesis point (the first output from the
+// extractGenesisOutpoint extracts the genesis point (the first input from the
 // genesis transaction).
 func extractGenesisOutpoint(tx *wire.MsgTx) wire.OutPoint {
 	return tx.TxIn[0].PreviousOutPoint
@@ -458,21 +431,70 @@ func (b *BatchCaretaker) seedlingsToAssetSprouts(ctx context.Context,
 
 	newAssets := make([]*asset.Asset, 0, len(b.cfg.Batch.Seedlings))
 
-	// Seedlings that anchor a group may be referenced by other seedlings,
-	// and therefore need to be mapped to sprouts first so that we derive
-	// the initial tweaked group key early.
-	orderedSeedlings := SortSeedlings(maps.Values(b.cfg.Batch.Seedlings))
-	newGroups := make(map[string]*asset.AssetGroup, len(orderedSeedlings))
+	// separate grouped assets from ungrouped
+	groupedSeedlings, ungroupedSeedlings := filterSeedlingsWithGroup(
+		b.cfg.Batch.Seedlings,
+	)
+	groupedSeedlingCount := len(groupedSeedlings)
+	// load seedling asset groups and check for correct group count
+	seedlingGroups, err := b.cfg.Log.FetchSeedlingGroups(
+		ctx, genesisPoint, assetOutputIndex,
+		maps.Values(groupedSeedlings),
+	)
+	if err != nil {
+		return nil, err
+	}
+	seedlingGroupCount := len(seedlingGroups)
 
-	for _, seedlingName := range orderedSeedlings {
-		seedling := b.cfg.Batch.Seedlings[seedlingName]
+	if groupedSeedlingCount != seedlingGroupCount {
+		return nil, fmt.Errorf("wrong number of grouped assets and "+
+			"asset groups: %d, %d", groupedSeedlingCount,
+			seedlingGroupCount)
+	}
 
-		assetGen := asset.Genesis{
-			FirstPrevOut: genesisPoint,
-			Tag:          seedling.AssetName,
-			OutputIndex:  assetOutputIndex,
-			Type:         seedling.AssetType,
+	for _, seedlingGroup := range seedlingGroups {
+		// check that asset group has a witness, and that the group
+		// has a matching seedling
+		if len(seedlingGroup.GroupKey.Witness) == 0 {
+			return nil, fmt.Errorf("not all seedling groups have " +
+				"witnesses")
 		}
+
+		seedling, ok := groupedSeedlings[seedlingGroup.Tag]
+		if !ok {
+			groupTweakedKey := seedlingGroup.GroupKey.GroupPubKey.
+				SerializeCompressed()
+			return nil, fmt.Errorf("no seedling with tag matching "+
+				"group: %v, %x", seedlingGroup.Tag,
+				groupTweakedKey)
+		}
+
+		// build assets for grouped seedlings
+		var amount uint64
+		switch seedling.AssetType {
+		case asset.Normal:
+			amount = seedling.Amount
+		case asset.Collectible:
+			amount = 1
+		}
+
+		newAsset, err := asset.New(
+			*seedlingGroup.Genesis, amount, 0, 0,
+			seedling.ScriptKey, seedlingGroup.GroupKey,
+			asset.WithAssetVersion(seedling.AssetVersion),
+		)
+		if err != nil {
+			return nil, fmt.Errorf("unable to create new asset: %w",
+				err)
+		}
+
+		newAssets = append(newAssets, newAsset)
+	}
+
+	// build assets for ungrouped seedlings
+	for seedlingName := range ungroupedSeedlings {
+		seedling := ungroupedSeedlings[seedlingName]
+		assetGen := seedling.Genesis(genesisPoint, assetOutputIndex)
 
 		// If the seedling has a meta data reveal set, then we'll bind
 		// that by including the hash of the meta data in the asset
@@ -481,23 +503,8 @@ func (b *BatchCaretaker) seedlingsToAssetSprouts(ctx context.Context,
 			assetGen.MetaHash = seedling.Meta.MetaHash()
 		}
 
-		scriptKey, err := b.cfg.KeyRing.DeriveNextKey(
-			ctx, asset.TaprootAssetsKeyFamily,
-		)
-		if err != nil {
-			return nil, fmt.Errorf("unable to obtain script "+
-				"key: %w", err)
-		}
-		tweakedScriptKey := asset.NewScriptKeyBip86(scriptKey)
-
-		var (
-			amount         uint64
-			groupInfo      *asset.AssetGroup
-			protoAsset     *asset.Asset
-			sproutGroupKey *asset.GroupKey
-		)
-
 		// Determine the amount for the actual asset.
+		var amount uint64
 		switch seedling.AssetType {
 		case asset.Normal:
 			amount = seedling.Amount
@@ -505,107 +512,15 @@ func (b *BatchCaretaker) seedlingsToAssetSprouts(ctx context.Context,
 			amount = 1
 		}
 
-		// If the seedling has a group key specified,
-		// that group key was validated earlier. We need to
-		// sign the new genesis with that group key.
-		if seedling.HasGroupKey() {
-			groupInfo = seedling.GroupInfo
-		}
-
-		// If the seedling has a group anchor specified, that anchor
-		// was validated earlier and the corresponding group has already
-		// been created. We need to look up the group key and sign
-		// the asset genesis with that key.
-		if seedling.GroupAnchor != nil {
-			groupInfo = newGroups[*seedling.GroupAnchor]
-		}
-
-		// If a group witness needs to be produced, then we will need a
-		// partially filled asset as part of the signing process.
-		if groupInfo != nil || seedling.EnableEmission {
-			protoAsset, err = asset.New(
-				assetGen, amount, 0, 0, tweakedScriptKey, nil,
-				asset.WithAssetVersion(seedling.AssetVersion),
-			)
-			if err != nil {
-				return nil, fmt.Errorf("unable to create "+
-					"asset for group key signing: %w", err)
-			}
-		}
-
-		if groupInfo != nil {
-			groupReq, err := asset.NewGroupKeyRequest(
-				groupInfo.GroupKey.RawKey, *groupInfo.Genesis,
-				protoAsset, nil,
-			)
-			if err != nil {
-				return nil, fmt.Errorf("unable to request "+
-					"asset group membership: %w", err)
-			}
-
-			sproutGroupKey, err = asset.DeriveGroupKey(
-				b.cfg.GenSigner, b.cfg.GenTxBuilder, *groupReq,
-			)
-			if err != nil {
-				return nil, fmt.Errorf("unable to tweak group "+
-					"key: %w", err)
-			}
-		}
-
-		// If emission is enabled without a group key specified,
-		// then we'll need to generate another public key,
-		// then use that to derive the key group signature
-		// along with the tweaked key group.
-		if seedling.EnableEmission {
-			rawGroupKey, err := b.cfg.KeyRing.DeriveNextKey(
-				ctx, asset.TaprootAssetsKeyFamily,
-			)
-			if err != nil {
-				return nil, fmt.Errorf("unable to derive "+
-					"group key: %w", err)
-			}
-
-			groupReq, err := asset.NewGroupKeyRequest(
-				rawGroupKey, assetGen, protoAsset, nil,
-			)
-			if err != nil {
-				return nil, fmt.Errorf("unable to request "+
-					"asset group creation: %w", err)
-			}
-
-			sproutGroupKey, err = asset.DeriveGroupKey(
-				b.cfg.GenSigner, b.cfg.GenTxBuilder, *groupReq,
-			)
-			if err != nil {
-				return nil, fmt.Errorf("unable to tweak group "+
-					"key: %w", err)
-			}
-
-			newGroups[seedlingName] = &asset.AssetGroup{
-				Genesis:  &assetGen,
-				GroupKey: sproutGroupKey,
-			}
-		}
-
 		// With the necessary keys components assembled, we'll create
 		// the actual asset now.
 		newAsset, err := asset.New(
-			assetGen, amount, 0, 0, tweakedScriptKey,
-			sproutGroupKey,
+			assetGen, amount, 0, 0, seedling.ScriptKey, nil,
 			asset.WithAssetVersion(seedling.AssetVersion),
 		)
 		if err != nil {
 			return nil, fmt.Errorf("unable to create new asset: %w",
 				err)
-		}
-
-		// Verify the group witness if present.
-		if sproutGroupKey != nil {
-			err := b.cfg.TxValidator.Execute(newAsset, nil, nil)
-			if err != nil {
-				return nil, fmt.Errorf("unable to verify "+
-					"asset group witness: %w", err)
-			}
 		}
 
 		newAssets = append(newAssets, newAsset)
@@ -614,7 +529,9 @@ func (b *BatchCaretaker) seedlingsToAssetSprouts(ctx context.Context,
 	// Now that we have all our assets created, we'll make a new
 	// Taproot asset commitment, which commits to all the assets we
 	// created above in a new root.
-	return commitment.FromAssets(newAssets...)
+	return commitment.FromAssets(
+		fn.Ptr(commitment.TapCommitmentV2), newAssets...,
+	)
 }
 
 // stateStep attempts to transition the state machine from one state to
@@ -644,29 +561,47 @@ func (b *BatchCaretaker) stateStep(currentState BatchState) (BatchState, error) 
 	// batch, so we'll use the batch key as the internal key for the
 	// genesis transaction that'll create the batch.
 	case BatchStateFrozen:
-		// First, we'll fund a PSBT packet with enough coins allocated
-		// as inputs to be able to create our genesis output for the
-		// asset and also pay for fees.
-		//
 		// TODO(roasbeef): need to invalidate asset creation if on
 		// restart leases are gone
 		ctx, cancel := b.WithCtxQuitNoTimeout()
 		defer cancel()
-		genesisTxPkt, err := b.fundGenesisPsbt(ctx)
+
+		// For the caretaker to manage a frozen batch, it must have some
+		// seedlings and a genesis packet. Check these preconditions
+		// before modifying the batch.
+		if len(b.cfg.Batch.Seedlings) == 0 {
+			return 0, fmt.Errorf("frozen batch has no seedlings")
+		}
+
+		if b.cfg.Batch.GenesisPacket == nil ||
+			b.cfg.Batch.GenesisPacket.Pkt == nil {
+
+			return 0, fmt.Errorf("frozen batch has no genesis " +
+				"packet")
+		}
+
+		// Make a copy of the batch PSBT, which we'll modify and then
+		// update the batch with.
+		var psbtBuf bytes.Buffer
+		err := b.cfg.Batch.GenesisPacket.Pkt.Serialize(&psbtBuf)
 		if err != nil {
-			return 0, err
+			return 0, fmt.Errorf("unable to serialize genesis "+
+				"PSBT: %w", err)
 		}
 
-		genesisPoint := extractGenesisOutpoint(
-			genesisTxPkt.Pkt.UnsignedTx,
-		)
-
-		// If the change output is first, then our commitment is second,
-		// and vice versa.
-		b.anchorOutputIndex = 0
-		if genesisTxPkt.ChangeOutputIndex == 0 {
-			b.anchorOutputIndex = 1
+		genesisTxPkt, err := psbt.NewFromRawBytes(&psbtBuf, false)
+		if err != nil {
+			return 0, fmt.Errorf("unable to deserialize genesis "+
+				"PSBT: %w", err)
 		}
+
+		// Unpack output indexes.
+		genesisPacket := b.cfg.Batch.GenesisPacket
+
+		changeOutputIndex := genesisPacket.ChangeOutputIndex
+		b.anchorOutputIndex = genesisPacket.AssetAnchorOutIdx
+
+		genesisPoint := extractGenesisOutpoint(genesisTxPkt.UnsignedTx)
 
 		// First, we'll turn all the seedlings into actual taproot assets.
 		tapCommitment, err := b.seedlingsToAssetSprouts(
@@ -674,37 +609,65 @@ func (b *BatchCaretaker) stateStep(currentState BatchState) (BatchState, error) 
 		)
 		if err != nil {
 			return 0, fmt.Errorf("unable to map seedlings to "+
-				"sprouts: %v", err)
+				"sprouts: %w", err)
 		}
 
 		b.cfg.Batch.RootAssetCommitment = tapCommitment
 
+		// Fetch the optional Tapscript sibling for this batch, and
+		// convert it to a TapscriptPreimage.
+		var batchSibling *commitment.TapscriptPreimage
+		if b.cfg.Batch.tapSibling != nil {
+			tapSibling, err := b.cfg.TreeStore.LoadTapscriptTree(
+				ctx, *b.cfg.Batch.tapSibling,
+			)
+			if err != nil {
+				return 0, err
+			}
+
+			batchSibling, err = commitment.
+				NewPreimageFromTapscriptTreeNodes(*tapSibling)
+			if err != nil {
+				return 0, err
+			}
+		}
+
 		// With the commitment Taproot Asset root SMT constructed, we'll
 		// map that into the tapscript root we'll insert into the
 		// genesis transaction.
-		genesisScript, err := b.cfg.Batch.genesisScript()
+		genesisScript, err := b.cfg.Batch.genesisScript(batchSibling)
 		if err != nil {
 			return 0, fmt.Errorf("unable to create genesis "+
-				"script: %v", err)
+				"script: %w", err)
 		}
 
-		genesisTxPkt.Pkt.UnsignedTx.TxOut[b.anchorOutputIndex].PkScript = genesisScript
+		genesisTxPkt.UnsignedTx.
+			TxOut[b.anchorOutputIndex].PkScript = genesisScript
 
 		log.Infof("BatchCaretaker(%x): committing sprouts to disk",
 			b.batchKey[:])
+
+		fundedGenesisPsbt := FundedMintAnchorPsbt{
+			FundedPsbt: tapsend.FundedPsbt{
+				Pkt:               genesisTxPkt,
+				ChangeOutputIndex: changeOutputIndex,
+			},
+			AssetAnchorOutIdx:   b.anchorOutputIndex,
+			PreCommitmentOutput: genesisPacket.PreCommitmentOutput,
+		}
 
 		// With all our commitments created, we'll commit them to disk,
 		// replacing the existing seedlings we had created for each of
 		// these assets.
 		err = b.cfg.Log.AddSproutsToBatch(
 			ctx, b.cfg.Batch.BatchKey.PubKey,
-			genesisTxPkt, b.cfg.Batch.RootAssetCommitment,
+			&fundedGenesisPsbt, b.cfg.Batch.RootAssetCommitment,
 		)
 		if err != nil {
 			return 0, fmt.Errorf("unable to commit batch: %w", err)
 		}
 
-		b.cfg.Batch.GenesisPacket = genesisTxPkt
+		b.cfg.Batch.GenesisPacket.Pkt = genesisTxPkt
 
 		// Now that we know the script key for all the assets, we'll
 		// populate the asset metas map as we need that to create the
@@ -776,18 +739,52 @@ func (b *BatchCaretaker) stateStep(currentState BatchState) (BatchState, error) 
 
 		// At this point we have a fully signed PSBT packet which'll
 		// create our set of assets once mined. We'll write this to
-		// disk, then import the public key into the wallet.
+		// disk, then import the public key into the wallet. The sibling
+		// here can always be nil as we'll fetch the output key computed
+		// previously in BatchStateFrozen.
 		//
 		// TODO(roasbeef): re-run during the broadcast phase to ensure
 		// it's fully imported?
-		mintingOutputKey, tapRoot, err := b.cfg.Batch.MintingOutputKey()
+		mintingOutputKey, merkleRoot, err := b.cfg.Batch.
+			MintingOutputKey(nil)
 		if err != nil {
 			return 0, err
 		}
+
+		// To spend this output in the future, we must also commit the
+		// Taproot Asset commitment root and batch tapscript sibling.
+		tapCommitmentRoot := b.cfg.Batch.RootAssetCommitment.
+			TapscriptRoot(nil)
+
+		// Fetch the optional Tapscript sibling for this batch, and
+		// encode it to bytes.
+		var siblingBytes []byte
+		if b.cfg.Batch.tapSibling != nil {
+			tapSibling, err := b.cfg.TreeStore.LoadTapscriptTree(
+				ctx, *b.cfg.Batch.tapSibling,
+			)
+			if err != nil {
+				return 0, err
+			}
+
+			batchSibling, err := commitment.
+				NewPreimageFromTapscriptTreeNodes(*tapSibling)
+			if err != nil {
+				return 0, err
+			}
+
+			siblingBytes, _, err = commitment.
+				MaybeEncodeTapscriptPreimage(batchSibling)
+			if err != nil {
+				return 0, err
+			}
+		}
+
 		err = b.cfg.Log.CommitSignedGenesisTx(
 			ctx, b.cfg.Batch.BatchKey.PubKey,
-			b.cfg.Batch.GenesisPacket, b.anchorOutputIndex,
-			tapRoot,
+			&b.cfg.Batch.GenesisPacket.FundedPsbt,
+			b.anchorOutputIndex, merkleRoot, tapCommitmentRoot[:],
+			siblingBytes,
 		)
 		if err != nil {
 			return 0, fmt.Errorf("unable to commit genesis "+
@@ -843,7 +840,9 @@ func (b *BatchCaretaker) stateStep(currentState BatchState) (BatchState, error) 
 		// transaction, then request a confirmation notification.
 		ctx, cancel := b.WithCtxQuit()
 		defer cancel()
-		err = b.cfg.ChainBridge.PublishTransaction(ctx, signedTx)
+		err = b.cfg.ChainBridge.PublishTransaction(
+			ctx, signedTx, IssuanceTxLabel,
+		)
 		if err != nil {
 			return 0, fmt.Errorf("unable to publish "+
 				"transaction: %w", err)
@@ -865,7 +864,7 @@ func (b *BatchCaretaker) stateStep(currentState BatchState) (BatchState, error) 
 		)
 		if err != nil {
 			return 0, fmt.Errorf("unable to register for "+
-				"minting tx conf: %v", err)
+				"minting tx conf: %w", err)
 		}
 
 		// Launch a goroutine that'll notify us when the transaction
@@ -972,9 +971,23 @@ func (b *BatchCaretaker) stateStep(currentState BatchState) (BatchState, error) 
 		ctx, cancel := b.WithCtxQuitNoTimeout()
 		defer cancel()
 
-		headerVerifier := GenHeaderVerifier(ctx, b.cfg.ChainBridge)
-		groupVerifier := GenGroupVerifier(ctx, b.cfg.Log)
-		groupAnchorVerifier := GenGroupAnchorVerifier(ctx, b.cfg.Log)
+		// Fetch the optional tapscript sibling for this batch, which
+		// is needed to construct valid inclusion proofs.
+		var batchSibling *commitment.TapscriptPreimage
+		if b.cfg.Batch.tapSibling != nil {
+			tapSibling, err := b.cfg.TreeStore.LoadTapscriptTree(
+				ctx, *b.cfg.Batch.tapSibling,
+			)
+			if err != nil {
+				return 0, err
+			}
+
+			batchSibling, err = commitment.
+				NewPreimageFromTapscriptTreeNodes(*tapSibling)
+			if err != nil {
+				return 0, err
+			}
+		}
 
 		// Now that the minting transaction has been confirmed, we'll
 		// need to create the series of proof file blobs for each of
@@ -990,6 +1003,7 @@ func (b *BatchCaretaker) stateStep(currentState BatchState) (BatchState, error) 
 				TxIndex:          int(confInfo.TxIndex),
 				OutputIndex:      int(b.anchorOutputIndex),
 				InternalKey:      b.cfg.Batch.BatchKey.PubKey,
+				TapscriptSibling: batchSibling,
 				TaprootAssetRoot: batchCommitment,
 			},
 			GenesisPoint: extractGenesisOutpoint(
@@ -997,8 +1011,9 @@ func (b *BatchCaretaker) stateStep(currentState BatchState) (BatchState, error) 
 			),
 		}
 		err := proof.AddExclusionProofs(
-			&baseProof.BaseProofParams,
-			b.cfg.Batch.GenesisPacket.Pkt, func(idx uint32) bool {
+			&baseProof.BaseProofParams, confInfo.Tx,
+			b.cfg.Batch.GenesisPacket.Pkt.Outputs,
+			func(idx uint32) bool {
 				return idx == b.anchorOutputIndex
 			},
 		)
@@ -1007,10 +1022,11 @@ func (b *BatchCaretaker) stateStep(currentState BatchState) (BatchState, error) 
 				"%w", err)
 		}
 
+		vCtx := b.verifierCtx(ctx)
 		mintingProofs, err := proof.NewMintingBlobs(
-			baseProof, headerVerifier, groupVerifier,
-			groupAnchorVerifier,
+			baseProof, vCtx,
 			proof.WithAssetMetaReveals(b.cfg.Batch.AssetMetas),
+			proof.WithSiblingPreimage(batchSibling),
 		)
 		if err != nil {
 			return 0, fmt.Errorf("unable to construct minting "+
@@ -1050,7 +1066,7 @@ func (b *BatchCaretaker) stateStep(currentState BatchState) (BatchState, error) 
 		// reissunces. This is required for any possible reissuances
 		// to be verified correctly when updating our local Universe.
 		anchorAssets, nonAnchorAssets, err := SortAssets(
-			committedAssets, groupAnchorVerifier,
+			committedAssets, vCtx.GroupAnchorVerifier,
 		)
 		if err != nil {
 			return 0, fmt.Errorf("could not sort assets: %w", err)
@@ -1069,8 +1085,7 @@ func (b *BatchCaretaker) stateStep(currentState BatchState) (BatchState, error) 
 			mintingProof := mintingProofs[scriptKey]
 
 			proofBlob, uniProof, err := b.storeMintingProof(
-				ctx, newAsset, mintingProof, mintTxHash,
-				headerVerifier, groupVerifier,
+				ctx, newAsset, mintingProof, mintTxHash, vCtx,
 			)
 			if err != nil {
 				return fmt.Errorf("unable to store "+
@@ -1159,9 +1174,7 @@ func (b *BatchCaretaker) stateStep(currentState BatchState) (BatchState, error) 
 // can be used to register the asset with the universe.
 func (b *BatchCaretaker) storeMintingProof(ctx context.Context,
 	a *asset.Asset, mintingProof *proof.Proof, mintTxHash chainhash.Hash,
-	headerVerifier proof.HeaderVerifier,
-	groupVerifier proof.GroupVerifier) (proof.Blob, *universe.Item,
-	error) {
+	vCtx proof.VerifierCtx) (proof.Blob, *universe.Item, error) {
 
 	assetID := a.ID()
 	blob, err := proof.EncodeAsProofFile(mintingProof)
@@ -1174,13 +1187,12 @@ func (b *BatchCaretaker) storeMintingProof(ctx context.Context,
 		Locator: proof.Locator{
 			AssetID:   &assetID,
 			ScriptKey: *a.ScriptKey.PubKey,
+			OutPoint:  fn.Ptr(mintingProof.OutPoint()),
 		},
 		Blob: blob,
 	}
 
-	err = b.cfg.ProofFiles.ImportProofs(
-		ctx, headerVerifier, groupVerifier, false, fullProof,
-	)
+	err = b.cfg.ProofFiles.ImportProofs(ctx, vCtx, false, fullProof)
 	if err != nil {
 		return nil, nil, fmt.Errorf("unable to insert proofs: %w", err)
 	}
@@ -1209,7 +1221,7 @@ func (b *BatchCaretaker) storeMintingProof(ctx context.Context,
 	// The base key is the set of bytes that keys into the universe, this'll
 	// be the outpoint where it was created at and the script key for that
 	// asset.
-	leafKey := universe.LeafKey{
+	leafKey := universe.BaseLeafKey{
 		OutPoint: wire.OutPoint{
 			Hash:  mintTxHash,
 			Index: b.anchorOutputIndex,
@@ -1217,8 +1229,8 @@ func (b *BatchCaretaker) storeMintingProof(ctx context.Context,
 		ScriptKey: &a.ScriptKey,
 	}
 
-	var proofBuf bytes.Buffer
-	if err = mintingProof.Encode(&proofBuf); err != nil {
+	mintingProofBytes, err := mintingProof.Bytes()
+	if err != nil {
 		return nil, nil, fmt.Errorf("unable to encode proof: %w", err)
 	}
 
@@ -1236,7 +1248,7 @@ func (b *BatchCaretaker) storeMintingProof(ctx context.Context,
 		// The universe tree store only the asset state transition and
 		// not also the proof file checksum (as the root is effectively
 		// a checksum), so we'll use just the state transition.
-		RawProof: proofBuf.Bytes(),
+		RawProof: mintingProofBytes,
 		Amt:      a.Amount,
 		Asset:    a,
 	}
@@ -1290,6 +1302,54 @@ func (b *BatchCaretaker) batchStreamUniverseItems(ctx context.Context,
 	}
 
 	return nil
+}
+
+// AssetMintEvent is an event which is sent to the BatchCaretaker's event
+// subscribers after a state was executed successfully.
+type AssetMintEvent struct {
+	// timestamp is the time the event was created.
+	timestamp time.Time
+
+	// BatchState is the last state that was executed before the event is
+	// received. This field takes precedence over Batch.State() as that
+	// might not always be updated when the event is created. In case Error
+	// below is set, the BatchState is the state that was executed that lead
+	// to the error.
+	BatchState BatchState
+
+	// Error is an optional error, indicating that something went wrong
+	// during the execution of the BatchState above.
+	Error error
+
+	// Batch is the batch that is being minted.
+	Batch *MintingBatch
+}
+
+// Timestamp returns the timestamp of the event.
+func (e *AssetMintEvent) Timestamp() time.Time {
+	return e.timestamp
+}
+
+// newAssetMintEvent creates a new AssetMintEvent from the given batch.
+func newAssetMintEvent(state BatchState, b *MintingBatch) *AssetMintEvent {
+	return &AssetMintEvent{
+		timestamp:  time.Now().UTC(),
+		BatchState: state,
+		Batch:      b.Copy(),
+	}
+}
+
+// newAssetMintErrorEvent creates a new AssetMintErrorEvent from the given
+// error, state and batch.
+func newAssetMintErrorEvent(err error, state BatchState,
+	b *MintingBatch) *AssetMintEvent {
+
+	return &AssetMintEvent{
+		timestamp:  time.Now().UTC(),
+		BatchState: state,
+		Error:      err,
+		Batch:      b.Copy(),
+	}
 }
 
 // SortSeedlings sorts the seedling names such that all seedlings that will be
@@ -1416,8 +1476,9 @@ func GenGroupVerifier(ctx context.Context,
 		// tweaked group key.
 		_, err = mintingStore.FetchGroupByGroupKey(ctx, groupKey)
 		if err != nil {
-			return fmt.Errorf("%x: group verifier: %v: %w",
-				assetGroupKey[:], err, ErrGroupKeyUnknown)
+			return fmt.Errorf("%x: group verifier: %s: %w",
+				assetGroupKey[:], err.Error(),
+				ErrGroupKeyUnknown)
 		}
 
 		_, _ = assetGroups.Put(assetGroupKey, emptyCacheVal{})
@@ -1481,10 +1542,10 @@ func GenRawGroupAnchorVerifier(ctx context.Context) func(*asset.Genesis,
 		assetGroupKey := asset.ToSerialized(&groupKey.GroupPubKey)
 		groupAnchor, err := groupAnchors.Get(assetGroupKey)
 		if err != nil {
-			// TODO(jhb): add tapscript root support
 			singleTweak := gen.ID()
-			tweakedGroupKey, err := asset.GroupPubKey(
-				groupKey.RawKey.PubKey, singleTweak[:], nil,
+			tweakedGroupKey, err := asset.GroupPubKeyV0(
+				groupKey.RawKey.PubKey, singleTweak[:],
+				groupKey.TapscriptRoot,
 			)
 			if err != nil {
 				return err
@@ -1507,5 +1568,21 @@ func GenRawGroupAnchorVerifier(ctx context.Context) func(*asset.Genesis,
 		}
 
 		return nil
+	}
+}
+
+// verifierCtx returns a verifier context that can be used to verify proofs.
+func (b *BatchCaretaker) verifierCtx(ctx context.Context) proof.VerifierCtx {
+	headerVerifier := GenHeaderVerifier(ctx, b.cfg.ChainBridge)
+	merkleVerifier := proof.DefaultMerkleVerifier
+	groupVerifier := GenGroupVerifier(ctx, b.cfg.Log)
+	groupAnchorVerifier := GenGroupAnchorVerifier(ctx, b.cfg.Log)
+
+	return proof.VerifierCtx{
+		HeaderVerifier:      headerVerifier,
+		MerkleVerifier:      merkleVerifier,
+		GroupVerifier:       groupVerifier,
+		GroupAnchorVerifier: groupAnchorVerifier,
+		ChainLookupGen:      b.cfg.ChainBridge,
 	}
 }

@@ -29,6 +29,23 @@ type AssetProof struct {
 	// committed asset must match, otherwise an asset.GroupKey which every
 	// committed asset must match.
 	TapKey [32]byte
+
+	// UnknownOddTypes is a map of unknown odd types that were encountered
+	// during decoding. This map is used to preserve unknown types that we
+	// don't know of yet, so we can still encode them back when serializing.
+	// This enables forward compatibility with future versions of the
+	// protocol as it allows new odd (optional) types to be added without
+	// breaking old clients that don't yet fully understand them.
+	UnknownOddTypes tlv.TypeMap
+}
+
+// Records returns the encoding/decoding records for the AssetProof.
+func (a *AssetProof) Records() []tlv.Record {
+	return []tlv.Record{
+		AssetProofVersionRecord(&a.Version),
+		AssetProofAssetIDRecord(&a.TapKey),
+		AssetProofRecord(&a.Proof),
+	}
 }
 
 // TaprootAssetProof is the proof used along with an asset commitment leaf to
@@ -36,9 +53,24 @@ type AssetProof struct {
 type TaprootAssetProof struct {
 	mssmt.Proof
 
-	// Version is the max version committed of the AssetCommitment's
-	// included in the TapCommitment.
-	Version asset.Version
+	// Version is the version of the TapCommitment used to create the proof.
+	Version TapCommitmentVersion
+
+	// UnknownOddTypes is a map of unknown odd types that were encountered
+	// during decoding. This map is used to preserve unknown types that we
+	// don't know of yet, so we can still encode them back when serializing.
+	// This enables forward compatibility with future versions of the
+	// protocol as it allows new odd (optional) types to be added without
+	// breaking old clients that don't yet fully understand them.
+	UnknownOddTypes tlv.TypeMap
+}
+
+// Records returns the encoding/decoding records for the TaprootAssetProof.
+func (t *TaprootAssetProof) Records() []tlv.Record {
+	return []tlv.Record{
+		TaprootAssetProofVersionRecord(&t.Version),
+		TaprootAssetProofRecord(&t.Proof),
+	}
 }
 
 // Proof represents a full commitment proof for a particular `Asset`. It proves
@@ -56,6 +88,14 @@ type Proof struct {
 	// TaprootAssetProof is the proof used along with the asset commitment
 	// to arrive at the root of the TapCommitment MS-SMT.
 	TaprootAssetProof TaprootAssetProof
+
+	// UnknownOddTypes is a map of unknown odd types that were encountered
+	// during decoding. This map is used to preserve unknown types that we
+	// don't know of yet, so we can still encode them back when serializing.
+	// This enables forward compatibility with future versions of the
+	// protocol as it allows new odd (optional) types to be added without
+	// breaking old clients that don't yet fully understand them.
+	UnknownOddTypes tlv.TypeMap
 }
 
 // EncodeRecords returns the encoding records for the Proof.
@@ -64,8 +104,12 @@ func (p Proof) EncodeRecords() []tlv.Record {
 	if p.AssetProof != nil {
 		records = append(records, ProofAssetProofRecord(&p.AssetProof))
 	}
-	records = append(records, ProofTaprootAssetProofRecord(&p.TaprootAssetProof))
-	return records
+	records = append(
+		records, ProofTaprootAssetProofRecord(&p.TaprootAssetProof),
+	)
+
+	// Add any unknown odd types that were encountered during decoding.
+	return asset.CombineRecords(records, p.UnknownOddTypes)
 }
 
 // DecodeRecords returns the decoding records for the CommitmentProof.
@@ -91,7 +135,17 @@ func (p *Proof) Decode(r io.Reader) error {
 	if err != nil {
 		return err
 	}
-	return stream.DecodeP2P(r)
+
+	unknownOddTypes, err := asset.TlvStrictDecodeP2P(
+		stream, r, KnownProofTypes,
+	)
+	if err != nil {
+		return err
+	}
+
+	p.UnknownOddTypes = unknownOddTypes
+
+	return nil
 }
 
 // DeriveByAssetInclusion derives the Taproot Asset commitment containing the

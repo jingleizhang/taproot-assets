@@ -36,14 +36,15 @@ var (
 	// to work with sqlite primarily, and postgres has some differences.
 	postgresSchemaReplacements = map[string]string{
 		"BLOB":                "BYTEA",
-		"INTEGER PRIMARY KEY": "SERIAL PRIMARY KEY",
-		"BIGINT PRIMARY KEY":  "BIGSERIAL PRIMARY KEY",
+		"INTEGER PRIMARY KEY": "BIGSERIAL PRIMARY KEY",
 		"TIMESTAMP":           "TIMESTAMP WITHOUT TIME ZONE",
 		"UNHEX":               "DECODE",
 	}
 )
 
 // PostgresConfig holds the postgres database configuration.
+//
+// nolint:lll
 type PostgresConfig struct {
 	SkipMigrations     bool          `long:"skipmigrations" description:"Skip applying migrations on startup."`
 	Host               string        `long:"host" description:"Database server hostname."`
@@ -53,8 +54,8 @@ type PostgresConfig struct {
 	DBName             string        `long:"dbname" description:"Database name to use."`
 	MaxOpenConnections int           `long:"maxconnections" description:"Max open connections to keep alive to the database server."`
 	MaxIdleConnections int           `long:"maxidleconnections" description:"Max number of idle connections to keep in the connection pool."`
-	ConnMaxLifetime    time.Duration `long:"connmaxlifetime" description:"Max amount of time a connection can be reused for before it is closed."`
-	ConnMaxIdleTime    time.Duration `long:"connmaxidletime" description:"Max amount of time a connection can be idle for before it is closed."`
+	ConnMaxLifetime    time.Duration `long:"connmaxlifetime" description:"Max amount of time a connection can be reused for before it is closed. Valid time units are {s, m, h}."`
+	ConnMaxIdleTime    time.Duration `long:"connmaxidletime" description:"Max amount of time a connection can be idle for before it is closed. Valid time units are {s, m, h}."`
 	RequireSSL         bool          `long:"requiressl" description:"Whether to require using SSL (mode: require) when connecting to the server."`
 }
 
@@ -130,7 +131,12 @@ func NewPostgresStore(cfg *PostgresConfig) (*PostgresStore, error) {
 	// Now that the database is open, populate the database with our set of
 	// schemas based on our embedded in-memory file system.
 	if !cfg.SkipMigrations {
-		if err := s.ExecuteMigrations(TargetLatest); err != nil {
+		err := s.ExecuteMigrations(
+			TargetLatest, WithPostStepCallbacks(
+				makePostStepCallbacks(s, postMigrationChecks),
+			),
+		)
+		if err != nil {
 			return nil, fmt.Errorf("error executing migrations: "+
 				"%w", err)
 		}
@@ -141,7 +147,14 @@ func NewPostgresStore(cfg *PostgresConfig) (*PostgresStore, error) {
 
 // ExecuteMigrations runs migrations for the Postgres database, depending on the
 // target given, either all migrations or up to a given version.
-func (s *PostgresStore) ExecuteMigrations(target MigrationTarget) error {
+func (s *PostgresStore) ExecuteMigrations(target MigrationTarget,
+	optFuncs ...MigrateOpt) error {
+
+	opts := defaultMigrateOptions()
+	for _, optFunc := range optFuncs {
+		optFunc(opts)
+	}
+
 	driver, err := postgres_migrate.WithInstance(
 		s.DB, &postgres_migrate.Config{},
 	)
@@ -152,6 +165,7 @@ func (s *PostgresStore) ExecuteMigrations(target MigrationTarget) error {
 	postgresFS := newReplacerFS(sqlSchemas, postgresSchemaReplacements)
 	return applyMigrations(
 		postgresFS, driver, "sqlc/migrations", s.cfg.DBName, target,
+		opts,
 	)
 }
 

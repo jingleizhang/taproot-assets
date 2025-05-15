@@ -6,13 +6,16 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"math/rand"
+	"os"
 	"testing"
 	"time"
 
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcutil/psbt"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
+	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
+	"github.com/btcsuite/btclog/v2"
 	"github.com/lightninglabs/taproot-assets/asset"
 	"github.com/lightninglabs/taproot-assets/commitment"
 	"github.com/lightninglabs/taproot-assets/fn"
@@ -21,7 +24,7 @@ import (
 	"github.com/lightninglabs/taproot-assets/tapdb/sqlc"
 	"github.com/lightninglabs/taproot-assets/tapgarden"
 	"github.com/lightninglabs/taproot-assets/tapscript"
-	"github.com/lightningnetwork/lnd/build"
+	"github.com/lightninglabs/taproot-assets/tapsend"
 	"github.com/lightningnetwork/lnd/clock"
 	"github.com/lightningnetwork/lnd/keychain"
 	"github.com/stretchr/testify/require"
@@ -52,12 +55,18 @@ func newAssetStoreFromDB(db *BaseDB) (*AssetMintingStore, *AssetStore) {
 		return db.WithTx(tx)
 	}
 
+	metaTxCreator := func(tx *sql.Tx) MetaStore {
+		return db.WithTx(tx)
+	}
+
 	assetMintingDB := NewTransactionExecutor(db, txCreator)
 	assetsDB := NewTransactionExecutor(db, activeTxCreator)
+	metaDB := NewTransactionExecutor(db, metaTxCreator)
+
 	testClock := clock.NewTestClock(time.Now())
 
 	return NewAssetMintingStore(assetMintingDB),
-		NewAssetStore(assetsDB, testClock)
+		NewAssetStore(assetsDB, metaDB, testClock, db.Backend())
 }
 
 func assertBatchState(t *testing.T, batch *tapgarden.MintingBatch,
@@ -66,14 +75,23 @@ func assertBatchState(t *testing.T, batch *tapgarden.MintingBatch,
 	require.Equal(t, state, batch.State())
 }
 
+func assertBatchSibling(t *testing.T, batch *tapgarden.MintingBatch,
+	sibling chainhash.Hash) {
+
+	require.Equal(t, sibling[:], batch.TapSibling())
+}
+
 func assertBatchEqual(t *testing.T, a, b *tapgarden.MintingBatch) {
 	t.Helper()
 
 	require.Equal(t, a.CreationTime.Unix(), b.CreationTime.Unix())
 	require.Equal(t, a.State(), b.State())
+	require.Equal(t, a.TapSibling(), b.TapSibling())
 	require.Equal(t, a.BatchKey, b.BatchKey)
 	require.Equal(t, a.Seedlings, b.Seedlings)
-	require.Equal(t, a.GenesisPacket, b.GenesisPacket)
+	assertPsbtEqual(
+		t, &a.GenesisPacket.FundedPsbt, &b.GenesisPacket.FundedPsbt,
+	)
 	require.Equal(t, a.RootAssetCommitment, b.RootAssetCommitment)
 }
 
@@ -117,11 +135,13 @@ func storeGroupGenesis(t *testing.T, ctx context.Context, initGen asset.Genesis,
 		t, assetGen, nil, asset.RandScriptKey(t),
 	)
 	groupReq := asset.NewGroupKeyRequestNoErr(
-		t, privDesc, initGen, genProtoAsset, nil,
+		t, privDesc, fn.None[asset.ExternalKey](), initGen,
+		genProtoAsset, nil, fn.None[chainhash.Hash](),
 	)
-	groupKey, err := asset.DeriveGroupKey(
-		genSigner, &genTxBuilder, *groupReq,
-	)
+	genTx, err := groupReq.BuildGroupVirtualTx(&genTxBuilder)
+	require.NoError(t, err)
+
+	groupKey, err := asset.DeriveGroupKey(genSigner, *genTx, *groupReq, nil)
 	require.NoError(t, err)
 
 	initialAsset := asset.RandAssetWithValues(
@@ -134,9 +154,13 @@ func storeGroupGenesis(t *testing.T, ctx context.Context, initGen asset.Genesis,
 		_, err = maybeUpsertAssetMeta(ctx, q, &assetGen, nil)
 		require.NoError(t, err)
 
-		_, _, err := upsertAssetsWithGenesis(
+		// Insert a random managed UTXO.
+		utxoID := addRandomManagedUTXO(t, ctx, q, initialAsset)
+
+		_, _, err = upsertAssetsWithGenesis(
 			ctx, q, assetGen.FirstPrevOut,
-			[]*asset.Asset{initialAsset}, nil,
+			[]*asset.Asset{initialAsset},
+			[]sql.NullInt64{sqlInt64(utxoID)},
 		)
 		require.NoError(t, err)
 		return nil
@@ -150,6 +174,224 @@ func storeGroupGenesis(t *testing.T, ctx context.Context, initGen asset.Genesis,
 		Genesis:  &assetGen,
 		GroupKey: groupKey,
 	}
+}
+
+// addRandomManagedUTXO is a helper function that will create a random managed
+// UTXO for a given asset.
+func addRandomManagedUTXO(t *testing.T, ctx context.Context,
+	db PendingAssetStore, asset *asset.Asset) int64 {
+
+	// Create the taproot asset root for the given asset.
+	assetRoot, err := commitment.NewAssetCommitment(asset)
+	require.NoError(t, err)
+
+	commitVersion := test.RandFlip(nil, fn.Ptr(commitment.TapCommitmentV2))
+	taprootAssetCommitment, err := commitment.NewTapCommitment(
+		commitVersion, assetRoot,
+	)
+	taprootAssetRoot := taprootAssetCommitment.TapscriptRoot(nil)
+	require.NoError(t, err)
+
+	// Create an anchor transaction.
+	var blockHash chainhash.Hash
+	_, err = rand.Read(blockHash[:])
+	require.NoError(t, err)
+
+	anchorTx := wire.NewMsgTx(2)
+	anchorTx.AddTxIn(&wire.TxIn{})
+	anchorTx.AddTxOut(&wire.TxOut{
+		PkScript: bytes.Repeat([]byte{0x01}, 34),
+		Value:    10,
+	})
+
+	// We'll add the chain transaction to the database
+	var anchorTxBuf bytes.Buffer
+	err = anchorTx.Serialize(&anchorTxBuf)
+	require.NoError(t, err)
+	anchorTXID := anchorTx.TxHash()
+	chainTXID, err := db.UpsertChainTx(ctx, ChainTxParams{
+		Txid:        anchorTXID[:],
+		RawTx:       anchorTxBuf.Bytes(),
+		BlockHeight: sqlInt32(20),
+		BlockHash:   blockHash[:],
+		TxIndex:     sqlInt32(0),
+	})
+	require.NoError(t, err, "unable to insert chain tx: %w", err)
+
+	anchorPoint := wire.OutPoint{
+		Hash:  anchorTx.TxHash(),
+		Index: 0,
+	}
+	outpointBytes, err := encodeOutpoint(anchorPoint)
+	require.NoError(t, err)
+
+	randPubKey := test.RandPubKey(t)
+
+	// Insert an internal key.
+	_, err = db.UpsertInternalKey(ctx, InternalKey{
+		RawKey:    randPubKey.SerializeCompressed(),
+		KeyFamily: 1,
+		KeyIndex:  2,
+	})
+	require.NoError(t, err)
+
+	// Insert the managed UTXO.
+	managedUTXO := RawManagedUTXO{
+		RawKey:           randPubKey.SerializeCompressed(),
+		Outpoint:         outpointBytes,
+		AmtSats:          10,
+		TaprootAssetRoot: taprootAssetRoot[:],
+		RootVersion: sql.NullInt16{
+			Int16: int16(1),
+			Valid: true,
+		},
+		MerkleRoot:       taprootAssetRoot[:],
+		TapscriptSibling: []byte{},
+		TxnID:            chainTXID,
+	}
+	utxoID, err := db.UpsertManagedUTXO(ctx, managedUTXO)
+	require.NoError(t, err)
+
+	return utxoID
+}
+
+// treeFromLeaves generates a tapscript tree in multiple forms from a list of
+// tapscript leaves.
+func treeFromLeaves(t *testing.T, leaves []txscript.TapLeaf) (chainhash.Hash,
+	asset.TapscriptTreeNodes, [][]byte) {
+
+	tree, err := asset.TapTreeNodesFromLeaves(leaves)
+	require.NoError(t, err)
+
+	checkedLeaves := asset.GetLeaves(*tree).UnwrapToPtr()
+	require.NotNil(t, checkedLeaves)
+
+	treeBytes, err := asset.EncodeTapLeafNodes(*checkedLeaves)
+	require.NoError(t, err)
+
+	return asset.LeafNodesRootHash(*checkedLeaves), *tree, treeBytes
+}
+
+// treeFromBranch generates a tapscript tree in multiple forms from a set of
+// byte slices.
+func treeFromBranch(t *testing.T, children [][]byte) (chainhash.Hash,
+	asset.TapscriptTreeNodes, [][]byte) {
+
+	branch, err := asset.DecodeTapBranchNodes(children)
+	require.NoError(t, err)
+
+	tree := asset.FromBranch(*branch)
+	treeBytes := asset.EncodeTapBranchNodes(*branch)
+
+	return asset.BranchNodesRootHash(*branch), tree, treeBytes
+}
+
+// storeTapscriptTreeWrapper wraps a DB transaction that stores a tapscript
+// tree.
+func storeTapscriptTreeWrapper(ctx context.Context, isBranch bool,
+	store *AssetMintingStore, rootHash []byte, nodes [][]byte) error {
+
+	var writeTxOpts AssetStoreTxOptions
+	return store.db.ExecTx(ctx, &writeTxOpts,
+		func(q PendingAssetStore) error {
+			return upsertTapscriptTree(
+				ctx, q, rootHash, isBranch, nodes,
+			)
+		})
+}
+
+// fetchTapscriptTreeWrapper wraps a DB transaction that fetches a tapscript
+// tree.
+func fetchTapscriptTreeWrapper(ctx context.Context, rootHash []byte,
+	store *AssetMintingStore) ([]TapscriptTreeNode, error) {
+
+	var (
+		dbTreeNodes []TapscriptTreeNode
+		err         error
+	)
+
+	readOpts := NewAssetStoreReadTx()
+	dbErr := store.db.ExecTx(ctx, &readOpts,
+		func(q PendingAssetStore) error {
+			dbTreeNodes, err = q.FetchTapscriptTree(ctx, rootHash)
+			return err
+		})
+
+	return dbTreeNodes, dbErr
+}
+
+// deleteTapscriptTreeWrapper wraps a DB transaction that deletes a tapscript
+// tree.
+func deleteTapscriptTreeWrapper(ctx context.Context, rootHash []byte,
+	store *AssetMintingStore) error {
+
+	var writeTxOpts AssetStoreTxOptions
+	return store.db.ExecTx(ctx, &writeTxOpts,
+		func(q PendingAssetStore) error {
+			return deleteTapscriptTree(ctx, q, rootHash[:])
+		})
+}
+
+// assertTreeDeletion asserts that a tapscript tree has been deleted properly.
+func assertTreeDeletion(t *testing.T, ctx context.Context, rootHash []byte,
+	store *AssetMintingStore) {
+
+	dbTree, err := fetchTapscriptTreeWrapper(ctx, rootHash, store)
+	require.NoError(t, err)
+	require.Empty(t, dbTree)
+}
+
+// assertStoredTreeEqual asserts that the tapscript tree fetched with a root
+// hash matches the expected bytes.
+func assertStoredTreeEqual(t *testing.T, ctx context.Context, isBranch bool,
+	store *AssetMintingStore, rootHash []byte, expected [][]byte) {
+
+	dbTree, err := fetchTapscriptTreeWrapper(ctx, rootHash, store)
+	require.NoError(t, err)
+
+	require.True(t, fn.All(dbTree, func(node TapscriptTreeNode) bool {
+		return node.BranchOnly == isBranch
+	}))
+	dbTreeBytes := fn.Map(dbTree, func(node TapscriptTreeNode) []byte {
+		return node.RawNode
+	})
+	require.Equal(t, expected, dbTreeBytes)
+}
+
+// storeTapscriptTreeChecked asserts that we can store a tapscript tree, and
+// that the root hash returned matches the one calculated from the tree.
+func storeTapscriptTreeChecked(t *testing.T, ctx context.Context,
+	store *AssetMintingStore, tree asset.TapscriptTreeNodes,
+	hash chainhash.Hash) {
+
+	dbRootHash, err := store.StoreTapscriptTree(ctx, tree)
+	require.NoError(t, err)
+	require.True(t, hash.IsEqual(dbRootHash))
+}
+
+// loadTapscriptTreeChecked asserts that we can load a tapscript tree, and that
+// the tapscript tree returned matches the initial tree.
+func loadTapscriptTreeChecked(t *testing.T, ctx context.Context,
+	store *AssetMintingStore, tree asset.TapscriptTreeNodes,
+	hash chainhash.Hash) {
+
+	dbTree, err := store.LoadTapscriptTree(ctx, hash)
+	require.NoError(t, err)
+	require.NotNil(t, dbTree)
+	require.Equal(t, tree, *dbTree)
+}
+
+// deleteTapscriptTreeChecked asserts that we can delete a tapscript tree, and
+// that future attempts to load the deleted tree return the expected error.
+func deleteTapscriptTreeChecked(t *testing.T, ctx context.Context,
+	store *AssetMintingStore, hash chainhash.Hash) {
+
+	err := store.DeleteTapscriptTree(ctx, hash)
+	require.NoError(t, err)
+
+	dbTree, err := store.LoadTapscriptTree(ctx, hash)
+	require.Empty(t, dbTree)
+	require.ErrorIs(t, err, asset.ErrTreeNotFound)
 }
 
 // addRandGroupToBatch selects a random seedling, generates an asset genesis to
@@ -167,7 +409,7 @@ func addRandGroupToBatch(t *testing.T, store *AssetMintingStore,
 
 	// Generate a random genesis and group to use as a group anchor
 	// for this seedling.
-	privDesc, groupPriv := randKeyDesc(t)
+	privDesc, groupPriv := test.RandKeyDesc(t)
 	randGenesis := asset.RandGenesis(t, randAssetType)
 	genesisAmt, groupPriv, group := storeGroupGenesis(
 		t, ctx, randGenesis, nil, store, privDesc, groupPriv,
@@ -188,12 +430,28 @@ func addRandGroupToBatch(t *testing.T, store *AssetMintingStore,
 	return genesisAmt, seedlingGroups, group
 }
 
+// addRandSiblingToBatch generates a random hash and adds it to the given batch.
+func addRandSiblingToBatch(t *testing.T, batch *tapgarden.MintingBatch) (
+	commitment.TapscriptPreimage, chainhash.Hash) {
+
+	tapSiblingSingleLeaf := test.RandTapLeaf(nil)
+	siblingPreimage, err := commitment.NewPreimageFromLeaf(
+		tapSiblingSingleLeaf,
+	)
+	require.NoError(t, err)
+	tapSibling, err := siblingPreimage.TapHash()
+	require.NoError(t, err)
+	batch.UpdateTapSibling(tapSibling)
+
+	return *siblingPreimage, *tapSibling
+}
+
 // addMultiAssetGroupToBatch selects a random seedling pair, where neither
 // seedling is being issued into an existing group, and creates a multi-asset
 // group. Specifically, one seedling will have emission enabled, and the other
 // seedling will reference the first seedling as its group anchor.
-func addMultiAssetGroupToBatch(t *testing.T,
-	seedlings map[string]*tapgarden.Seedling) (string, string) {
+func addMultiAssetGroupToBatch(seedlings map[string]*tapgarden.Seedling) (
+	string, string) {
 
 	seedlingNames := maps.Keys(seedlings)
 	seedlingCount := len(seedlingNames)
@@ -220,6 +478,7 @@ func addMultiAssetGroupToBatch(t *testing.T,
 	// The anchor asset must have emission enabled, and the second asset
 	// must specify the first as its group anchor.
 	anchorSeedling.EnableEmission = true
+	anchorSeedling.GroupTapscriptRoot = test.RandBytes(32)
 	groupedSeedling.AssetType = anchorSeedling.AssetType
 	groupedSeedling.EnableEmission = false
 	groupedSeedling.GroupAnchor = &anchorSeedling.AssetName
@@ -242,9 +501,12 @@ func TestCommitMintingBatchSeedlings(t *testing.T) {
 	// internal key and a set of seedlings. One random seedling will
 	// be a reissuance into a specific group.
 	mintingBatch := tapgarden.RandSeedlingMintingBatch(t, numSeedlings)
-	addRandGroupToBatch(t, assetStore, ctx, mintingBatch.Seedlings)
+	_, randGroup, _ := addRandGroupToBatch(
+		t, assetStore, ctx, mintingBatch.Seedlings,
+	)
+	_, randSiblingHash := addRandSiblingToBatch(t, mintingBatch)
 	err := assetStore.CommitMintingBatch(ctx, mintingBatch)
-	require.NoError(t, err, "unable to write batch: %v", err)
+	require.NoError(t, err)
 
 	batchKey := mintingBatch.BatchKey.PubKey
 
@@ -252,7 +514,9 @@ func TestCommitMintingBatchSeedlings(t *testing.T) {
 	// have it be exactly the same as what we wrote.
 	mintingBatches := noError1(t, assetStore.FetchNonFinalBatches, ctx)
 	assertSeedlingBatchLen(t, mintingBatches, 1, numSeedlings)
+	require.NotNil(t, mintingBatches[0].GenesisPacket)
 	assertBatchEqual(t, mintingBatch, mintingBatches[0])
+	assertBatchSibling(t, mintingBatch, randSiblingHash)
 
 	mintingBatchKeyed, err := assetStore.FetchMintingBatch(ctx, batchKey)
 	require.NoError(t, err)
@@ -265,13 +529,11 @@ func TestCommitMintingBatchSeedlings(t *testing.T) {
 	seedlings := tapgarden.RandSeedlings(t, numSeedlings)
 
 	// Pick a random seedling and give it a specific group.
-	addRandGroupToBatch(t, assetStore, ctx, seedlings)
+	_, secondGroup, _ := addRandGroupToBatch(t, assetStore, ctx, seedlings)
 	mintingBatch.Seedlings = mergeMap(mintingBatch.Seedlings, seedlings)
-	require.NoError(t,
-		assetStore.AddSeedlingsToBatch(
-			ctx, batchKey, maps.Values(seedlings)...,
-		), "unable to write seedlings: %v", err,
-	)
+	require.NoError(t, assetStore.AddSeedlingsToBatch(
+		ctx, batchKey, maps.Values(seedlings)...,
+	))
 
 	// If we read the batch from disk again, then we should have 10 total
 	// seedlings, and the batch still matches what we wrote to disk.
@@ -297,6 +559,31 @@ func TestCommitMintingBatchSeedlings(t *testing.T) {
 	mintingBatches = noError1(t, assetStore.FetchNonFinalBatches, ctx)
 	assertSeedlingBatchLen(t, mintingBatches, 0, 0)
 
+	// Insert the batch seedlings as assets before fetching the finalized
+	// batch. This test won't check if these were stored correctly, but
+	// batches cannot be finalized without any sprouted assets.
+	genesisPacket := mintingBatch.GenesisPacket
+	randGroup = mergeMap(randGroup, secondGroup)
+	assetRoot := seedlingsToAssetRoot(
+		t, genesisPacket.Pkt.UnsignedTx.TxIn[0].PreviousOutPoint,
+		mintingBatch.Seedlings, randGroup,
+	)
+	genesisScript, err := tapscript.PayToAddrScript(
+		*batchKey, &randSiblingHash, *assetRoot,
+	)
+	require.NoError(t, err)
+
+	genesisPacket.Pkt.UnsignedTx.TxOut[0].PkScript = genesisScript
+
+	// Adding sprouts updates the batch state to committed, so we'll set it
+	// back to finalized.
+	require.NoError(t, assetStore.AddSproutsToBatch(
+		ctx, batchKey, genesisPacket, assetRoot,
+	))
+	require.NoError(t, assetStore.UpdateBatchState(
+		ctx, batchKey, tapgarden.BatchStateFinalized,
+	))
+
 	// We should still be able to fetch the finalized batch from disk.
 	mintingBatchKeyed, err = assetStore.FetchMintingBatch(ctx, batchKey)
 	require.NoError(t, err)
@@ -313,25 +600,12 @@ func TestCommitMintingBatchSeedlings(t *testing.T) {
 	require.ErrorContains(t, err, "no batch with key")
 
 	// Insert another normal batch into the database. We should get this
-	// batch back if we query for the set of non final batches.
+	// batch back if we query for the set of non-final batches.
 	mintingBatch = tapgarden.RandSeedlingMintingBatch(t, numSeedlings)
 	err = assetStore.CommitMintingBatch(ctx, mintingBatch)
 	require.NoError(t, err)
 	mintingBatches = noError1(t, assetStore.FetchNonFinalBatches, ctx)
 	assertSeedlingBatchLen(t, mintingBatches, 1, numSeedlings)
-}
-
-func randKeyDesc(t *testing.T) (keychain.KeyDescriptor, *btcec.PrivateKey) {
-	priv, err := btcec.NewPrivateKey()
-	require.NoError(t, err)
-
-	return keychain.KeyDescriptor{
-		PubKey: priv.PubKey(),
-		KeyLocator: keychain.KeyLocator{
-			Index:  uint32(rand.Int31()),
-			Family: keychain.KeyFamily(rand.Int31()),
-		},
-	}, priv
 }
 
 // seedlingsToAssetRoot maps a set of seedlings to an asset root.
@@ -359,9 +633,6 @@ func seedlingsToAssetRoot(t *testing.T, genesisPoint wire.OutPoint,
 		if seedling.Meta != nil {
 			assetGen.MetaHash = seedling.Meta.MetaHash()
 		}
-
-		scriptKey, _ := randKeyDesc(t)
-		tweakedScriptKey := asset.NewScriptKeyBip86(scriptKey)
 
 		var (
 			genTxBuilder = tapscript.GroupTxBuilder{}
@@ -396,7 +667,7 @@ func seedlingsToAssetRoot(t *testing.T, genesisPoint wire.OutPoint,
 
 		if groupInfo != nil || seedling.EnableEmission {
 			protoAsset, err = asset.New(
-				assetGen, amount, 0, 0, tweakedScriptKey, nil,
+				assetGen, amount, 0, 0, seedling.ScriptKey, nil,
 			)
 			require.NoError(t, err)
 		}
@@ -404,23 +675,41 @@ func seedlingsToAssetRoot(t *testing.T, genesisPoint wire.OutPoint,
 		if groupInfo != nil {
 			groupReq := asset.NewGroupKeyRequestNoErr(
 				t, groupInfo.GroupKey.RawKey,
-				*groupInfo.Genesis, protoAsset, nil,
+				fn.None[asset.ExternalKey](),
+				*groupInfo.Genesis, protoAsset,
+				groupInfo.GroupKey.TapscriptRoot,
+				fn.None[chainhash.Hash](),
 			)
+			genTx, err := groupReq.BuildGroupVirtualTx(
+				&genTxBuilder,
+			)
+			require.NoError(t, err)
+
 			groupKey, err = asset.DeriveGroupKey(
 				asset.NewMockGenesisSigner(groupPriv),
-				&genTxBuilder, *groupReq,
+				*genTx, *groupReq, nil,
 			)
+			require.NoError(t, err)
 		}
 
 		if seedling.EnableEmission {
-			groupKeyRaw, newGroupPriv := randKeyDesc(t)
+			groupKeyRaw, newGroupPriv := test.RandKeyDesc(t)
 			genSigner := asset.NewMockGenesisSigner(newGroupPriv)
 			groupReq := asset.NewGroupKeyRequestNoErr(
-				t, groupKeyRaw, assetGen, protoAsset, nil,
+				t, groupKeyRaw, fn.None[asset.ExternalKey](),
+				assetGen, protoAsset,
+				seedling.GroupTapscriptRoot,
+				fn.None[chainhash.Hash](),
 			)
+			genTx, err := groupReq.BuildGroupVirtualTx(
+				&genTxBuilder,
+			)
+			require.NoError(t, err)
+
 			groupKey, err = asset.DeriveGroupKey(
-				genSigner, &genTxBuilder, *groupReq,
+				genSigner, *genTx, *groupReq, nil,
 			)
+			require.NoError(t, err)
 			newGroupPrivs[seedling.AssetName] = newGroupPriv
 			newGroupInfo[seedling.AssetName] = &asset.AssetGroup{
 				Genesis:  &assetGen,
@@ -431,7 +720,7 @@ func seedlingsToAssetRoot(t *testing.T, genesisPoint wire.OutPoint,
 		require.NoError(t, err)
 
 		newAsset, err := asset.New(
-			assetGen, amount, 0, 0, tweakedScriptKey, groupKey,
+			assetGen, amount, 0, 0, seedling.ScriptKey, groupKey,
 			asset.WithAssetVersion(seedling.AssetVersion),
 		)
 		require.NoError(t, err)
@@ -444,49 +733,15 @@ func seedlingsToAssetRoot(t *testing.T, genesisPoint wire.OutPoint,
 		assetRoots = append(assetRoots, assetRoot)
 	}
 
-	tapCommitment, err := commitment.NewTapCommitment(assetRoots...)
+	tapCommitment, err := commitment.NewTapCommitment(nil, assetRoots...)
 	require.NoError(t, err)
 
 	return tapCommitment
 }
 
-func randGenesisPacket(t *testing.T) *tapgarden.FundedPsbt {
-	tx := wire.NewMsgTx(2)
-
-	var hash chainhash.Hash
-	_, err := rand.Read(hash[:])
-	require.NoError(t, err)
-
-	tx.AddTxIn(&wire.TxIn{
-		PreviousOutPoint: wire.OutPoint{
-			Hash:  hash,
-			Index: 1,
-		},
-	})
-	tx.AddTxOut(&wire.TxOut{
-		PkScript: bytes.Repeat([]byte{0x01}, 34),
-		Value:    5,
-	})
-	tx.AddTxOut(&wire.TxOut{
-		PkScript: bytes.Repeat([]byte{0x02}, 34),
-		Value:    10,
-	})
-	tx.AddTxOut(&wire.TxOut{
-		PkScript: bytes.Repeat([]byte{0x02}, 34),
-		Value:    15,
-	})
-
-	packet, err := psbt.NewFromUnsignedTx(tx)
-	require.NoError(t, err)
-	return &tapgarden.FundedPsbt{
-		Pkt:               packet,
-		ChangeOutputIndex: 1,
-		ChainFees:         100,
-	}
-}
-
-func assertPsbtEqual(t *testing.T, a, b *tapgarden.FundedPsbt) {
+func assertPsbtEqual(t *testing.T, a, b *tapsend.FundedPsbt) {
 	require.Equal(t, a.ChangeOutputIndex, b.ChangeOutputIndex)
+	require.Equal(t, a.ChainFees, b.ChainFees)
 	require.Equal(t, a.LockedUTXOs, b.LockedUTXOs)
 
 	var aBuf, bBuf bytes.Buffer
@@ -557,11 +812,26 @@ func TestAddSproutsToBatch(t *testing.T) {
 
 	// Now that the batch is on disk, we'll map those seedlings to an
 	// actual asset commitment, then insert them into the DB as sprouts.
-	genesisPacket := randGenesisPacket(t)
+	genesisPacket := mintingBatch.GenesisPacket
 	assetRoot := seedlingsToAssetRoot(
 		t, genesisPacket.Pkt.UnsignedTx.TxIn[0].PreviousOutPoint,
 		mintingBatch.Seedlings, seedlingGroups,
 	)
+
+	// Update the pkScript of the anchor output in the genesis packet to
+	// make sure the validation doesn't fail when reading the batch from the
+	// DB again.
+	anchorOutputIndex := uint32(0)
+	if mintingBatch.GenesisPacket.ChangeOutputIndex == 0 {
+		anchorOutputIndex = 1
+	}
+
+	script, err := tapscript.PayToAddrScript(
+		*mintingBatch.BatchKey.PubKey, nil, *assetRoot,
+	)
+	require.NoError(t, err)
+	genesisPacket.Pkt.UnsignedTx.TxOut[anchorOutputIndex].PkScript = script
+
 	require.NoError(t, assetStore.AddSproutsToBatch(
 		ctx, batchKey, genesisPacket, assetRoot,
 	))
@@ -575,7 +845,10 @@ func TestAddSproutsToBatch(t *testing.T) {
 	// state.
 	assertSeedlingBatchLen(t, mintingBatches, 1, 0)
 	assertBatchState(t, mintingBatches[0], tapgarden.BatchStateCommitted)
-	assertPsbtEqual(t, genesisPacket, mintingBatches[0].GenesisPacket)
+	assertPsbtEqual(
+		t, &genesisPacket.FundedPsbt,
+		&mintingBatches[0].GenesisPacket.FundedPsbt,
+	)
 	assertAssetsEqual(t, assetRoot, mintingBatches[0].RootAssetCommitment)
 
 	// We also expect that for each of the assets we created above, we're
@@ -601,13 +874,17 @@ func TestAddSproutsToBatch(t *testing.T) {
 }
 
 type randAssetCtx struct {
-	batchKey     *btcec.PublicKey
-	groupKey     *btcec.PublicKey
-	groupGenAmt  uint64
-	genesisPkt   *tapgarden.FundedPsbt
-	scriptRoot   []byte
-	assetRoot    *commitment.TapCommitment
-	mintingBatch *tapgarden.MintingBatch
+	batchKey        *btcec.PublicKey
+	groupKey        *btcec.PublicKey
+	groupGenAmt     uint64
+	genesisPkt      *tapsend.FundedPsbt
+	assetRoot       *commitment.TapCommitment
+	merkleRoot      []byte
+	scriptRoot      []byte
+	tapSiblingBytes []byte
+	tapSiblingHash  chainhash.Hash
+	mintingBatch    *tapgarden.MintingBatch
+	groupGenesis    *asset.Genesis
 }
 
 func addRandAssets(t *testing.T, ctx context.Context,
@@ -617,29 +894,56 @@ func addRandAssets(t *testing.T, ctx context.Context,
 	genAmt, seedlingGroups, group := addRandGroupToBatch(
 		t, assetStore, ctx, mintingBatch.Seedlings,
 	)
+	randSibling, randSiblingHash := addRandSiblingToBatch(t, mintingBatch)
 	batchKey := mintingBatch.BatchKey.PubKey
 	require.NoError(t, assetStore.CommitMintingBatch(ctx, mintingBatch))
 
-	genesisPacket := randGenesisPacket(t)
-
+	genesisPacket := mintingBatch.GenesisPacket
 	assetRoot := seedlingsToAssetRoot(
 		t, genesisPacket.Pkt.UnsignedTx.TxIn[0].PreviousOutPoint,
 		mintingBatch.Seedlings, seedlingGroups,
 	)
+
+	// Update the pkScript of the anchor output in the genesis packet to
+	// make sure the validation doesn't fail when reading the batch from the
+	// DB again.
+	anchorOutputIndex := uint32(0)
+	if mintingBatch.GenesisPacket.ChangeOutputIndex == 0 {
+		anchorOutputIndex = 1
+	}
+
+	mintingBatch.RootAssetCommitment = assetRoot
+	mintingOutputKey, _, err := mintingBatch.MintingOutputKey(&randSibling)
+	require.NoError(t, err)
+
+	script, err := txscript.PayToTaprootScript(mintingOutputKey)
+	require.NoError(t, err)
+
+	genesisPacket.Pkt.UnsignedTx.TxOut[anchorOutputIndex].PkScript = script
+
 	require.NoError(t, assetStore.AddSproutsToBatch(
 		ctx, batchKey, genesisPacket, assetRoot,
 	))
 
+	merkleRoot := assetRoot.TapscriptRoot(&randSiblingHash)
 	scriptRoot := assetRoot.TapscriptRoot(nil)
+	siblingBytes, _, err := commitment.MaybeEncodeTapscriptPreimage(
+		&randSibling,
+	)
+	require.NoError(t, err)
 
 	return randAssetCtx{
-		batchKey:     batchKey,
-		groupKey:     &group.GroupKey.GroupPubKey,
-		groupGenAmt:  genAmt,
-		genesisPkt:   genesisPacket,
-		scriptRoot:   scriptRoot[:],
-		assetRoot:    assetRoot,
-		mintingBatch: mintingBatch,
+		batchKey:        batchKey,
+		groupKey:        &group.GroupKey.GroupPubKey,
+		groupGenAmt:     genAmt,
+		genesisPkt:      &genesisPacket.FundedPsbt,
+		assetRoot:       assetRoot,
+		merkleRoot:      merkleRoot[:],
+		scriptRoot:      scriptRoot[:],
+		tapSiblingBytes: siblingBytes,
+		tapSiblingHash:  randSiblingHash,
+		mintingBatch:    mintingBatch,
+		groupGenesis:    group.Genesis,
 	}
 }
 
@@ -657,8 +961,6 @@ func TestCommitBatchChainActions(t *testing.T) {
 
 	// First, we'll create a new batch, then add some sample seedlings, and
 	// then those seedlings as assets.
-	//
-	// nolint:lll
 	randAssetCtx := addRandAssets(t, ctx, assetStore, numSeedlings)
 
 	// The packet needs to be finalized, so we'll insert a fake
@@ -672,8 +974,9 @@ func TestCommitBatchChainActions(t *testing.T) {
 	// to disk, along with the Taproot Asset script root that's stored
 	// alongside any managed UTXOs.
 	require.NoError(t, assetStore.CommitSignedGenesisTx(
-		ctx, randAssetCtx.batchKey, randAssetCtx.genesisPkt, 2,
-		randAssetCtx.scriptRoot,
+		ctx, randAssetCtx.batchKey, randAssetCtx.genesisPkt, 0,
+		randAssetCtx.merkleRoot, randAssetCtx.scriptRoot,
+		randAssetCtx.tapSiblingBytes,
 	))
 
 	// The batch updated above should be found, with the batch state
@@ -684,8 +987,10 @@ func TestCommitBatchChainActions(t *testing.T) {
 		t, mintingBatches[0], tapgarden.BatchStateBroadcast,
 	)
 	assertPsbtEqual(
-		t, randAssetCtx.genesisPkt, mintingBatches[0].GenesisPacket,
+		t, randAssetCtx.genesisPkt,
+		&mintingBatches[0].GenesisPacket.FundedPsbt,
 	)
+	assertBatchSibling(t, mintingBatches[0], randAssetCtx.tapSiblingHash)
 
 	var rawTxBytes bytes.Buffer
 	rawGenTx, err := psbt.Extract(randAssetCtx.genesisPkt.Pkt)
@@ -710,7 +1015,11 @@ func TestCommitBatchChainActions(t *testing.T) {
 		TxnID: sqlInt64(dbGenTx.TxnID),
 	})
 	require.NoError(t, err)
-	require.Equal(t, randAssetCtx.scriptRoot, managedUTXO.MerkleRoot)
+	require.Equal(t, randAssetCtx.merkleRoot, managedUTXO.MerkleRoot)
+	require.Equal(t, randAssetCtx.scriptRoot, managedUTXO.TaprootAssetRoot)
+	require.Equal(
+		t, randAssetCtx.tapSiblingBytes, managedUTXO.TapscriptSibling,
+	)
 
 	// Next, we'll confirm that all the assets inserted previously now are
 	// able to be queried according to the anchor UTXO primary key.
@@ -755,27 +1064,28 @@ func TestCommitBatchChainActions(t *testing.T) {
 	)
 	require.Equal(t, txIndex, extractSqlInt32[uint32](dbGenTx.TxIndex))
 
-	// If we query for the set of all active assets, then we should get
-	// back the same number of seedlings.
+	// If we query for the set of all active assets, then we should get back
+	// the number of seedlings AND also the genesis asset we have created
+	// with `addRandAssets`.
 	//
 	// TODO(roasbeef): move into isolated test
 	assets, err := confAssets.FetchAllAssets(ctx, false, false, nil)
 	require.NoError(t, err)
-	require.Equal(t, numSeedlings, len(assets))
+	require.Equal(t, numSeedlings+1, len(assets))
 
 	// Count the number of assets with a group key. Each grouped asset
 	// should have a grouped genesis witness.
-	groupCount := fn.Count(assets, func(a *ChainAsset) bool {
+	groupCount := fn.Count(assets, func(a *asset.ChainAsset) bool {
 		return a.GroupKey != nil
 	})
-	groupWitnessCount := fn.Count(assets, func(a *ChainAsset) bool {
+	groupWitnessCount := fn.Count(assets, func(a *asset.ChainAsset) bool {
 		return a.HasGenesisWitnessForGroup()
 	})
 	require.Equal(t, groupCount, groupWitnessCount)
 
 	// All the assets returned should have the genesis prev ID set up.
 	ungroupedCount := len(assets) - groupCount
-	genesisWitnessCount := fn.Count(assets, func(a *ChainAsset) bool {
+	genesisWitnessCount := fn.Count(assets, func(a *asset.ChainAsset) bool {
 		return a.HasGenesisWitness()
 	})
 	require.Equal(t, ungroupedCount, genesisWitnessCount)
@@ -783,9 +1093,15 @@ func TestCommitBatchChainActions(t *testing.T) {
 	// All the assets should also have a matching asset version as the
 	// seedlings we created.
 	mintingBatch := randAssetCtx.mintingBatch
-	require.True(t, fn.All(assets, func(dbAsset *ChainAsset) bool {
+	randomGenesisTag := randAssetCtx.groupGenesis.Tag
+	require.True(t, fn.All(assets, func(dbAsset *asset.ChainAsset) bool {
 		seedling, ok := mintingBatch.Seedlings[dbAsset.Genesis.Tag]
 		if !ok {
+			// The only asset that doesn't have a seedling is the
+			// random genesis asset created by `addRandAssets`
+			if dbAsset.Genesis.Tag == randomGenesisTag {
+				return true
+			}
 			t.Logf("seedling for %v not found",
 				dbAsset.Genesis.Tag)
 			return ok
@@ -809,15 +1125,17 @@ func TestCommitBatchChainActions(t *testing.T) {
 
 	// If we look up all the proofs by their specific script key, we should
 	// get the same set of proofs.
-	scriptKeys := fMapKeys(
-		assetProofs, func(k asset.SerializedKey) *btcec.PublicKey {
-			parsed, err := btcec.ParsePubKey(k.CopyBytes())
+	proofLocators := fMapKeys(
+		assetProofs, func(k asset.SerializedKey) proof.Locator {
+			parsedScriptKey, err := btcec.ParsePubKey(k.CopyBytes())
 			require.NoError(t, err)
 
-			return parsed
+			return proof.Locator{
+				ScriptKey: *parsedScriptKey,
+			}
 		},
 	)
-	diskProofs, err = confAssets.FetchAssetProofs(ctx, scriptKeys...)
+	diskProofs, err = confAssets.FetchAssetProofs(ctx, proofLocators...)
 	require.NoError(t, err)
 	require.Equal(t, assetProofs, diskProofs)
 
@@ -825,7 +1143,9 @@ func TestCommitBatchChainActions(t *testing.T) {
 
 	// We'll now query for the set of balances to ensure they all line up
 	// with the assets we just created, including the group genesis asset.
-	assetBalances, err := confAssets.QueryBalancesByAsset(ctx, nil)
+	assetBalances, err := confAssets.QueryBalancesByAsset(
+		ctx, nil, false, fn.None[asset.ScriptKeyType](),
+	)
 	require.NoError(t, err)
 	require.Equal(t, numSeedlings+1, len(assetBalances))
 
@@ -847,7 +1167,7 @@ func TestCommitBatchChainActions(t *testing.T) {
 	}
 	numKeyGroups := fn.Reduce(mintedAssets, keyGroupSumReducer)
 	assetBalancesByGroup, err := confAssets.QueryAssetBalancesByGroup(
-		ctx, nil,
+		ctx, nil, false, fn.None[asset.ScriptKeyType](),
 	)
 	require.NoError(t, err)
 	require.Equal(t, numKeyGroups, len(assetBalancesByGroup))
@@ -887,7 +1207,7 @@ func TestDuplicateGroupKey(t *testing.T) {
 
 	// Now that we have the DB, we'll insert a new random internal key, and
 	// then a key family linked to that internal key.
-	keyDesc, _ := randKeyDesc(t)
+	keyDesc, _ := test.RandKeyDesc(t)
 	rawKey := keyDesc.PubKey.SerializeCompressed()
 
 	keyID, err := db.UpsertInternalKey(ctx, InternalKey{
@@ -934,12 +1254,12 @@ func TestGroupStore(t *testing.T) {
 
 	// Now we generate and store one group of two assets, and
 	// a collectible in its own group.
-	privDesc1, groupPriv1 := randKeyDesc(t)
+	privDesc1, groupPriv1 := test.RandKeyDesc(t)
 	gen1 := asset.RandGenesis(t, asset.Normal)
 	_, _, group1 := storeGroupGenesis(
 		t, ctx, gen1, nil, assetStore, privDesc1, groupPriv1,
 	)
-	privDesc2, groupPriv2 := randKeyDesc(t)
+	privDesc2, groupPriv2 := test.RandKeyDesc(t)
 	gen2 := asset.RandGenesis(t, asset.Collectible)
 	_, _, group2 := storeGroupGenesis(
 		t, ctx, gen2, nil, assetStore, privDesc2, groupPriv2,
@@ -1084,9 +1404,9 @@ func TestGroupAnchors(t *testing.T) {
 	_, seedlingGroups, _ := addRandGroupToBatch(
 		t, assetStore, ctx, mintingBatch.Seedlings,
 	)
-	addMultiAssetGroupToBatch(t, mintingBatch.Seedlings)
+	addMultiAssetGroupToBatch(mintingBatch.Seedlings)
 	err := assetStore.CommitMintingBatch(ctx, mintingBatch)
-	require.NoError(t, err, "unable to write batch: %v", err)
+	require.NoError(t, err)
 
 	batchKey := mintingBatch.BatchKey.PubKey
 
@@ -1099,9 +1419,7 @@ func TestGroupAnchors(t *testing.T) {
 	// Now we'll add an additional set of seedlings with
 	// another multi-asset group.
 	seedlings := tapgarden.RandSeedlings(t, numSeedlings)
-	secondAnchor, secondGrouped := addMultiAssetGroupToBatch(
-		t, seedlings,
-	)
+	secondAnchor, secondGrouped := addMultiAssetGroupToBatch(seedlings)
 
 	// We add seedlings one at a time, in order, as the planter does.
 	mintingBatch.Seedlings = mergeMap(mintingBatch.Seedlings, seedlings)
@@ -1144,11 +1462,26 @@ func TestGroupAnchors(t *testing.T) {
 
 	// Now we'll map these seedlings to an asset commitment and insert them
 	// into the DB as sprouts.
-	genesisPacket := randGenesisPacket(t)
+	genesisPacket := mintingBatch.GenesisPacket
 	assetRoot := seedlingsToAssetRoot(
 		t, genesisPacket.Pkt.UnsignedTx.TxIn[0].PreviousOutPoint,
 		mintingBatch.Seedlings, seedlingGroups,
 	)
+
+	// Update the pkScript of the anchor output in the genesis packet to
+	// make sure the validation doesn't fail when reading the batch from the
+	// DB again.
+	anchorOutputIndex := uint32(0)
+	if mintingBatch.GenesisPacket.ChangeOutputIndex == 0 {
+		anchorOutputIndex = 1
+	}
+
+	script, err := tapscript.PayToAddrScript(
+		*mintingBatch.BatchKey.PubKey, nil, *assetRoot,
+	)
+	require.NoError(t, err)
+	genesisPacket.Pkt.UnsignedTx.TxOut[anchorOutputIndex].PkScript = script
+
 	require.NoError(t, assetStore.AddSproutsToBatch(
 		ctx, batchKey, genesisPacket, assetRoot,
 	))
@@ -1162,7 +1495,10 @@ func TestGroupAnchors(t *testing.T) {
 	// state.
 	assertSeedlingBatchLen(t, mintingBatches, 1, 0)
 	assertBatchState(t, mintingBatches[0], tapgarden.BatchStateCommitted)
-	assertPsbtEqual(t, genesisPacket, mintingBatches[0].GenesisPacket)
+	assertPsbtEqual(
+		t, &genesisPacket.FundedPsbt,
+		&mintingBatches[0].GenesisPacket.FundedPsbt,
+	)
 	assertAssetsEqual(t, assetRoot, mintingBatches[0].RootAssetCommitment)
 
 	// Check that the number of group anchors and members matches the batch
@@ -1189,11 +1525,395 @@ func TestGroupAnchors(t *testing.T) {
 	require.Equal(t, groupAnchors, rawGroupAnchors)
 }
 
+// TestTapscriptTreeStore tests the functions that use the queries of the
+// TapscriptTreeStore interface.
+func TestTapscriptTreeStore(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+
+	// First, we'll open up a new asset store. We only need the mintingStore
+	// pointer, as we're only testing the TapscriptTreeStore functionality
+	// here.
+	assetStore, _, _ := newAssetStore(t)
+
+	// Now we generate a set of tapLeafs and tapBranches to store.
+	randLeafCount := 4
+	var tapLeaves []txscript.TapLeaf
+	for i := 0; i < randLeafCount; i++ {
+		leaf := test.RandTapLeaf(nil)
+		tapLeaves = append(tapLeaves, leaf)
+	}
+
+	// Let's add a duplicate tapLeaf as well.
+	dupeNode := txscript.NewBaseTapLeaf(tapLeaves[1].Script)
+	tapLeaves = append(tapLeaves, dupeNode)
+
+	branchChildCount := 3
+	var tapBranchChildren [][]byte
+	for i := 0; i < branchChildCount; i++ {
+		tapBranchChildren = append(
+			tapBranchChildren, test.RandBytes(chainhash.HashSize),
+		)
+	}
+
+	// Now, let's compute root hashes for the trees we'll load and store.
+	// We will use 5 trees total, as drawn below.
+	//
+	// tree 1: tapLeaves[0]
+	// tree 2: tapLeaves[:3] (first three nodes)
+	// tree 3; tapLeaves[:] (five nodes, including a duplicate from tree 2)
+	// tree 4: tapBranchChildren[:2] (first two branch nodes)
+	// tree 5: tapBranchChildren[1:] (last two branch nodes)
+
+	tree1Hash, _, tree1 := treeFromLeaves(
+		t, []txscript.TapLeaf{tapLeaves[0]},
+	)
+	tree2Hash, _, tree2 := treeFromLeaves(t, tapLeaves[:3])
+	tree3Hash, _, tree3 := treeFromLeaves(t, tapLeaves[:])
+	tree4Hash, _, tree4 := treeFromBranch(t, tapBranchChildren[:2])
+	tree5Hash, _, tree5 := treeFromBranch(t, tapBranchChildren[1:])
+
+	// Start with the cases where tree insertion should fail.
+	badRootHashErr := storeTapscriptTreeWrapper(
+		ctx, false, assetStore, tree1Hash[1:], tree1,
+	)
+	require.ErrorContains(t, badRootHashErr, "must be 32 bytes")
+
+	emptyTreeErr := storeTapscriptTreeWrapper(
+		ctx, false, assetStore, tree1Hash[:], nil,
+	)
+	require.ErrorContains(t, emptyTreeErr, "no tapscript tree nodes")
+
+	invalidBranchErr := storeTapscriptTreeWrapper(
+		ctx, true, assetStore, tree4Hash[:], tree3,
+	)
+	require.ErrorContains(t, invalidBranchErr, "must be 2 nodes")
+
+	// Now, let's insert the first tree, and then assert that we can fetch
+	// and decode an identical tree.
+	err := storeTapscriptTreeWrapper(
+		ctx, false, assetStore, tree1Hash[:], tree1,
+	)
+	require.NoError(t, err)
+
+	assertStoredTreeEqual(t, ctx, false, assetStore, tree1Hash[:], tree1)
+
+	// If we try to fetch a tree with a different root hash, that will not
+	// return an error, but the results should be empty.
+	dbTree2, err := fetchTapscriptTreeWrapper(ctx, tree2Hash[:], assetStore)
+	require.Empty(t, dbTree2)
+	require.Nil(t, err)
+
+	// Trying to delete a tree we haven't inserted yet will not err.
+	err = deleteTapscriptTreeWrapper(ctx, tree2Hash[:], assetStore)
+	require.Nil(t, err)
+
+	// Insert the second tree, which has one node already inserted.
+	err = storeTapscriptTreeWrapper(
+		ctx, false, assetStore, tree2Hash[:], tree2,
+	)
+	require.NoError(t, err)
+
+	// Fetching both trees should still work.
+	assertStoredTreeEqual(t, ctx, false, assetStore, tree1Hash[:], tree1)
+	assertStoredTreeEqual(t, ctx, false, assetStore, tree2Hash[:], tree2)
+
+	// If we delete the first tree, we should still be able to fetch the
+	// second tree intact.
+	err = deleteTapscriptTreeWrapper(ctx, tree1Hash[:], assetStore)
+	require.NoError(t, err)
+	assertTreeDeletion(t, ctx, tree1Hash[:], assetStore)
+
+	assertStoredTreeEqual(t, ctx, false, assetStore, tree2Hash[:], tree2)
+
+	// Let's insert the third tree, which contains a node that's a duplicate
+	// of an already-inserted node.
+	err = storeTapscriptTreeWrapper(
+		ctx, false, assetStore, tree3Hash[:], tree3,
+	)
+	require.NoError(t, err)
+
+	// Fetching the second and third trees should succeed.
+	assertStoredTreeEqual(t, ctx, false, assetStore, tree2Hash[:], tree2)
+	assertStoredTreeEqual(t, ctx, false, assetStore, tree3Hash[:], tree3)
+
+	// Deleting the third tree should not affect the second tree.
+	err = deleteTapscriptTreeWrapper(ctx, tree3Hash[:], assetStore)
+	require.NoError(t, err)
+	assertTreeDeletion(t, ctx, tree1Hash[:], assetStore)
+
+	assertStoredTreeEqual(t, ctx, false, assetStore, tree2Hash[:], tree2)
+
+	// Let's also test handling of tapscript branches.
+	err = storeTapscriptTreeWrapper(
+		ctx, true, assetStore, tree4Hash[:], tree4,
+	)
+	require.NoError(t, err)
+
+	assertStoredTreeEqual(t, ctx, true, assetStore, tree4Hash[:], tree4)
+
+	// The second tapscript branch shares a node with the first.
+	err = storeTapscriptTreeWrapper(
+		ctx, true, assetStore, tree5Hash[:], tree5,
+	)
+	require.NoError(t, err)
+
+	assertStoredTreeEqual(t, ctx, true, assetStore, tree4Hash[:], tree4)
+	assertStoredTreeEqual(t, ctx, true, assetStore, tree5Hash[:], tree5)
+
+	// Deleting the first set of branches should not affect the second.
+	err = deleteTapscriptTreeWrapper(ctx, tree4Hash[:], assetStore)
+	require.NoError(t, err)
+	assertTreeDeletion(t, ctx, tree4Hash[:], assetStore)
+
+	assertStoredTreeEqual(t, ctx, true, assetStore, tree5Hash[:], tree5)
+}
+
+// TestTapscriptTreeManager tests the functions that implement the
+// TapscriptTreeManager interface. This follows the same actions as
+// TestTapscriptTreeStore, but with higher-level functions.
+func TestTapscriptTreeManager(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+
+	// First, we'll open up a new asset store. We only need the mintingStore
+	// pointer, as we're only testing the TapscriptTreeStore functionality
+	// here.
+	assetStore, _, _ := newAssetStore(t)
+
+	// Now we generate a set of tapLeafs and tapBranches to store.
+	randLeafCount := 4
+	var tapLeaves []txscript.TapLeaf
+	for i := 0; i < randLeafCount; i++ {
+		leaf := test.RandTapLeaf(nil)
+		tapLeaves = append(tapLeaves, leaf)
+	}
+
+	// Let's add a duplicate tapLeaf as well.
+	dupeNode := txscript.NewBaseTapLeaf(tapLeaves[1].Script)
+	tapLeaves = append(tapLeaves, dupeNode)
+
+	branchChildCount := 3
+	var tapBranchChildren [][]byte
+	for i := 0; i < branchChildCount; i++ {
+		tapBranchChildren = append(
+			tapBranchChildren, test.RandBytes(chainhash.HashSize),
+		)
+	}
+
+	// Now, let's compute root hashes for the trees we'll load and store.
+	// We will use 5 trees total, as drawn below.
+	//
+	// tree 1: tapLeaves[0]
+	// tree 2: tapLeaves[:3] (first three nodes)
+	// tree 3; tapLeaves[:] (five nodes, including a duplicate from tree 2)
+	// tree 4: tapBranchChildren[:2] (first two branch nodes)
+	// tree 5: tapBranchChildren[1:] (last two branch nodes)
+
+	tree1Hash, tree1, _ := treeFromLeaves(
+		t, []txscript.TapLeaf{tapLeaves[0]},
+	)
+	tree2Hash, tree2, _ := treeFromLeaves(t, tapLeaves[:3])
+	tree3Hash, tree3, _ := treeFromLeaves(t, tapLeaves[:])
+	tree4Hash, tree4, _ := treeFromBranch(t, tapBranchChildren[:2])
+	tree5Hash, tree5, _ := treeFromBranch(t, tapBranchChildren[1:])
+
+	// Now, let's insert the first tree, and then assert that we can fetch
+	// and decode an identical tree.
+	storeTapscriptTreeChecked(t, ctx, assetStore, tree1, tree1Hash)
+	loadTapscriptTreeChecked(t, ctx, assetStore, tree1, tree1Hash)
+
+	// If we try to fetch a tree with a different root hash, that will
+	// return an error.
+	tree2empty, err := assetStore.LoadTapscriptTree(ctx, tree2Hash)
+	require.ErrorContains(t, err, "tree not found")
+	require.Nil(t, tree2empty)
+
+	// Trying to delete a tree we haven't inserted yet will not err.
+	err = assetStore.DeleteTapscriptTree(ctx, tree2Hash)
+	require.Nil(t, err)
+
+	// Insert the second tree, which has one node already inserted.
+	storeTapscriptTreeChecked(t, ctx, assetStore, tree2, tree2Hash)
+
+	// Fetching both trees should still work.
+	loadTapscriptTreeChecked(t, ctx, assetStore, tree1, tree1Hash)
+	loadTapscriptTreeChecked(t, ctx, assetStore, tree2, tree2Hash)
+
+	// If we delete the first tree, we should still be able to fetch the
+	// second tree intact.
+	deleteTapscriptTreeChecked(t, ctx, assetStore, tree1Hash)
+	loadTapscriptTreeChecked(t, ctx, assetStore, tree2, tree2Hash)
+
+	// Let's insert the third tree, which contains a node that's a duplicate
+	// of an already-inserted node.
+	storeTapscriptTreeChecked(t, ctx, assetStore, tree3, tree3Hash)
+
+	// Fetching the second and third trees should succeed.
+	loadTapscriptTreeChecked(t, ctx, assetStore, tree2, tree2Hash)
+	loadTapscriptTreeChecked(t, ctx, assetStore, tree3, tree3Hash)
+
+	// Deleting the third tree should not affect the second tree.
+	deleteTapscriptTreeChecked(t, ctx, assetStore, tree3Hash)
+	loadTapscriptTreeChecked(t, ctx, assetStore, tree2, tree2Hash)
+
+	// Let's also test handling of tapscript branches.
+	storeTapscriptTreeChecked(t, ctx, assetStore, tree4, tree4Hash)
+	loadTapscriptTreeChecked(t, ctx, assetStore, tree4, tree4Hash)
+
+	// The second tapscript branch shares a node with the first.
+	storeTapscriptTreeChecked(t, ctx, assetStore, tree5, tree5Hash)
+	loadTapscriptTreeChecked(t, ctx, assetStore, tree4, tree4Hash)
+	loadTapscriptTreeChecked(t, ctx, assetStore, tree5, tree5Hash)
+
+	// Deleting the first set of branches should not affect the second.
+	deleteTapscriptTreeChecked(t, ctx, assetStore, tree4Hash)
+	loadTapscriptTreeChecked(t, ctx, assetStore, tree5, tree5Hash)
+}
+
+// storeMintAnchorUniCommitment stores a mint anchor commitment in the DB.
+func storeMintAnchorUniCommitment(t *testing.T, assetStore AssetMintingStore,
+	batchID int32, txOutputIndex int32, taprootInternalKey []byte,
+	groupKey []byte) {
+
+	ctx := context.Background()
+
+	var writeTxOpts AssetStoreTxOptions
+	upsertMintAnchorPreCommit := func(q PendingAssetStore) error {
+		_, err := q.UpsertMintAnchorUniCommitment(
+			ctx, sqlc.UpsertMintAnchorUniCommitmentParams{
+				BatchID:            batchID,
+				TxOutputIndex:      txOutputIndex,
+				TaprootInternalKey: taprootInternalKey,
+				GroupKey:           groupKey,
+			},
+		)
+		require.NoError(t, err)
+
+		return nil
+	}
+	_ = assetStore.db.ExecTx(ctx, &writeTxOpts, upsertMintAnchorPreCommit)
+}
+
+// assertMintAnchorUniCommitment is a helper function that reads a mint anchor
+// commitment from the DB and asserts that it matches the expected values.
+func assertMintAnchorUniCommitment(t *testing.T, assetStore AssetMintingStore,
+	batchID int32, txOutputIndex int32, preCommitInternalKeyBytes,
+	groupPubKeyBytes []byte) {
+
+	ctx := context.Background()
+	readOpts := NewAssetStoreReadTx()
+
+	var mintAnchorCommitment *sqlc.MintAnchorUniCommitment
+	readMintAnchorCommitment := func(q PendingAssetStore) error {
+		res, err := q.FetchMintAnchorUniCommitment(ctx, batchID)
+		require.NoError(t, err)
+
+		mintAnchorCommitment = &res
+		return nil
+	}
+	_ = assetStore.db.ExecTx(ctx, &readOpts, readMintAnchorCommitment)
+
+	// Ensure the mint anchor commitment matches the one we inserted.
+	require.NotNil(t, mintAnchorCommitment)
+	require.Equal(t, batchID, mintAnchorCommitment.BatchID)
+	require.Equal(t, txOutputIndex, mintAnchorCommitment.TxOutputIndex)
+	require.Equal(
+		t, preCommitInternalKeyBytes,
+		mintAnchorCommitment.TaprootInternalKey,
+	)
+	require.Equal(t, groupPubKeyBytes, mintAnchorCommitment.GroupKey)
+}
+
+// TestUpsertMintAnchorUniCommitment tests the UpsertMintAnchorUniCommitment
+// FetchMintAnchorUniCommitment and SQL queries. In particular, it tests that
+// upsert works correctly.
+func TestUpsertMintAnchorUniCommitment(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	assetStore, _, _ := newAssetStore(t)
+
+	// Create a new batch with one asset group seedling.
+	mintingBatch := tapgarden.RandSeedlingMintingBatch(t, 1)
+	mintingBatch.UniverseCommitments = true
+
+	_, _, group := addRandGroupToBatch(
+		t, assetStore, ctx, mintingBatch.Seedlings,
+	)
+
+	// Commit batch.
+	require.NoError(t, assetStore.CommitMintingBatch(ctx, mintingBatch))
+
+	// Retrieve the batch ID of the batch we just inserted.
+	var batchID int32
+	readOpts := NewAssetStoreReadTx()
+	_ = assetStore.db.ExecTx(
+		ctx, &readOpts, func(q PendingAssetStore) error {
+			batches, err := q.AllMintingBatches(ctx)
+			require.NoError(t, err)
+			require.Len(t, batches, 1)
+
+			batchID = int32(batches[0].BatchID)
+			return nil
+		},
+	)
+
+	// Serialize keys into bytes for easier handling.
+	preCommitInternalKey := test.RandPubKey(t)
+	preCommitInternalKeyBytes := preCommitInternalKey.SerializeCompressed()
+
+	groupPubKeyBytes := group.GroupPubKey.SerializeCompressed()
+
+	// Upsert a mint anchor commitment for the batch.
+	txOutputIndex := int32(2)
+	storeMintAnchorUniCommitment(
+		t, *assetStore, batchID, txOutputIndex,
+		preCommitInternalKeyBytes, groupPubKeyBytes,
+	)
+
+	// Retrieve and inspect the mint anchor commitment we just inserted.
+	assertMintAnchorUniCommitment(
+		t, *assetStore, batchID, txOutputIndex,
+		preCommitInternalKeyBytes, groupPubKeyBytes,
+	)
+
+	// Upsert-ing a new taproot internal key for the same batch should
+	// overwrite the existing one.
+	internalKey2 := test.RandPubKey(t)
+	internalKey2Bytes := internalKey2.SerializeCompressed()
+
+	storeMintAnchorUniCommitment(
+		t, *assetStore, batchID, txOutputIndex, internalKey2Bytes,
+		groupPubKeyBytes,
+	)
+
+	assertMintAnchorUniCommitment(
+		t, *assetStore, batchID, txOutputIndex, internalKey2Bytes,
+		groupPubKeyBytes,
+	)
+
+	// Upsert-ing a new group key for the same batch should overwrite the
+	// existing one.
+	groupPubKey2 := test.RandPubKey(t)
+	groupPubKey2Bytes := groupPubKey2.SerializeCompressed()
+
+	storeMintAnchorUniCommitment(
+		t, *assetStore, batchID, txOutputIndex, internalKey2Bytes,
+		groupPubKey2Bytes,
+	)
+
+	assertMintAnchorUniCommitment(
+		t, *assetStore, batchID, txOutputIndex, internalKey2Bytes,
+		groupPubKey2Bytes,
+	)
+}
+
 func init() {
 	rand.Seed(time.Now().Unix())
 
-	logWriter := build.NewRotatingLogWriter()
-	logger := logWriter.GenSubLogger(Subsystem, func() {})
-	logWriter.RegisterSubLogger(Subsystem, logger)
-	UseLogger(logger)
+	logger := btclog.NewSLogger(btclog.NewDefaultHandler(os.Stdout))
+	UseLogger(logger.SubSystem(Subsystem))
 }

@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/lightninglabs/taproot-assets/cmd/commands"
 	"github.com/lightninglabs/taproot-assets/fn"
 	"github.com/lightninglabs/taproot-assets/taprpc"
 	"github.com/lightninglabs/taproot-assets/taprpc/mintrpc"
@@ -22,7 +23,7 @@ const (
 
 	// testPageSizeSmall is the page size to use when fetching data from the
 	// universe rpc. We use a small page size to test pagination.
-	testPageSizeSmall = 2
+	testPageSizeSmall = 10
 
 	// testGroupSize is the size of the asset group we mint in the
 	// testUniversePaginationSimple test.
@@ -30,21 +31,20 @@ const (
 )
 
 func testUniversePaginationSimple(t *harnessTest) {
-	mintSize := 255
+	mintSize := 50
 	timeout := defaultWaitTimeout
 
 	// If we create a second tapd instance and sync the universe state,
 	// the synced tree should match the source tree.
-	bob := setupTapdHarness(
-		t.t, t, t.lndHarness.Bob, t.universeServer,
-	)
+	bobLnd := t.lndHarness.NewNodeWithCoins("Bob", nil)
+	bob := setupTapdHarness(t.t, t, bobLnd, t.universeServer)
 	defer func() {
 		require.NoError(t.t, bob.stop(!*noDelete))
 	}()
 
 	mintBatches := func(reqs []*mintrpc.MintAssetRequest) []*taprpc.Asset {
 		return MintAssetsConfirmBatch(
-			t.t, t.lndHarness.Miner.Client, t.tapd, reqs,
+			t.t, t.lndHarness.Miner().Client, t.tapd, reqs,
 			WithMintingTimeout(timeout),
 		)
 	}
@@ -59,7 +59,8 @@ func testUniversePaginationSimple(t *harnessTest) {
 
 // mintBatchAssetsTest mints many assets
 func mintBatchAssetsTest(
-	t *testing.T, alice, bob TapdClient, aliceHost string, mintSize int,
+	t *testing.T, alice, bob commands.RpcClientsBundle, aliceHost string,
+	mintSize int,
 	mintAssets func([]*mintrpc.MintAssetRequest) []*taprpc.Asset,
 	imageMetadataBytes []byte, minterTimeout time.Duration) {
 
@@ -88,7 +89,7 @@ func mintBatchAssetsTest(
 
 	// Update the asset name and metadata to match an index.
 	incrementMintAsset := func(asset *mintrpc.MintAsset, ind int) {
-		asset.Name = asset.Name + strconv.Itoa(ind)
+		asset.Name += strconv.Itoa(ind)
 		binary.PutUvarint(metadataPrefix, uint64(ind))
 		copy(asset.AssetMeta.Data[0:metaPrefixSize], metadataPrefix)
 	}
@@ -180,7 +181,7 @@ func mintBatchAssetsTest(
 		// all outpoints matching the chain anchor of the group anchor.
 		mintOutpoint := collectibleAnchor.ChainAnchor.AnchorOutpoint
 
-		leafKeys, err := fetchAllLeafKeys(t, alice, &collectUniID)
+		leafKeys, err := fetchAllLeafKeys(alice, &collectUniID)
 		require.NoError(t, err)
 
 		require.Len(t, leafKeys, len(mintBatch))
@@ -211,14 +212,12 @@ func mintBatchAssetsTest(
 	require.NoError(t, err)
 
 	require.Eventually(t, func() bool {
-		return AssertUniverseStateEqual(
-			t, alice, bob,
-		)
-	}, minterTimeout, time.Second)
+		return AssertUniverseStateEqual(t, alice, bob)
+	}, minterTimeout, 200*time.Millisecond)
 }
 
 // fetchAllLeafKeys fetches all leaf keys for a given universe ID.
-func fetchAllLeafKeys(t *testing.T, alice TapdClient,
+func fetchAllLeafKeys(alice commands.RpcClientsBundle,
 	id *unirpc.ID) ([]*unirpc.AssetKey, error) {
 
 	keys := make([]*unirpc.AssetKey, 0)

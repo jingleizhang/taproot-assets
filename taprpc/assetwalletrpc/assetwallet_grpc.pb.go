@@ -26,11 +26,23 @@ type AssetWalletClient interface {
 	// commitments of the inputs and outputs.
 	SignVirtualPsbt(ctx context.Context, in *SignVirtualPsbtRequest, opts ...grpc.CallOption) (*SignVirtualPsbtResponse, error)
 	// AnchorVirtualPsbts merges and then commits multiple virtual transactions in
-	// a single BTC level anchor transaction.
-	//
-	// TODO(guggero): Actually implement accepting and merging multiple
-	// transactions.
+	// a single BTC level anchor transaction. This RPC should be used if the BTC
+	// level anchor transaction of the assets to be spent are encumbered by a
+	// normal key and don't require any special spending conditions. For any custom
+	// spending conditions on the BTC level, the two RPCs CommitVirtualPsbts and
+	// PublishAndLogTransfer should be used instead (which in combination do the
+	// same as this RPC but allow for more flexibility).
 	AnchorVirtualPsbts(ctx context.Context, in *AnchorVirtualPsbtsRequest, opts ...grpc.CallOption) (*taprpc.SendAssetResponse, error)
+	// CommitVirtualPsbts creates the output commitments and proofs for the given
+	// virtual transactions by committing them to the BTC level anchor transaction.
+	// In addition, the BTC level anchor transaction is funded and prepared up to
+	// the point where it is ready to be signed.
+	CommitVirtualPsbts(ctx context.Context, in *CommitVirtualPsbtsRequest, opts ...grpc.CallOption) (*CommitVirtualPsbtsResponse, error)
+	// PublishAndLogTransfer accepts a fully committed and signed anchor
+	// transaction and publishes it to the Bitcoin network. It also logs the
+	// transfer of the given active and passive assets in the database and ships
+	// any outgoing proofs to the counterparties.
+	PublishAndLogTransfer(ctx context.Context, in *PublishAndLogRequest, opts ...grpc.CallOption) (*taprpc.SendAssetResponse, error)
 	// NextInternalKey derives the next internal key for the given key family and
 	// stores it as an internal key in the database to make sure it is identified
 	// as a local key later on when importing proofs. While an internal key can
@@ -42,6 +54,11 @@ type AssetWalletClient interface {
 	// key) and stores them both in the database to make sure they are identified
 	// as local keys later on when importing proofs.
 	NextScriptKey(ctx context.Context, in *NextScriptKeyRequest, opts ...grpc.CallOption) (*NextScriptKeyResponse, error)
+	// QueryInternalKey returns the key descriptor for the given internal key.
+	QueryInternalKey(ctx context.Context, in *QueryInternalKeyRequest, opts ...grpc.CallOption) (*QueryInternalKeyResponse, error)
+	// QueryScriptKey returns the full script key descriptor for the given tweaked
+	// script key.
+	QueryScriptKey(ctx context.Context, in *QueryScriptKeyRequest, opts ...grpc.CallOption) (*QueryScriptKeyResponse, error)
 	// tapcli: `proofs proveownership`
 	// ProveAssetOwnership creates an ownership proof embedded in an asset
 	// transition proof. That ownership proof is a signed virtual transaction
@@ -55,6 +72,11 @@ type AssetWalletClient interface {
 	// RemoveUTXOLease removes the lease/lock/reservation of the given managed
 	// UTXO.
 	RemoveUTXOLease(ctx context.Context, in *RemoveUTXOLeaseRequest, opts ...grpc.CallOption) (*RemoveUTXOLeaseResponse, error)
+	// DeclareScriptKey declares a new script key to the wallet. This is useful
+	// when the script key contains scripts, which would mean it wouldn't be
+	// recognized by the wallet automatically. Declaring a script key will make any
+	// assets sent to the script key be recognized as being local assets.
+	DeclareScriptKey(ctx context.Context, in *DeclareScriptKeyRequest, opts ...grpc.CallOption) (*DeclareScriptKeyResponse, error)
 }
 
 type assetWalletClient struct {
@@ -92,6 +114,24 @@ func (c *assetWalletClient) AnchorVirtualPsbts(ctx context.Context, in *AnchorVi
 	return out, nil
 }
 
+func (c *assetWalletClient) CommitVirtualPsbts(ctx context.Context, in *CommitVirtualPsbtsRequest, opts ...grpc.CallOption) (*CommitVirtualPsbtsResponse, error) {
+	out := new(CommitVirtualPsbtsResponse)
+	err := c.cc.Invoke(ctx, "/assetwalletrpc.AssetWallet/CommitVirtualPsbts", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *assetWalletClient) PublishAndLogTransfer(ctx context.Context, in *PublishAndLogRequest, opts ...grpc.CallOption) (*taprpc.SendAssetResponse, error) {
+	out := new(taprpc.SendAssetResponse)
+	err := c.cc.Invoke(ctx, "/assetwalletrpc.AssetWallet/PublishAndLogTransfer", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *assetWalletClient) NextInternalKey(ctx context.Context, in *NextInternalKeyRequest, opts ...grpc.CallOption) (*NextInternalKeyResponse, error) {
 	out := new(NextInternalKeyResponse)
 	err := c.cc.Invoke(ctx, "/assetwalletrpc.AssetWallet/NextInternalKey", in, out, opts...)
@@ -104,6 +144,24 @@ func (c *assetWalletClient) NextInternalKey(ctx context.Context, in *NextInterna
 func (c *assetWalletClient) NextScriptKey(ctx context.Context, in *NextScriptKeyRequest, opts ...grpc.CallOption) (*NextScriptKeyResponse, error) {
 	out := new(NextScriptKeyResponse)
 	err := c.cc.Invoke(ctx, "/assetwalletrpc.AssetWallet/NextScriptKey", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *assetWalletClient) QueryInternalKey(ctx context.Context, in *QueryInternalKeyRequest, opts ...grpc.CallOption) (*QueryInternalKeyResponse, error) {
+	out := new(QueryInternalKeyResponse)
+	err := c.cc.Invoke(ctx, "/assetwalletrpc.AssetWallet/QueryInternalKey", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *assetWalletClient) QueryScriptKey(ctx context.Context, in *QueryScriptKeyRequest, opts ...grpc.CallOption) (*QueryScriptKeyResponse, error) {
+	out := new(QueryScriptKeyResponse)
+	err := c.cc.Invoke(ctx, "/assetwalletrpc.AssetWallet/QueryScriptKey", in, out, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -137,6 +195,15 @@ func (c *assetWalletClient) RemoveUTXOLease(ctx context.Context, in *RemoveUTXOL
 	return out, nil
 }
 
+func (c *assetWalletClient) DeclareScriptKey(ctx context.Context, in *DeclareScriptKeyRequest, opts ...grpc.CallOption) (*DeclareScriptKeyResponse, error) {
+	out := new(DeclareScriptKeyResponse)
+	err := c.cc.Invoke(ctx, "/assetwalletrpc.AssetWallet/DeclareScriptKey", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // AssetWalletServer is the server API for AssetWallet service.
 // All implementations must embed UnimplementedAssetWalletServer
 // for forward compatibility
@@ -148,11 +215,23 @@ type AssetWalletServer interface {
 	// commitments of the inputs and outputs.
 	SignVirtualPsbt(context.Context, *SignVirtualPsbtRequest) (*SignVirtualPsbtResponse, error)
 	// AnchorVirtualPsbts merges and then commits multiple virtual transactions in
-	// a single BTC level anchor transaction.
-	//
-	// TODO(guggero): Actually implement accepting and merging multiple
-	// transactions.
+	// a single BTC level anchor transaction. This RPC should be used if the BTC
+	// level anchor transaction of the assets to be spent are encumbered by a
+	// normal key and don't require any special spending conditions. For any custom
+	// spending conditions on the BTC level, the two RPCs CommitVirtualPsbts and
+	// PublishAndLogTransfer should be used instead (which in combination do the
+	// same as this RPC but allow for more flexibility).
 	AnchorVirtualPsbts(context.Context, *AnchorVirtualPsbtsRequest) (*taprpc.SendAssetResponse, error)
+	// CommitVirtualPsbts creates the output commitments and proofs for the given
+	// virtual transactions by committing them to the BTC level anchor transaction.
+	// In addition, the BTC level anchor transaction is funded and prepared up to
+	// the point where it is ready to be signed.
+	CommitVirtualPsbts(context.Context, *CommitVirtualPsbtsRequest) (*CommitVirtualPsbtsResponse, error)
+	// PublishAndLogTransfer accepts a fully committed and signed anchor
+	// transaction and publishes it to the Bitcoin network. It also logs the
+	// transfer of the given active and passive assets in the database and ships
+	// any outgoing proofs to the counterparties.
+	PublishAndLogTransfer(context.Context, *PublishAndLogRequest) (*taprpc.SendAssetResponse, error)
 	// NextInternalKey derives the next internal key for the given key family and
 	// stores it as an internal key in the database to make sure it is identified
 	// as a local key later on when importing proofs. While an internal key can
@@ -164,6 +243,11 @@ type AssetWalletServer interface {
 	// key) and stores them both in the database to make sure they are identified
 	// as local keys later on when importing proofs.
 	NextScriptKey(context.Context, *NextScriptKeyRequest) (*NextScriptKeyResponse, error)
+	// QueryInternalKey returns the key descriptor for the given internal key.
+	QueryInternalKey(context.Context, *QueryInternalKeyRequest) (*QueryInternalKeyResponse, error)
+	// QueryScriptKey returns the full script key descriptor for the given tweaked
+	// script key.
+	QueryScriptKey(context.Context, *QueryScriptKeyRequest) (*QueryScriptKeyResponse, error)
 	// tapcli: `proofs proveownership`
 	// ProveAssetOwnership creates an ownership proof embedded in an asset
 	// transition proof. That ownership proof is a signed virtual transaction
@@ -177,6 +261,11 @@ type AssetWalletServer interface {
 	// RemoveUTXOLease removes the lease/lock/reservation of the given managed
 	// UTXO.
 	RemoveUTXOLease(context.Context, *RemoveUTXOLeaseRequest) (*RemoveUTXOLeaseResponse, error)
+	// DeclareScriptKey declares a new script key to the wallet. This is useful
+	// when the script key contains scripts, which would mean it wouldn't be
+	// recognized by the wallet automatically. Declaring a script key will make any
+	// assets sent to the script key be recognized as being local assets.
+	DeclareScriptKey(context.Context, *DeclareScriptKeyRequest) (*DeclareScriptKeyResponse, error)
 	mustEmbedUnimplementedAssetWalletServer()
 }
 
@@ -193,11 +282,23 @@ func (UnimplementedAssetWalletServer) SignVirtualPsbt(context.Context, *SignVirt
 func (UnimplementedAssetWalletServer) AnchorVirtualPsbts(context.Context, *AnchorVirtualPsbtsRequest) (*taprpc.SendAssetResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method AnchorVirtualPsbts not implemented")
 }
+func (UnimplementedAssetWalletServer) CommitVirtualPsbts(context.Context, *CommitVirtualPsbtsRequest) (*CommitVirtualPsbtsResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method CommitVirtualPsbts not implemented")
+}
+func (UnimplementedAssetWalletServer) PublishAndLogTransfer(context.Context, *PublishAndLogRequest) (*taprpc.SendAssetResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method PublishAndLogTransfer not implemented")
+}
 func (UnimplementedAssetWalletServer) NextInternalKey(context.Context, *NextInternalKeyRequest) (*NextInternalKeyResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method NextInternalKey not implemented")
 }
 func (UnimplementedAssetWalletServer) NextScriptKey(context.Context, *NextScriptKeyRequest) (*NextScriptKeyResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method NextScriptKey not implemented")
+}
+func (UnimplementedAssetWalletServer) QueryInternalKey(context.Context, *QueryInternalKeyRequest) (*QueryInternalKeyResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method QueryInternalKey not implemented")
+}
+func (UnimplementedAssetWalletServer) QueryScriptKey(context.Context, *QueryScriptKeyRequest) (*QueryScriptKeyResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method QueryScriptKey not implemented")
 }
 func (UnimplementedAssetWalletServer) ProveAssetOwnership(context.Context, *ProveAssetOwnershipRequest) (*ProveAssetOwnershipResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method ProveAssetOwnership not implemented")
@@ -207,6 +308,9 @@ func (UnimplementedAssetWalletServer) VerifyAssetOwnership(context.Context, *Ver
 }
 func (UnimplementedAssetWalletServer) RemoveUTXOLease(context.Context, *RemoveUTXOLeaseRequest) (*RemoveUTXOLeaseResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method RemoveUTXOLease not implemented")
+}
+func (UnimplementedAssetWalletServer) DeclareScriptKey(context.Context, *DeclareScriptKeyRequest) (*DeclareScriptKeyResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method DeclareScriptKey not implemented")
 }
 func (UnimplementedAssetWalletServer) mustEmbedUnimplementedAssetWalletServer() {}
 
@@ -275,6 +379,42 @@ func _AssetWallet_AnchorVirtualPsbts_Handler(srv interface{}, ctx context.Contex
 	return interceptor(ctx, in, info, handler)
 }
 
+func _AssetWallet_CommitVirtualPsbts_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CommitVirtualPsbtsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AssetWalletServer).CommitVirtualPsbts(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/assetwalletrpc.AssetWallet/CommitVirtualPsbts",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AssetWalletServer).CommitVirtualPsbts(ctx, req.(*CommitVirtualPsbtsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _AssetWallet_PublishAndLogTransfer_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(PublishAndLogRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AssetWalletServer).PublishAndLogTransfer(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/assetwalletrpc.AssetWallet/PublishAndLogTransfer",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AssetWalletServer).PublishAndLogTransfer(ctx, req.(*PublishAndLogRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _AssetWallet_NextInternalKey_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(NextInternalKeyRequest)
 	if err := dec(in); err != nil {
@@ -307,6 +447,42 @@ func _AssetWallet_NextScriptKey_Handler(srv interface{}, ctx context.Context, de
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(AssetWalletServer).NextScriptKey(ctx, req.(*NextScriptKeyRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _AssetWallet_QueryInternalKey_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(QueryInternalKeyRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AssetWalletServer).QueryInternalKey(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/assetwalletrpc.AssetWallet/QueryInternalKey",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AssetWalletServer).QueryInternalKey(ctx, req.(*QueryInternalKeyRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _AssetWallet_QueryScriptKey_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(QueryScriptKeyRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AssetWalletServer).QueryScriptKey(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/assetwalletrpc.AssetWallet/QueryScriptKey",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AssetWalletServer).QueryScriptKey(ctx, req.(*QueryScriptKeyRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -365,6 +541,24 @@ func _AssetWallet_RemoveUTXOLease_Handler(srv interface{}, ctx context.Context, 
 	return interceptor(ctx, in, info, handler)
 }
 
+func _AssetWallet_DeclareScriptKey_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DeclareScriptKeyRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AssetWalletServer).DeclareScriptKey(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/assetwalletrpc.AssetWallet/DeclareScriptKey",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AssetWalletServer).DeclareScriptKey(ctx, req.(*DeclareScriptKeyRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // AssetWallet_ServiceDesc is the grpc.ServiceDesc for AssetWallet service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -385,12 +579,28 @@ var AssetWallet_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _AssetWallet_AnchorVirtualPsbts_Handler,
 		},
 		{
+			MethodName: "CommitVirtualPsbts",
+			Handler:    _AssetWallet_CommitVirtualPsbts_Handler,
+		},
+		{
+			MethodName: "PublishAndLogTransfer",
+			Handler:    _AssetWallet_PublishAndLogTransfer_Handler,
+		},
+		{
 			MethodName: "NextInternalKey",
 			Handler:    _AssetWallet_NextInternalKey_Handler,
 		},
 		{
 			MethodName: "NextScriptKey",
 			Handler:    _AssetWallet_NextScriptKey_Handler,
+		},
+		{
+			MethodName: "QueryInternalKey",
+			Handler:    _AssetWallet_QueryInternalKey_Handler,
+		},
+		{
+			MethodName: "QueryScriptKey",
+			Handler:    _AssetWallet_QueryScriptKey_Handler,
 		},
 		{
 			MethodName: "ProveAssetOwnership",
@@ -403,6 +613,10 @@ var AssetWallet_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "RemoveUTXOLease",
 			Handler:    _AssetWallet_RemoveUTXOLease_Handler,
+		},
+		{
+			MethodName: "DeclareScriptKey",
+			Handler:    _AssetWallet_DeclareScriptKey_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

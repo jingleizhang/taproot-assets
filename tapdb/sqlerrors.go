@@ -37,7 +37,7 @@ func MapSQLError(err error) error {
 	return err
 }
 
-// parsePostgresError attempts to parse a sqlite error as a database agnostic
+// parseSqliteError attempts to parse a sqlite error as a database agnostic
 // SQL error.
 func parseSqliteError(sqliteErr *sqlite.Error) error {
 	switch sqliteErr.Code() {
@@ -50,6 +50,13 @@ func parseSqliteError(sqliteErr *sqlite.Error) error {
 	// Database is currently busy, so we'll need to try again.
 	case sqlite3.SQLITE_BUSY:
 		return &ErrSerializationError{
+			DbError: sqliteErr,
+		}
+
+	// A write operation could not continue because of a conflict within the
+	// same database connection.
+	case sqlite3.SQLITE_LOCKED:
+		return &ErrDeadlockError{
 			DbError: sqliteErr,
 		}
 
@@ -85,6 +92,13 @@ func parsePostgresError(pqErr *pgconn.PgError) error {
 	// Unable to serialize the transaction, so we'll need to try again.
 	case pgerrcode.SerializationFailure:
 		return &ErrSerializationError{
+			DbError: pqErr,
+		}
+
+	// A write operation could not continue because of a conflict within the
+	// same database connection.
+	case pgerrcode.DeadlockDetected:
+		return &ErrDeadlockError{
 			DbError: pqErr,
 		}
 
@@ -126,11 +140,39 @@ func (e ErrSerializationError) Error() string {
 	return e.DbError.Error()
 }
 
+// ErrDeadlockError is an error type which represents a database agnostic
+// error where transactions have led to cyclic dependencies in lock acquisition.
+type ErrDeadlockError struct {
+	DbError error
+}
+
+// Unwrap returns the wrapped error.
+func (e ErrDeadlockError) Unwrap() error {
+	return e.DbError
+}
+
+// Error returns the error message.
+func (e ErrDeadlockError) Error() string {
+	return e.DbError.Error()
+}
+
 // IsSerializationError returns true if the given error is a serialization
 // error.
 func IsSerializationError(err error) bool {
 	var serializationError *ErrSerializationError
 	return errors.As(err, &serializationError)
+}
+
+// IsDeadlockError returns true if the given error is a deadlock error.
+func IsDeadlockError(err error) bool {
+	var deadlockError *ErrDeadlockError
+	return errors.As(err, &deadlockError)
+}
+
+// IsSerializationOrDeadlockError returns true if the given error is either a
+// deadlock error or a serialization error.
+func IsSerializationOrDeadlockError(err error) bool {
+	return IsDeadlockError(err) || IsSerializationError(err)
 }
 
 // ErrSchemaError is an error type which represents a database agnostic error

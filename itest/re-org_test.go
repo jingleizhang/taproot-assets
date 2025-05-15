@@ -9,18 +9,25 @@ import (
 	"github.com/lightninglabs/taproot-assets/taprpc/mintrpc"
 	unirpc "github.com/lightninglabs/taproot-assets/taprpc/universerpc"
 	"github.com/lightningnetwork/lnd/lntest"
+	"github.com/lightningnetwork/lnd/lntest/miner"
 	"github.com/stretchr/testify/require"
 )
 
 // testReOrgMint tests that when a re-org occurs, minted asset proofs are
 // updated accordingly.
 func testReOrgMint(t *harnessTest) {
+	// We create a second node for the second tapd instance. But because
+	// NewNodeWithCoins mines a block, we need to do it before we do
+	// anything else.
+	lndBob := t.lndHarness.NewNodeWithCoins("Bob", nil)
+
 	// First, we'll mint a few assets but don't confirm the batch TX.
 	mintRequests := []*mintrpc.MintAssetRequest{
 		issuableAssets[0], issuableAssets[1],
 	}
+	lndMiner := t.lndHarness.Miner()
 	mintTXID, batchKey := MintAssetUnconfirmed(
-		t.t, t.lndHarness.Miner.Client, t.tapd, mintRequests,
+		t.t, lndMiner.Client, t.tapd, mintRequests,
 	)
 
 	ctxb := context.Background()
@@ -30,10 +37,9 @@ func testReOrgMint(t *harnessTest) {
 	// Before we mine a block to confirm the mint TX, we create a temporary
 	// miner.
 	tempMiner := spawnTempMiner(t.t, t, ctxt)
-	miner := t.lndHarness.Miner
 
 	// And now we mine a block to confirm the assets.
-	initialBlock := MineBlocks(t.t, t.lndHarness.Miner.Client, 1, 1)[0]
+	initialBlock := MineBlocks(t.t, lndMiner.Client, 1, 1)[0]
 	initialBlockHash := initialBlock.BlockHash()
 	WaitForBatchState(
 		t.t, ctxt, t.tapd, defaultWaitTimeout, batchKey,
@@ -41,7 +47,7 @@ func testReOrgMint(t *harnessTest) {
 	)
 
 	// Make sure the original mint TX was mined in the first block.
-	miner.AssertTxInBlock(initialBlock, &mintTXID)
+	lndMiner.AssertTxInBlock(initialBlock, mintTXID)
 	t.Logf("Mint TX %v mined in block %v", mintTXID, initialBlockHash)
 
 	assetList := AssertAssetsMinted(
@@ -51,9 +57,7 @@ func testReOrgMint(t *harnessTest) {
 	// Now that we have the asset created, we'll make a new node that'll
 	// serve as the node which'll receive the assets. The existing tapd
 	// node will be used to synchronize universe state.
-	secondTapd := setupTapdHarness(
-		t.t, t, t.lndHarness.Bob, t.universeServer,
-	)
+	secondTapd := setupTapdHarness(t.t, t, lndBob, t.universeServer)
 	defer func() {
 		require.NoError(t.t, secondTapd.stop(!*noDelete))
 	}()
@@ -65,7 +69,7 @@ func testReOrgMint(t *harnessTest) {
 	// chain, where the funding transaction is not confirmed.
 	_, tempMinerHeight, err := tempMiner.Client.GetBestBlock()
 	require.NoError(t.t, err, "unable to get current block height")
-	t.lndHarness.WaitForNodeBlockHeight(t.lndHarness.Alice, tempMinerHeight)
+	t.lndHarness.WaitForNodeBlockHeight(t.tapd.cfg.LndNode, tempMinerHeight)
 
 	// At this point, the asset proofs should be invalid, since the mint TX
 	// was re-organized out.
@@ -77,8 +81,8 @@ func testReOrgMint(t *harnessTest) {
 	// Cleanup by mining the minting tx again.
 	newBlock := t.lndHarness.MineBlocksAndAssertNumTxes(1, 1)[0]
 	newBlockHash := newBlock.BlockHash()
-	_, newBlockHeight := t.lndHarness.Miner.GetBestBlock()
-	t.lndHarness.Miner.AssertTxInBlock(newBlock, &mintTXID)
+	_, newBlockHeight := lndMiner.GetBestBlock()
+	lndMiner.AssertTxInBlock(newBlock, mintTXID)
 	t.Logf("Mint TX %v re-mined in block %v", mintTXID, newBlockHash)
 
 	// Let's wait until we see that the proof for the first asset was
@@ -122,8 +126,9 @@ func testReOrgSend(t *harnessTest) {
 	mintRequests := []*mintrpc.MintAssetRequest{
 		issuableAssets[0], issuableAssets[1],
 	}
+	lndMiner := t.lndHarness.Miner()
 	assetList := MintAssetsConfirmBatch(
-		t.t, t.lndHarness.Miner.Client, t.tapd, mintRequests,
+		t.t, lndMiner.Client, t.tapd, mintRequests,
 	)
 
 	ctxb := context.Background()
@@ -133,9 +138,8 @@ func testReOrgSend(t *harnessTest) {
 	// Now that we have the asset created, we'll make a new node that'll
 	// serve as the node which'll receive the assets. The existing tapd
 	// node will be used to synchronize universe state.
-	secondTapd := setupTapdHarness(
-		t.t, t, t.lndHarness.Bob, t.universeServer,
-	)
+	lndBob := t.lndHarness.NewNodeWithCoins("Bob", nil)
+	secondTapd := setupTapdHarness(t.t, t, lndBob, t.universeServer)
 	defer func() {
 		require.NoError(t.t, secondTapd.stop(!*noDelete))
 	}()
@@ -143,7 +147,6 @@ func testReOrgSend(t *harnessTest) {
 	// Before we mine a block to confirm the mint TX, we create a temporary
 	// miner.
 	tempMiner := spawnTempMiner(t.t, t, ctxt)
-	miner := t.lndHarness.Miner
 
 	// Now to the second part of the test: We'll send an asset to Bob, and
 	// then re-org the chain again.
@@ -156,10 +159,9 @@ func testReOrgSend(t *harnessTest) {
 	})
 	require.NoError(t.t, err)
 	AssertAddrCreated(t.t, secondTapd, sendAsset, bobAddr)
-	sendResp := sendAssetsToAddr(t, t.tapd, bobAddr)
+	sendResp, _ := sendAssetsToAddr(t, t.tapd, bobAddr)
 	initialBlock := ConfirmAndAssertOutboundTransfer(
-		t.t, t.lndHarness.Miner.Client, t.tapd, sendResp,
-		sendAssetGen.AssetId,
+		t.t, lndMiner.Client, t.tapd, sendResp, sendAssetGen.AssetId,
 		[]uint64{sendAsset.Amount - sendAmount, sendAmount}, 0, 1,
 	)
 	AssertNonInteractiveRecvComplete(t.t, secondTapd, 1)
@@ -168,17 +170,19 @@ func testReOrgSend(t *harnessTest) {
 	// Make sure the original send TX was mined in the first block.
 	sendTXID, err := chainhash.NewHash(sendResp.Transfer.AnchorTxHash)
 	require.NoError(t.t, err)
-	miner.AssertTxInBlock(initialBlock, sendTXID)
+	lndMiner.AssertTxInBlock(initialBlock, *sendTXID)
 	t.Logf("Send TX %v mined in block %v", sendTXID, initialBlockHash)
 
-	// We now generate the re-org.
+	// We now generate the re-org. That should put the minting TX back into
+	// the mempool.
 	generateReOrg(t.t, t.lndHarness, tempMiner, 3, 2)
+	lndMiner.AssertNumTxsInMempool(1)
 
 	// This should have caused a reorg, and Alice should sync to the longer
 	// chain, where the funding transaction is not confirmed.
 	_, tempMinerHeight, err := tempMiner.Client.GetBestBlock()
 	require.NoError(t.t, err, "unable to get current block height")
-	t.lndHarness.WaitForNodeBlockHeight(t.lndHarness.Alice, tempMinerHeight)
+	t.lndHarness.WaitForNodeBlockHeight(t.tapd.cfg.LndNode, tempMinerHeight)
 
 	// At this point, the all asset proofs should be invalid, since the send
 	// TX was re-organized out, and it also contained passive assets.
@@ -200,8 +204,8 @@ func testReOrgSend(t *harnessTest) {
 	// Cleanup by mining the minting tx again.
 	newBlock := t.lndHarness.MineBlocksAndAssertNumTxes(1, 1)[0]
 	newBlockHash := newBlock.BlockHash()
-	_, newBlockHeight := t.lndHarness.Miner.GetBestBlock()
-	t.lndHarness.Miner.AssertTxInBlock(newBlock, sendTXID)
+	_, newBlockHeight := lndMiner.GetBestBlock()
+	lndMiner.AssertTxInBlock(newBlock, *sendTXID)
 	t.Logf("Send TX %v re-mined in block %v", sendTXID, newBlockHash)
 
 	// Let's wait until we see that the proof for the first asset was
@@ -236,25 +240,28 @@ func testReOrgMintAndSend(t *harnessTest) {
 	ctxt, cancel := context.WithTimeout(ctxb, defaultWaitTimeout)
 	defer cancel()
 
+	// We create a second node for the second tapd instance. But because
+	// NewNodeWithCoins mines a block, we need to do it before we spawn the
+	// temporary miner.
+	lndBob := t.lndHarness.NewNodeWithCoins("Bob", nil)
+
 	// Before we do anything, we spawn a miner. This is where the fork in
 	// the chain starts.
 	tempMiner := spawnTempMiner(t.t, t, ctxt)
-	miner := t.lndHarness.Miner
+	lndMiner := t.lndHarness.Miner()
 
 	// Then, we'll mint a few assets and confirm the batch TX.
 	mintRequests := []*mintrpc.MintAssetRequest{
 		issuableAssets[0], issuableAssets[1],
 	}
 	assetList := MintAssetsConfirmBatch(
-		t.t, t.lndHarness.Miner.Client, t.tapd, mintRequests,
+		t.t, lndMiner.Client, t.tapd, mintRequests,
 	)
 
 	// Now that we have the asset created, we'll make a new node that'll
 	// serve as the node which'll receive the assets. The existing tapd
 	// node will be used to synchronize universe state.
-	secondTapd := setupTapdHarness(
-		t.t, t, t.lndHarness.Bob, t.universeServer,
-	)
+	secondTapd := setupTapdHarness(t.t, t, lndBob, t.universeServer)
 	defer func() {
 		require.NoError(t.t, secondTapd.stop(!*noDelete))
 	}()
@@ -270,10 +277,9 @@ func testReOrgMintAndSend(t *harnessTest) {
 	})
 	require.NoError(t.t, err)
 	AssertAddrCreated(t.t, secondTapd, sendAsset, bobAddr)
-	sendResp := sendAssetsToAddr(t, t.tapd, bobAddr)
+	sendResp, _ := sendAssetsToAddr(t, t.tapd, bobAddr)
 	initialBlock := ConfirmAndAssertOutboundTransfer(
-		t.t, t.lndHarness.Miner.Client, t.tapd, sendResp,
-		sendAssetGen.AssetId,
+		t.t, lndMiner.Client, t.tapd, sendResp, sendAssetGen.AssetId,
 		[]uint64{sendAsset.Amount - sendAmount, sendAmount}, 0, 1,
 	)
 	AssertNonInteractiveRecvComplete(t.t, secondTapd, 1)
@@ -282,17 +288,19 @@ func testReOrgMintAndSend(t *harnessTest) {
 	// Make sure the original send TX was mined in the first block.
 	sendTXID, err := chainhash.NewHash(sendResp.Transfer.AnchorTxHash)
 	require.NoError(t.t, err)
-	miner.AssertTxInBlock(initialBlock, sendTXID)
+	lndMiner.AssertTxInBlock(initialBlock, *sendTXID)
 	t.Logf("Send TX %v mined in block %v", sendTXID, initialBlockHash)
 
-	// We now generate the re-org.
+	// We now generate the re-org. That should put the minting and send TX
+	// back into the mempool.
 	generateReOrg(t.t, t.lndHarness, tempMiner, 4, 2)
+	lndMiner.AssertNumTxsInMempool(2)
 
 	// This should have caused a reorg, and Alice should sync to the longer
 	// chain, where the funding transaction is not confirmed.
 	_, tempMinerHeight, err := tempMiner.Client.GetBestBlock()
 	require.NoError(t.t, err, "unable to get current block height")
-	t.lndHarness.WaitForNodeBlockHeight(t.lndHarness.Alice, tempMinerHeight)
+	t.lndHarness.WaitForNodeBlockHeight(t.tapd.cfg.LndNode, tempMinerHeight)
 
 	// At this point, the all asset proofs should be invalid, since the send
 	// TX was re-organized out, and it also contained passive assets.
@@ -319,8 +327,8 @@ func testReOrgMintAndSend(t *harnessTest) {
 	// Cleanup by mining the minting tx again.
 	newBlock := t.lndHarness.MineBlocksAndAssertNumTxes(1, 2)[0]
 	newBlockHash := newBlock.BlockHash()
-	_, newBlockHeight := t.lndHarness.Miner.GetBestBlock()
-	t.lndHarness.Miner.AssertTxInBlock(newBlock, sendTXID)
+	_, newBlockHeight := lndMiner.GetBestBlock()
+	lndMiner.AssertTxInBlock(newBlock, *sendTXID)
 	t.Logf("Send TX %v re-mined in block %v", sendTXID, newBlockHash)
 
 	// We now restart Bob's daemon, expecting it to pick up the re-org.
@@ -356,10 +364,10 @@ func testReOrgMintAndSend(t *harnessTest) {
 // spawnTempMiner creates a temporary miner that uses the same chain backend
 // and client as the main miner.
 func spawnTempMiner(t *testing.T, ht *harnessTest,
-	ctx context.Context) *lntest.HarnessMiner {
+	ctx context.Context) *miner.HarnessMiner {
 
-	tempHarness := lntest.NewMiner(ctx, t)
-	tempHarness.Client = ht.lndHarness.Miner.Client
+	tempHarness := miner.NewMiner(ctx, t)
+	tempHarness.Client = ht.lndHarness.Miner().Client
 	return tempHarness.SpawnTempMiner()
 }
 
@@ -368,15 +376,14 @@ func spawnTempMiner(t *testing.T, ht *harnessTest,
 // Depending on when exactly the temporary miner was spawned, the expectedDelta
 // might differ from the depth, if the "main" miner already has more blocks.
 func generateReOrg(t *testing.T, lnd *lntest.HarnessTest,
-	tempMiner *lntest.HarnessMiner, depth uint32, expectedDelta int32) {
+	tempMiner *miner.HarnessMiner, depth uint32, expectedDelta int32) {
 
 	// Now we generate a longer chain with the temp miner.
-	_, err := tempMiner.Client.Generate(depth)
-	require.NoError(t, err, "unable to generate blocks")
+	tempMiner.MineEmptyBlocks(int(depth))
 
 	// Ensure the chain lengths are what we expect, with the temp miner
 	// being 2 blocks ahead.
-	lnd.Miner.AssertMinerBlockHeightDelta(tempMiner, expectedDelta)
+	lnd.Miner().AssertMinerBlockHeightDelta(tempMiner, expectedDelta)
 
 	// Now we disconnect lnd's chain backend from the original miner, and
 	// connect the two miners together. Since the temporary miner knows
@@ -385,14 +392,14 @@ func generateReOrg(t *testing.T, lnd *lntest.HarnessTest,
 
 	// Connecting to the temporary miner should now cause our original
 	// chain to be re-orged out.
-	lnd.Miner.ConnectMiner(tempMiner)
+	lnd.Miner().ConnectMiner(tempMiner)
 
 	// Once again they should be on the same chain.
-	lnd.Miner.AssertMinerBlockHeightDelta(tempMiner, 0)
+	lnd.Miner().AssertMinerBlockHeightDelta(tempMiner, 0)
 
 	// Now we disconnect the two miners, and connect our original miner to
 	// our chain backend once again.
-	lnd.Miner.DisconnectMiner(tempMiner)
+	lnd.Miner().DisconnectMiner(tempMiner)
 
 	lnd.ConnectMiner()
 }

@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/lightninglabs/taproot-assets/cmd/commands"
 	"github.com/lightninglabs/taproot-assets/fn"
 	"github.com/lightninglabs/taproot-assets/taprpc"
 	"github.com/lightninglabs/taproot-assets/taprpc/mintrpc"
@@ -56,16 +57,15 @@ func testMintBatchNStressTest(t *harnessTest, batchSize int,
 
 	// If we create a second tapd instance and sync the universe state,
 	// the synced tree should match the source tree.
-	bob := setupTapdHarness(
-		t.t, t, t.lndHarness.Bob, t.universeServer,
-	)
+	lndBob := t.lndHarness.NewNodeWithCoins("Bob", nil)
+	bob := setupTapdHarness(t.t, t, lndBob, t.universeServer)
 	defer func() {
 		require.NoError(t.t, bob.stop(!*noDelete))
 	}()
 
 	mintBatches := func(reqs []*mintrpc.MintAssetRequest) []*taprpc.Asset {
 		return MintAssetsConfirmBatch(
-			t.t, t.lndHarness.Miner.Client, t.tapd, reqs,
+			t.t, t.lndHarness.Miner().Client, t.tapd, reqs,
 			WithMintingTimeout(timeout),
 		)
 	}
@@ -93,7 +93,8 @@ func GetImageMetadataBytes(t *testing.T, fileName string) []byte {
 }
 
 func mintBatchStressTest(
-	t *testing.T, alice, bob TapdClient, aliceHost string, batchSize int,
+	t *testing.T, alice, bob commands.RpcClientsBundle, aliceHost string,
+	batchSize int,
 	mintAssets func([]*mintrpc.MintAssetRequest) []*taprpc.Asset,
 	imageMetadataBytes []byte, minterTimeout time.Duration) {
 
@@ -121,7 +122,7 @@ func mintBatchStressTest(
 
 	// Update the asset name and metadata to match an index.
 	incrementMintAsset := func(asset *mintrpc.MintAsset, ind int) {
-		asset.Name = asset.Name + strconv.Itoa(ind)
+		asset.Name += strconv.Itoa(ind)
 		binary.PutUvarint(metadataPrefix, uint64(ind))
 		copy(asset.AssetMeta.Data[0:metaPrefixSize], metadataPrefix)
 	}
@@ -202,7 +203,7 @@ func mintBatchStressTest(
 	// outpoints matching the chain anchor of the group anchor.
 	mintOutpoint := collectibleAnchor.ChainAnchor.AnchorOutpoint
 
-	leafKeys, err := fetchAllLeafKeys(t, alice, &collectUniID)
+	leafKeys, err := fetchAllLeafKeys(alice, &collectUniID)
 	require.NoError(t, err)
 
 	require.Len(t, leafKeys, batchSize)

@@ -1,4 +1,4 @@
-FROM golang:1.21.4 as builder
+FROM golang:1.23.9 as builder
 
 WORKDIR /app
 
@@ -6,7 +6,7 @@ COPY . /app
 
 ENV CGO_ENABLED=0
 
-RUN make install
+RUN make release-install TAGS=monitoring
 
 # FINAL IMAGE
 FROM alpine as final

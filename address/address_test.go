@@ -12,7 +12,9 @@ import (
 	"github.com/btcsuite/btcd/wire"
 	"github.com/lightninglabs/taproot-assets/asset"
 	"github.com/lightninglabs/taproot-assets/commitment"
+	"github.com/lightninglabs/taproot-assets/fn"
 	"github.com/lightninglabs/taproot-assets/internal/test"
+	"github.com/lightningnetwork/lnd/tlv"
 	"github.com/stretchr/testify/require"
 )
 
@@ -33,7 +35,7 @@ var (
 	}
 )
 
-func randAddress(t *testing.T, net *ChainParams, v Version, groupPubKey,
+func randAddress(t *testing.T, net *ChainParams, v *Version, groupPubKey,
 	sibling bool, amt *uint64, assetType asset.Type,
 	addrOpts ...NewAddrOpt) (*Tap, error) {
 
@@ -48,11 +50,15 @@ func randAddress(t *testing.T, net *ChainParams, v Version, groupPubKey,
 		amount = test.RandInt[uint64]()
 	}
 
-	var tapscriptSibling *commitment.TapscriptPreimage
+	var (
+		tapscriptSibling *commitment.TapscriptPreimage
+		err              error
+	)
 	if sibling {
-		tapscriptSibling = commitment.NewPreimageFromLeaf(
+		tapscriptSibling, err = commitment.NewPreimageFromLeaf(
 			txscript.NewBaseTapLeaf([]byte("not a valid script")),
 		)
+		require.NoError(t, err)
 	}
 
 	scriptKey := *pubKey
@@ -77,8 +83,13 @@ func randAddress(t *testing.T, net *ChainParams, v Version, groupPubKey,
 
 	proofCourierAddr := RandProofCourierAddr(t)
 
+	vers := test.RandFlip(V0, V1)
+	if v != nil {
+		vers = *v
+	}
+
 	return New(
-		v, genesis, groupKey, groupWitness, scriptKey, internalKey,
+		vers, genesis, groupKey, groupWitness, scriptKey, internalKey,
 		amount, tapscriptSibling, net, proofCourierAddr,
 		addrOpts...,
 	)
@@ -91,8 +102,7 @@ func randEncodedAddress(t *testing.T, net *ChainParams, groupPubKey,
 	t.Helper()
 
 	newAddr, err := randAddress(
-		t, net, V0, groupPubKey, sibling, nil, assetType,
-		addrOpts...,
+		t, net, nil, groupPubKey, sibling, nil, assetType, addrOpts...,
 	)
 	if err != nil {
 		return nil, "", err
@@ -106,12 +116,17 @@ func randEncodedAddress(t *testing.T, net *ChainParams, groupPubKey,
 func assertAddressEqual(t *testing.T, a, b *Tap) {
 	t.Helper()
 
+	// TODO(jhb): assert the full chainparams, not just the HRP
+	require.Equal(t, a.Version, b.Version)
+	require.Equal(t, a.ChainParams.TapHRP, b.ChainParams.TapHRP)
 	require.Equal(t, a.AssetVersion, b.AssetVersion)
 	require.Equal(t, a.AssetID, b.AssetID)
 	require.Equal(t, a.GroupKey, b.GroupKey)
 	require.Equal(t, a.ScriptKey, b.ScriptKey)
 	require.Equal(t, a.InternalKey, b.InternalKey)
+	require.Equal(t, a.TapscriptSibling, b.TapscriptSibling)
 	require.Equal(t, a.Amount, b.Amount)
+	require.Equal(t, a.ProofCourierAddr, b.ProofCourierAddr)
 }
 
 // TestNewAddress tests edge cases around creating a new address.
@@ -125,7 +140,7 @@ func TestNewAddress(t *testing.T) {
 			name: "normal address",
 			f: func() (*Tap, error) {
 				return randAddress(
-					t, &TestNet3Tap, V0, false, false, nil,
+					t, &TestNet3Tap, nil, false, false, nil,
 					asset.Normal,
 				)
 			},
@@ -135,7 +150,7 @@ func TestNewAddress(t *testing.T) {
 			name: "normal address, v1 asset version",
 			f: func() (*Tap, error) {
 				return randAddress(
-					t, &TestNet3Tap, V0, false, false, nil,
+					t, &TestNet3Tap, nil, false, false, nil,
 					asset.Normal, WithAssetVersion(asset.V1),
 				)
 			},
@@ -146,7 +161,7 @@ func TestNewAddress(t *testing.T) {
 				"version",
 			f: func() (*Tap, error) {
 				return randAddress(
-					t, &MainNetTap, V0, true, false, nil,
+					t, &MainNetTap, nil, true, false, nil,
 					asset.Collectible,
 					WithAssetVersion(asset.V1),
 				)
@@ -157,7 +172,7 @@ func TestNewAddress(t *testing.T) {
 			name: "collectible address with group key",
 			f: func() (*Tap, error) {
 				return randAddress(
-					t, &MainNetTap, V0, true, false, nil,
+					t, &MainNetTap, nil, true, false, nil,
 					asset.Collectible,
 				)
 			},
@@ -167,7 +182,7 @@ func TestNewAddress(t *testing.T) {
 			name: "collectible address with group key and sibling",
 			f: func() (*Tap, error) {
 				return randAddress(
-					t, &MainNetTap, V0, true, true, nil,
+					t, &MainNetTap, nil, true, true, nil,
 					asset.Collectible,
 				)
 			},
@@ -178,7 +193,7 @@ func TestNewAddress(t *testing.T) {
 			f: func() (*Tap, error) {
 				zeroAmt := uint64(0)
 				return randAddress(
-					t, &TestNet3Tap, V0, false, false,
+					t, &TestNet3Tap, nil, false, false,
 					&zeroAmt, asset.Normal,
 				)
 			},
@@ -189,7 +204,7 @@ func TestNewAddress(t *testing.T) {
 			f: func() (*Tap, error) {
 				badAmt := uint64(2)
 				return randAddress(
-					t, &TestNet3Tap, V0, false, false,
+					t, &TestNet3Tap, nil, false, false,
 					&badAmt, asset.Collectible,
 				)
 			},
@@ -199,7 +214,7 @@ func TestNewAddress(t *testing.T) {
 			name: "invalid hrp",
 			f: func() (*Tap, error) {
 				return randAddress(
-					t, &invalidNet, V0, false, false, nil,
+					t, &invalidNet, nil, false, false, nil,
 					asset.Normal,
 				)
 			},
@@ -209,8 +224,8 @@ func TestNewAddress(t *testing.T) {
 			name: "invalid version",
 			f: func() (*Tap, error) {
 				return randAddress(
-					t, &TestNet3Tap, Version(123), false,
-					false, nil, asset.Normal,
+					t, &TestNet3Tap, fn.Ptr(Version(123)),
+					false, false, nil, asset.Normal,
 				)
 			},
 			err: ErrUnknownVersion,
@@ -348,6 +363,29 @@ func TestAddressEncoding(t *testing.T) {
 			err: nil,
 		},
 		{
+			name: "simnet collectible with sibling and unknown " +
+				"TLV type",
+			f: func() (*Tap, string, error) {
+				addr, _, err := randEncodedAddress(
+					t, &SimNetTap, false, true,
+					asset.Collectible,
+				)
+
+				if err != nil {
+					return nil, "", err
+				}
+
+				foo := []byte("foo")
+				addr.UnknownOddTypes = tlv.TypeMap{
+					test.TestVectorAllowedUnknownType: foo,
+				}
+
+				str, err := addr.EncodeAddress()
+				return addr, str, err
+			},
+			err: nil,
+		},
+		{
 			name: "unsupported hrp",
 			f: func() (*Tap, string, error) {
 				return randEncodedAddress(
@@ -390,8 +428,8 @@ func TestAddressEncoding(t *testing.T) {
 			name: "unknown version number in constructor",
 			f: func() (*Tap, string, error) {
 				_, err := randAddress(
-					t, &TestNet3Tap, Version(255), false,
-					true, nil, asset.Collectible,
+					t, &TestNet3Tap, fn.Ptr(Version(255)),
+					false, true, nil, asset.Collectible,
 				)
 				return nil, "", err
 			},
@@ -401,7 +439,7 @@ func TestAddressEncoding(t *testing.T) {
 			name: "unknown version number",
 			f: func() (*Tap, string, error) {
 				newAddr, err := randAddress(
-					t, &TestNet3Tap, V0, false, true, nil,
+					t, &TestNet3Tap, nil, false, true, nil,
 					asset.Collectible,
 				)
 				require.NoError(t, err)
@@ -478,6 +516,24 @@ func runBIPTestVector(t *testing.T, testVectors *TestVectors) {
 
 			areEqual := validCase.Expected == addrString
 
+			// Make sure the address in the test vectors doesn't use
+			// a record type we haven't marked as known/supported
+			// yet. If the following check fails, you need to update
+			// the KnownAddressTypes set.
+			for _, record := range a.EncodeRecords() {
+				// Test vectors may contain this one type to
+				// demonstrate that it is not rejected.
+				if record.Type() ==
+					test.TestVectorAllowedUnknownType {
+
+					continue
+				}
+
+				require.Contains(
+					tt, KnownAddressTypes, record.Type(),
+				)
+			}
+
 			// Create nice diff if things don't match.
 			if !areEqual {
 				chainParams, err := a.Net()
@@ -529,4 +585,47 @@ func FuzzAddressDecode(f *testing.F) {
 		a := &Tap{}
 		_ = a.Decode(bytes.NewReader(data))
 	})
+}
+
+// TestAddressUnknownOddType tests that an unknown odd type is allowed in an
+// address and that we can still arrive at the correct leaf hash with it.
+func TestAddressUnknownOddType(t *testing.T) {
+	knownAddr, _, _ := RandAddr(t, &TestNet3Tap, RandProofCourierAddr(t))
+	knownAddrString, err := knownAddr.EncodeAddress()
+	require.NoError(t, err)
+
+	test.RunUnknownOddTypeTest(
+		t, knownAddr.Tap, &asset.ErrUnknownType{},
+		func(buf *bytes.Buffer, addr *Tap) error {
+			return addr.Encode(buf)
+		},
+		func(buf *bytes.Buffer) (*Tap, error) {
+			parsedAddr := &Tap{
+				ChainParams: &TestNet3Tap,
+			}
+			return parsedAddr, parsedAddr.Decode(buf)
+		},
+		func(parsedAddr *Tap, unknownTypes tlv.TypeMap) {
+			require.Equal(
+				t, unknownTypes, parsedAddr.UnknownOddTypes,
+			)
+
+			// The address should've changed, to make sure the
+			// unknown value was taken into account when creating
+			// the serialized address.
+			parsedAddrString, err := parsedAddr.EncodeAddress()
+			require.NoError(t, err)
+
+			require.NotEqual(t, knownAddrString, parsedAddrString)
+
+			parsedAddr.UnknownOddTypes = nil
+
+			// The genesis information isn't actually encoded in the
+			// address, so we need to clear that out before
+			// comparing.
+			knownAddr.Tap.assetGen = asset.Genesis{}
+
+			require.Equal(t, knownAddr.Tap, parsedAddr)
+		},
+	)
 }

@@ -12,6 +12,7 @@ import (
 	"github.com/lightninglabs/taproot-assets/commitment"
 	"github.com/lightninglabs/taproot-assets/internal/test"
 	"github.com/lightningnetwork/lnd/keychain"
+	"github.com/lightningnetwork/lnd/tlv"
 	"github.com/stretchr/testify/require"
 )
 
@@ -32,7 +33,7 @@ func RandAddr(t testing.TB, params *ChainParams,
 	proofCourierAddr url.URL) (*AddrWithKeyInfo,
 	*asset.Genesis, *asset.GroupKey) {
 
-	scriptKeyPriv := test.RandPrivKey(t)
+	scriptKeyPriv := test.RandPrivKey()
 	scriptKey := asset.NewScriptKeyBip86(keychain.KeyDescriptor{
 		PubKey: scriptKeyPriv.PubKey(),
 		KeyLocator: keychain.KeyLocator{
@@ -41,7 +42,7 @@ func RandAddr(t testing.TB, params *ChainParams,
 		},
 	})
 
-	internalKey := test.RandPrivKey(t)
+	internalKey := test.RandPrivKey()
 
 	genesis := asset.RandGenesis(t, asset.Type(test.RandInt31n(2)))
 	amount := test.RandInt[uint64]()
@@ -51,17 +52,18 @@ func RandAddr(t testing.TB, params *ChainParams,
 
 	var (
 		assetVersion     asset.Version
+		addrVersion      Version
 		groupInfo        *asset.GroupKey
 		groupPubKey      *btcec.PublicKey
 		groupWitness     wire.TxWitness
 		tapscriptSibling *commitment.TapscriptPreimage
 	)
 
-	if test.RandInt[uint32]()%2 == 0 {
+	if test.RandBool() {
 		assetVersion = asset.V1
 	}
 
-	if test.RandInt[uint32]()%2 == 0 {
+	if test.RandBool() {
 		protoAsset := asset.NewAssetNoErr(
 			t, genesis, amount, 0, 0, scriptKey, nil,
 			asset.WithAssetVersion(assetVersion),
@@ -70,15 +72,20 @@ func RandAddr(t testing.TB, params *ChainParams,
 		groupPubKey = &groupInfo.GroupPubKey
 		groupWitness = groupInfo.Witness
 
-		tapscriptSibling = commitment.NewPreimageFromLeaf(
+		var err error
+		tapscriptSibling, err = commitment.NewPreimageFromLeaf(
 			txscript.NewBaseTapLeaf([]byte("not a valid script")),
 		)
+		require.NoError(t, err)
 	}
 
+	addrVersion = test.RandFlip(V0, V1)
+
 	tapAddr, err := New(
-		V0, genesis, groupPubKey, groupWitness, *scriptKey.PubKey,
-		*internalKey.PubKey(), amount, tapscriptSibling, params,
-		proofCourierAddr, WithAssetVersion(assetVersion),
+		addrVersion, genesis, groupPubKey, groupWitness,
+		*scriptKey.PubKey, *internalKey.PubKey(), amount,
+		tapscriptSibling, params, proofCourierAddr,
+		WithAssetVersion(assetVersion),
 	)
 	require.NoError(t, err)
 
@@ -129,6 +136,7 @@ func NewTestFromAddress(t testing.TB, a *Tap) *TestAddress {
 		InternalKey:      test.HexPubKey(&a.InternalKey),
 		Amount:           a.Amount,
 		ProofCourierAddr: a.ProofCourierAddr.String(),
+		UnknownOddTypes:  a.UnknownOddTypes,
 	}
 
 	if a.GroupKey != nil {
@@ -145,16 +153,17 @@ func NewTestFromAddress(t testing.TB, a *Tap) *TestAddress {
 }
 
 type TestAddress struct {
-	Version          uint8  `json:"version"`
-	ChainParamsHRP   string `json:"chain_params_hrp"`
-	AssetVersion     uint8  `json:"asset_version"`
-	AssetID          string `json:"asset_id"`
-	GroupKey         string `json:"group_key"`
-	ScriptKey        string `json:"script_key"`
-	InternalKey      string `json:"internal_key"`
-	TapscriptSibling string `json:"tapscript_sibling"`
-	Amount           uint64 `json:"amount"`
-	ProofCourierAddr string `json:"proof_courier_addr"`
+	Version          uint8       `json:"version"`
+	ChainParamsHRP   string      `json:"chain_params_hrp"`
+	AssetVersion     uint8       `json:"asset_version"`
+	AssetID          string      `json:"asset_id"`
+	GroupKey         string      `json:"group_key"`
+	ScriptKey        string      `json:"script_key"`
+	InternalKey      string      `json:"internal_key"`
+	TapscriptSibling string      `json:"tapscript_sibling"`
+	Amount           uint64      `json:"amount"`
+	ProofCourierAddr string      `json:"proof_courier_addr"`
+	UnknownOddTypes  tlv.TypeMap `json:"unknown_odd_types"`
 }
 
 func (ta *TestAddress) ToAddress(t testing.TB) *Tap {
@@ -212,6 +221,7 @@ func (ta *TestAddress) ToAddress(t testing.TB) *Tap {
 		InternalKey:      *test.ParsePubKey(t, ta.InternalKey),
 		Amount:           ta.Amount,
 		ProofCourierAddr: *proofCourierAddr,
+		UnknownOddTypes:  ta.UnknownOddTypes,
 	}
 
 	if ta.GroupKey != "" {

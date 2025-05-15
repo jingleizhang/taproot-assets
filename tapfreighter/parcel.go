@@ -1,23 +1,22 @@
 package tapfreighter
 
 import (
-	"bytes"
 	"fmt"
 	"time"
 
-	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/lightninglabs/taproot-assets/address"
 	"github.com/lightninglabs/taproot-assets/asset"
 	"github.com/lightninglabs/taproot-assets/commitment"
 	"github.com/lightninglabs/taproot-assets/fn"
-	"github.com/lightninglabs/taproot-assets/mssmt"
 	"github.com/lightninglabs/taproot-assets/proof"
 	"github.com/lightninglabs/taproot-assets/tappsbt"
+	"github.com/lightninglabs/taproot-assets/tapsend"
 	"github.com/lightningnetwork/lnd/chainntnfs"
 	"github.com/lightningnetwork/lnd/keychain"
 	"github.com/lightningnetwork/lnd/lnwallet/chainfee"
+	"golang.org/x/exp/maps"
 )
 
 // SendState is an enum that describes the current state of a pending outbound
@@ -25,9 +24,13 @@ import (
 type SendState uint8
 
 const (
+	// SendStateStartHandleAddrParcel is the initial state entered when
+	// the state machine begins processing a new address parcel.
+	SendStateStartHandleAddrParcel SendState = iota
+
 	// SendStateVirtualCommitmentSelect is the state for performing input
 	// coin selection to pick out which assets inputs should be spent.
-	SendStateVirtualCommitmentSelect SendState = iota
+	SendStateVirtualCommitmentSelect
 
 	// SendStateVirtualSign is used to generate the Taproot Asset level
 	// witness data for any inputs being spent.
@@ -38,11 +41,9 @@ const (
 	// then finalize to place the necessary signatures in the transaction.
 	SendStateAnchorSign
 
-	// SendStateLogCommit is the final in memory state. In this state,
-	// we'll extract the signed transaction from the PSBT and log the
-	// transfer information to disk. At this point, after a restart, the
-	// transfer can be resumed.
-	SendStateLogCommit
+	// SendStateStorePreBroadcast is the state in which the finalized fully
+	// signed transaction is written to persistent storage before broadcast.
+	SendStateStorePreBroadcast
 
 	// SendStateBroadcast broadcasts the transfer transaction to the
 	// network, and imports the taproot output back into the wallet to
@@ -53,13 +54,16 @@ const (
 	// transaction to confirm on-chain.
 	SendStateWaitTxConf
 
-	// SendStateStoreProofs is the state in which we will write the sender
-	// and receiver proofs to the proof archive.
-	SendStateStoreProofs
+	// SendStateStorePostAnchorTxConf is the state in which we will update
+	// the send package in store to reflect the confirmation of the anchor
+	// transaction. This includes:
+	// * writing the sender and receiver proofs to the proof archive
+	// * marking the transfer change outputs as spendable.
+	SendStateStorePostAnchorTxConf
 
-	// SendStateReceiverProofTransfer is the state in which we will commence
-	// the receiver proof transfer process.
-	SendStateReceiverProofTransfer
+	// SendStateTransferProofs is the state where we attempt to transfer
+	// on-chain transaction proof(s) to the receiving party or parties.
+	SendStateTransferProofs
 
 	// SendStateComplete is the state which is reached once entire asset
 	// transfer process is complete.
@@ -69,6 +73,9 @@ const (
 // String returns a human-readable version of SendState.
 func (s SendState) String() string {
 	switch s {
+	case SendStateStartHandleAddrParcel:
+		return "SendStateStartHandleAddrParcel"
+
 	case SendStateVirtualCommitmentSelect:
 		return "SendStateVirtualCommitmentSelect"
 
@@ -78,8 +85,8 @@ func (s SendState) String() string {
 	case SendStateAnchorSign:
 		return "SendStateAnchorSign"
 
-	case SendStateLogCommit:
-		return "SendStateLogCommit"
+	case SendStateStorePreBroadcast:
+		return "SendStateStorePreBroadcast"
 
 	case SendStateBroadcast:
 		return "SendStateBroadcast"
@@ -87,11 +94,11 @@ func (s SendState) String() string {
 	case SendStateWaitTxConf:
 		return "SendStateWaitTxConf"
 
-	case SendStateStoreProofs:
-		return "SendStateStoreProofs"
+	case SendStateStorePostAnchorTxConf:
+		return "SendStateStorePostAnchorTxConf"
 
-	case SendStateReceiverProofTransfer:
-		return "SendStateReceiverProofTransfer"
+	case SendStateTransferProofs:
+		return "SendStateTransferProofs"
 
 	case SendStateComplete:
 		return "SendStateComplete"
@@ -109,7 +116,9 @@ type Parcel interface {
 	// kit returns the parcel kit used for delivery.
 	kit() *parcelKit
 
-	// Validate validates the parcel.
+	// Validate validates the parcel. The validation focuses on the
+	// necessary fields being present in order for the porter not to panic.
+	// Any business logic validation is assumed to already have happened.
 	Validate() error
 }
 
@@ -135,6 +144,15 @@ type AddressParcel struct {
 	// transferFeeRate is an optional manually-set feerate specified when
 	// requesting an asset transfer.
 	transferFeeRate *chainfee.SatPerKWeight
+
+	// label is an optional user provided transfer label.
+	label string
+
+	// skipProofCourierPingCheck bool is a flag that indicates whether the
+	// proof courier ping check should be skipped. This is useful for
+	// testing purposes or to force transfer attempts even if the
+	// proof courier is not immediately reachable.
+	skipProofCourierPingCheck bool
 }
 
 // A compile-time assertion to ensure AddressParcel implements the parcel
@@ -142,7 +160,8 @@ type AddressParcel struct {
 var _ Parcel = (*AddressParcel)(nil)
 
 // NewAddressParcel creates a new AddressParcel.
-func NewAddressParcel(feeRate *chainfee.SatPerKWeight,
+func NewAddressParcel(feeRate *chainfee.SatPerKWeight, label string,
+	skipProofCourierPingCheck bool,
 	destAddrs ...*address.Tap) *AddressParcel {
 
 	return &AddressParcel{
@@ -150,8 +169,10 @@ func NewAddressParcel(feeRate *chainfee.SatPerKWeight,
 			respChan: make(chan *OutboundParcel, 1),
 			errChan:  make(chan error, 1),
 		},
-		destAddrs:       destAddrs,
-		transferFeeRate: feeRate,
+		destAddrs:                 destAddrs,
+		transferFeeRate:           feeRate,
+		label:                     label,
+		skipProofCourierPingCheck: skipProofCourierPingCheck,
 	}
 }
 
@@ -162,7 +183,9 @@ func (p *AddressParcel) pkg() *sendPackage {
 
 	// Initialize a package with the destination address.
 	return &sendPackage{
-		Parcel: p,
+		Parcel:                    p,
+		Label:                     p.label,
+		SkipProofCourierPingCheck: p.skipProofCourierPingCheck,
 	}
 }
 
@@ -171,7 +194,9 @@ func (p *AddressParcel) kit() *parcelKit {
 	return p.parcelKit
 }
 
-// Validate validates the parcel.
+// Validate validates the parcel. The validation focuses on the necessary fields
+// being present in order for the porter not to panic. Any business logic
+// validation is assumed to already have happened.
 func (p *AddressParcel) Validate() error {
 	// We need at least one address to send to in an address parcel.
 	if len(p.destAddrs) < 1 {
@@ -179,8 +204,14 @@ func (p *AddressParcel) Validate() error {
 			"specified in address parcel")
 	}
 
+	firstAddrVersion := p.destAddrs[0].Version
 	for idx := range p.destAddrs {
 		tapAddr := p.destAddrs[idx]
+
+		// All addresses must have the same version.
+		if tapAddr.Version != firstAddrVersion {
+			return fmt.Errorf("mixed address versions")
+		}
 
 		// Validate proof courier addresses.
 		err := proof.ValidateCourierAddress(&tapAddr.ProofCourierAddr)
@@ -219,6 +250,7 @@ func (p *PendingParcel) pkg() *sendPackage {
 	return &sendPackage{
 		OutboundPkg: p.outboundPkg,
 		SendState:   SendStateBroadcast,
+		Label:       p.outboundPkg.Label,
 	}
 }
 
@@ -227,7 +259,9 @@ func (p *PendingParcel) kit() *parcelKit {
 	return p.parcelKit
 }
 
-// Validate validates the parcel.
+// Validate validates the parcel. The validation focuses on the necessary fields
+// being present in order for the porter not to panic. Any business logic
+// validation is assumed to already have happened.
 func (p *PendingParcel) Validate() error {
 	// A pending parcel should have already been validated.
 	return nil
@@ -239,12 +273,16 @@ func (p *PendingParcel) Validate() error {
 type PreSignedParcel struct {
 	*parcelKit
 
-	// vPkt is the virtual transaction that should be delivered.
-	vPkt *tappsbt.VPacket
+	// vPackets is the list of virtual transaction that should be delivered.
+	vPackets []*tappsbt.VPacket
 
 	// inputCommitments are the commitments for the input that are being
 	// spent in the virtual transaction.
 	inputCommitments tappsbt.InputCommitments
+
+	// note is a string that provides any user defined description for this
+	// transfer.
+	note string
 }
 
 // A compile-time assertion to ensure PreSignedParcel implements the parcel
@@ -252,31 +290,34 @@ type PreSignedParcel struct {
 var _ Parcel = (*PreSignedParcel)(nil)
 
 // NewPreSignedParcel creates a new PreSignedParcel.
-func NewPreSignedParcel(vPkt *tappsbt.VPacket,
-	inputCommitments tappsbt.InputCommitments) *PreSignedParcel {
+func NewPreSignedParcel(vPackets []*tappsbt.VPacket,
+	inputCommitments tappsbt.InputCommitments,
+	note string) *PreSignedParcel {
 
 	return &PreSignedParcel{
 		parcelKit: &parcelKit{
 			respChan: make(chan *OutboundParcel, 1),
 			errChan:  make(chan error, 1),
 		},
-		vPkt:             vPkt,
+		vPackets:         vPackets,
 		inputCommitments: inputCommitments,
+		note:             note,
 	}
 }
 
 // pkg returns the send package that should be delivered.
 func (p *PreSignedParcel) pkg() *sendPackage {
-	log.Infof("New signed delivery request with %d outputs",
-		len(p.vPkt.Outputs))
+	log.Infof("New signed delivery request with %d packets",
+		len(p.vPackets))
 
 	// Initialize a package the signed virtual transaction and input
 	// commitment.
 	return &sendPackage{
 		Parcel:           p,
 		SendState:        SendStateAnchorSign,
-		VirtualPacket:    p.vPkt,
+		VirtualPackets:   p.vPackets,
 		InputCommitments: p.inputCommitments,
+		Note:             p.note,
 	}
 }
 
@@ -285,9 +326,135 @@ func (p *PreSignedParcel) kit() *parcelKit {
 	return p.parcelKit
 }
 
-// Validate validates the parcel.
+// Validate validates the parcel. The validation focuses on the necessary fields
+// being present in order for the porter not to panic. Any business logic
+// validation is assumed to already have happened.
 func (p *PreSignedParcel) Validate() error {
-	// TODO(ffranr): Add validation where appropriate.
+	if len(p.vPackets) == 0 {
+		return fmt.Errorf("no virtual transaction in pre-signed parcel")
+	}
+
+	err := tapsend.ValidateVPacketVersions(p.vPackets)
+	if err != nil {
+		return err
+	}
+
+	for _, vPkt := range p.vPackets {
+		if len(vPkt.Outputs) == 0 {
+			return fmt.Errorf("no outputs in virtual transaction")
+		}
+	}
+
+	if p.inputCommitments == nil {
+		return fmt.Errorf("no input commitments in pre-signed parcel")
+	}
+
+	inputCommitVersions := maps.Values(p.inputCommitments)
+	if inputCommitVersions[0] == nil {
+		return fmt.Errorf("missing input commitment in pre-signed " +
+			"parcel")
+	}
+
+	firstCommitVersion := inputCommitVersions[0].Version
+	for _, inputCommit := range p.inputCommitments {
+		if !commitment.IsSimilarTapCommitmentVersion(
+			&firstCommitVersion, &inputCommit.Version,
+		) {
+
+			return fmt.Errorf("mixed input commitment versions")
+		}
+	}
+
+	return nil
+}
+
+// PreAnchoredParcel is a request to log and publish an asset transfer of a
+// pre-anchored parcel. All virtual PSBTs and the on-chain BTC level anchor
+// transaction must be fully signed and ready to be broadcast.
+type PreAnchoredParcel struct {
+	*parcelKit
+
+	virtualPackets []*tappsbt.VPacket
+
+	passiveAssets []*tappsbt.VPacket
+
+	anchorTx *tapsend.AnchorTransaction
+}
+
+// A compile-time assertion to ensure PreAnchoredParcel implements the Parcel
+// interface.
+var _ Parcel = (*PreAnchoredParcel)(nil)
+
+// NewPreAnchoredParcel creates a new PreAnchoredParcel.
+func NewPreAnchoredParcel(vPackets []*tappsbt.VPacket,
+	passiveAssets []*tappsbt.VPacket,
+	anchorTx *tapsend.AnchorTransaction) *PreAnchoredParcel {
+
+	return &PreAnchoredParcel{
+		parcelKit: &parcelKit{
+			respChan: make(chan *OutboundParcel, 1),
+			errChan:  make(chan error, 1),
+		},
+		virtualPackets: vPackets,
+		passiveAssets:  passiveAssets,
+		anchorTx:       anchorTx,
+	}
+}
+
+// pkg returns the send package that should be delivered.
+func (p *PreAnchoredParcel) pkg() *sendPackage {
+	log.Infof("New anchored delivery request with %d packets",
+		len(p.virtualPackets))
+
+	// Initialize a package the signed virtual transaction and input
+	// commitment.
+	return &sendPackage{
+		Parcel:         p,
+		SendState:      SendStateStorePreBroadcast,
+		VirtualPackets: p.virtualPackets,
+		PassiveAssets:  p.passiveAssets,
+		AnchorTx:       p.anchorTx,
+	}
+}
+
+// kit returns the parcel kit used for delivery.
+func (p *PreAnchoredParcel) kit() *parcelKit {
+	return p.parcelKit
+}
+
+// Validate validates the parcel. The validation focuses on the necessary fields
+// being present in order for the porter not to panic. Any business logic
+// validation is assumed to already have happened.
+func (p *PreAnchoredParcel) Validate() error {
+	if len(p.virtualPackets) == 0 {
+		return fmt.Errorf("no virtual transactions in pre-anchored " +
+			"parcel")
+	}
+
+	err := tapsend.ValidateVPacketVersions(p.virtualPackets)
+	if err != nil {
+		return err
+	}
+
+	for _, vPkt := range p.virtualPackets {
+		if len(vPkt.Outputs) == 0 {
+			return fmt.Errorf("no outputs in virtual transaction")
+		}
+	}
+
+	if p.anchorTx == nil {
+		return fmt.Errorf("no anchor transaction in pre-anchored " +
+			"parcel")
+	}
+
+	if p.anchorTx.FinalTx == nil {
+		return fmt.Errorf("no final transaction in anchor transaction")
+	}
+
+	if p.anchorTx.FundedPsbt == nil {
+		return fmt.Errorf("no funded PSBT in anchor transaction")
+	}
+
 	return nil
 }
 
@@ -296,27 +463,22 @@ type sendPackage struct {
 	// SendState is the current send state of this parcel.
 	SendState SendState
 
-	// VirtualPacket is the virtual packet that we'll use to construct the
-	// virtual asset transition transaction.
-	VirtualPacket *tappsbt.VPacket
-
-	// OutputIdxToAddr is a map from a VPacket's VOutput index to its
-	// associated Tap address.
-	OutputIdxToAddr tappsbt.OutputIdxToAddr
+	// VirtualPackets is the list of virtual packets that should be shipped.
+	VirtualPackets []*tappsbt.VPacket
 
 	// InputCommitments is a map from virtual package input index to its
 	// associated Taproot Asset commitment.
 	InputCommitments tappsbt.InputCommitments
 
 	// PassiveAssets is the data used in re-anchoring passive assets.
-	PassiveAssets []*PassiveAssetReAnchor
+	PassiveAssets []*tappsbt.VPacket
 
 	// Parcel is the asset transfer request that kicked off this transfer.
 	Parcel Parcel
 
 	// AnchorTx is the BTC level anchor transaction with all its information
 	// as it was used when funding/signing it.
-	AnchorTx *AnchorTransaction
+	AnchorTx *tapsend.AnchorTransaction
 
 	// OutboundPkg is the on-disk level information that tracks the pending
 	// transfer.
@@ -324,496 +486,288 @@ type sendPackage struct {
 
 	// FinalProofs is the set of final full proof chain files that are going
 	// to be stored on disk, one for each output in the outbound parcel,
-	// keyed by their script key.
-	FinalProofs map[asset.SerializedKey]*proof.AnnotatedProof
+	// keyed by their unique output key (hash of asset ID and script key).
+	FinalProofs map[OutputIdentifier]*proof.AnnotatedProof
 
 	// TransferTxConfEvent contains transfer transaction on-chain
 	// confirmation data.
 	TransferTxConfEvent *chainntnfs.TxConfirmation
+
+	// Label is a user provided short label for this transfer.
+	Label string
+
+	// Note is a user provided description for this transfer. This is
+	// currently only used by asset burn transfers.
+	Note string
+
+	// SkipProofCourierPingCheck bool is a flag that indicates whether the
+	// proof courier ping check should be skipped. This is useful for
+	// testing purposes or to force transfer attempts even if the
+	// proof courier is not immediately reachable.
+	SkipProofCourierPingCheck bool
 }
 
-// prepareForStorage prepares the send package for storing to the database.
-func (s *sendPackage) prepareForStorage(currentHeight uint32) (*OutboundParcel,
+// ConvertToTransfer prepares the finished send data for storing to the database
+// as a transfer. We generally understand a "transfer" as everything that
+// happened on the asset level within a single bitcoin anchor transaction.
+// Virtual transactions grouped into "active" transfers are movements that the
+// user explicitly initiated. These usually can be identified as either creating
+// a split (for partial amounts) or (for full value sends) as sending to a
+// script key. Passive virtual transactions are state updates for all assets
+// that were committed to in the same anchor transaction as the active assets
+// being spent but remain under the daemon's control. These can be identified as
+// 1-input-1-output virtual transactions that send to the same script key as
+// they were already committed at.
+func ConvertToTransfer(currentHeight uint32, activeTransfers []*tappsbt.VPacket,
+	anchorTx *tapsend.AnchorTransaction, passiveAssets []*tappsbt.VPacket,
+	isLocalKey func(asset.ScriptKey) bool, label string) (*OutboundParcel,
 	error) {
 
-	// Gather newly generated data required for re-anchoring passive assets.
-	for idx := range s.PassiveAssets {
-		passiveAsset := s.PassiveAssets[idx]
-
-		// Generate passive asset re-anchoring proofs.
-		newProof, err := s.createReAnchorProof(passiveAsset.VPacket)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create re-anchor "+
-				"proof: %w", err)
+	var passiveAssetAnchor *Anchor
+	if len(passiveAssets) > 0 {
+		// If we have passive assets, we need to create a new anchor
+		// for them. They all anchor into the same output, so we can
+		// just use the first one.
+		firstPassiveVOutput := passiveAssets[0].Outputs[0]
+		if firstPassiveVOutput.ProofSuffix == nil {
+			return nil, fmt.Errorf("no proof suffix for passive " +
+				"assets")
 		}
 
-		passiveAsset.NewProof = newProof
-		signedAsset := passiveAsset.VPacket.Outputs[0].Asset
-		passiveAsset.NewWitnessData = signedAsset.PrevWitnesses
+		var err error
+		passiveAssetAnchor, err = outputAnchor(
+			anchorTx, firstPassiveVOutput, nil,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("unable to create passive "+
+				"asset anchor: %w", err)
+		}
 	}
 
-	vPkt := s.VirtualPacket
-	anchorTXID := s.AnchorTx.FinalTx.TxHash()
 	parcel := &OutboundParcel{
-		AnchorTx:           s.AnchorTx.FinalTx,
+		AnchorTx:           anchorTx.FinalTx,
 		AnchorTxHeightHint: currentHeight,
 		// TODO(bhandras): use clock.Clock instead.
-		TransferTime:  time.Now(),
-		ChainFees:     s.AnchorTx.ChainFees,
-		Inputs:        make([]TransferInput, len(vPkt.Inputs)),
-		Outputs:       make([]TransferOutput, len(vPkt.Outputs)),
-		PassiveAssets: s.PassiveAssets,
+		TransferTime: time.Now(),
+		ChainFees:    anchorTx.ChainFees,
+		Inputs:       make([]TransferInput, 0, len(activeTransfers)),
+		Outputs: make(
+			// This is just a heuristic to pre-allocate something,
+			// assuming most transfers have around two outputs.
+			[]TransferOutput, 0, len(activeTransfers)*2,
+		),
+		PassiveAssets:       passiveAssets,
+		PassiveAssetsAnchor: passiveAssetAnchor,
+		Label:               label,
 	}
 
-	for idx := range vPkt.Inputs {
-		vIn := vPkt.Inputs[idx]
+	allPackets := append(activeTransfers, passiveAssets...)
+	if err := tapsend.AssertInputsUnique(allPackets); err != nil {
+		return nil, fmt.Errorf("unable to convert to transfer: %w", err)
+	}
 
-		// We don't know the actual outpoint the input is spending, so
-		// we need to look it up by the pkScript in the anchor TX.
-		var anchorOutPoint *wire.OutPoint
-		for inIdx := range s.AnchorTx.FundedPsbt.Pkt.Inputs {
-			pIn := s.AnchorTx.FundedPsbt.Pkt.Inputs[inIdx]
-			if pIn.WitnessUtxo == nil {
-				return nil, fmt.Errorf("anchor input %d has "+
-					"no witness utxo", idx)
-			}
-			utxo := pIn.WitnessUtxo
-			if bytes.Equal(utxo.PkScript, vIn.Anchor.PkScript) {
-				txIn := s.AnchorTx.FinalTx.TxIn[inIdx]
-				anchorOutPoint = &txIn.PreviousOutPoint
-				break
-			}
-		}
-		if anchorOutPoint == nil {
-			return nil, fmt.Errorf("unable to find anchor "+
-				"outpoint for input %d", idx)
-		}
+	for pIdx := range activeTransfers {
+		vPkt := activeTransfers[pIdx]
 
-		parcel.Inputs[idx] = TransferInput{
-			PrevID: asset.PrevID{
-				OutPoint: *anchorOutPoint,
-				ID:       vIn.Asset().ID(),
-				ScriptKey: asset.ToSerialized(
-					vIn.Asset().ScriptKey.PubKey,
-				),
-			},
-			Amount: vIn.Asset().Amount,
+		for idx := range vPkt.Inputs {
+			tIn, err := transferInput(vPkt.Inputs[idx])
+			if err != nil {
+				return nil, fmt.Errorf("unable to convert "+
+					"input %d: %w", idx, err)
+			}
+
+			parcel.Inputs = append(parcel.Inputs, *tIn)
 		}
 	}
 
-	outputCommitments := s.AnchorTx.OutputCommitments
-	for idx := range vPkt.Outputs {
-		vOut := vPkt.Outputs[idx]
+	// The outputPosition represents the index of the output within the list
+	// of output transfers. It is continuously incremented across all
+	// outputs and virtual packets.
+	outputPosition := uint64(0)
 
-		// Convert any proof courier address associated with this output
-		// to bytes for db storage.
-		var proofCourierAddrBytes []byte
-		if s.OutputIdxToAddr != nil {
-			if addr, ok := s.OutputIdxToAddr[idx]; ok {
-				proofCourierAddrBytes = []byte(
-					addr.ProofCourierAddr.String(),
-				)
-			}
-		}
+	for pIdx := range activeTransfers {
+		vPkt := activeTransfers[pIdx]
 
-		anchorInternalKey := keychain.KeyDescriptor{
-			PubKey: vOut.AnchorOutputInternalKey,
-		}
-		if vOut.AnchorOutputBip32Derivation != nil {
-			var err error
-			anchorInternalKey, err = vOut.AnchorKeyToDesc()
+		for vPktOutputIdx := range vPkt.Outputs {
+			// Burn and tombstone keys are the only keys that we
+			// don't explicitly store in the DB before this point.
+			// But we'll want them to have the correct type when
+			// creating the transfer, as they'll be inserted into
+			// the DB, assigned to this transfer.
+			detectUnSpendableKeys(vPkt.Outputs[vPktOutputIdx])
+
+			tOut, err := transferOutput(
+				vPkt, vPktOutputIdx, outputPosition, anchorTx,
+				passiveAssets, isLocalKey,
+			)
 			if err != nil {
-				return nil, fmt.Errorf("unable to get anchor "+
-					"key desc: %w", err)
+				return nil, fmt.Errorf("unable to convert "+
+					"output %d: %w", vPktOutputIdx, err)
 			}
-		}
+			outputPosition += 1
 
-		preimageBytes, siblingHash, err := commitment.MaybeEncodeTapscriptPreimage(
-			vOut.AnchorOutputTapscriptSibling,
-		)
-		if err != nil {
-			return nil, fmt.Errorf("unable to encode tapscript "+
-				"preimage: %w", err)
-		}
-
-		outCommitment := outputCommitments[vOut.AnchorOutputIndex]
-		merkleRoot := outCommitment.TapscriptRoot(siblingHash)
-		taprootAssetRoot := outCommitment.TapscriptRoot(nil)
-
-		var (
-			numPassiveAssets    uint32
-			proofSuffixBuf      bytes.Buffer
-			witness             []asset.Witness
-			splitCommitmentRoot mssmt.Node
-		)
-
-		// If there are passive assets, they are always committed to the
-		// output that is marked as the split root.
-		if vOut.Type.CanCarryPassive() {
-			numPassiveAssets = uint32(len(s.PassiveAssets))
-		}
-
-		// Either we have an asset that we commit to or we have an
-		// output just for the passive assets, which we mark as an
-		// interactive split root.
-		switch {
-		// This is a "valid" output for just carrying passive assets
-		// (marked as interactive split root and not committing to an
-		// active asset transfer).
-		case vOut.Interactive && vOut.Type.IsSplitRoot() && vOut.Asset == nil:
-			vOut.Type = tappsbt.TypePassiveAssetsOnly
-
-		// In any other case we expect an active asset transfer to be
-		// committed to.
-		case vOut.Asset != nil:
-			proofSuffix, err := s.createProofSuffix(idx)
-			if err != nil {
-				return nil, fmt.Errorf("unable to create "+
-					"proof %d: %w", idx, err)
-			}
-			err = proofSuffix.Encode(&proofSuffixBuf)
-			if err != nil {
-				return nil, fmt.Errorf("unable to encode "+
-					"proof %d: %w", idx, err)
-			}
-			witness = vOut.Asset.PrevWitnesses
-			splitCommitmentRoot = vOut.Asset.SplitCommitmentRoot
-
-		default:
-			return nil, fmt.Errorf("invalid output %d, asset "+
-				"missing and not marked for passive assets",
-				idx)
-		}
-
-		txOut := s.AnchorTx.FinalTx.TxOut[vOut.AnchorOutputIndex]
-		parcel.Outputs[idx] = TransferOutput{
-			Anchor: Anchor{
-				OutPoint: wire.OutPoint{
-					Hash:  anchorTXID,
-					Index: vOut.AnchorOutputIndex,
-				},
-				Value:            btcutil.Amount(txOut.Value),
-				InternalKey:      anchorInternalKey,
-				TaprootAssetRoot: taprootAssetRoot[:],
-				MerkleRoot:       merkleRoot[:],
-				TapscriptSibling: preimageBytes,
-				NumPassiveAssets: numPassiveAssets,
-			},
-			Type:                vOut.Type,
-			ScriptKey:           vOut.ScriptKey,
-			Amount:              vOut.Amount,
-			AssetVersion:        vOut.AssetVersion,
-			WitnessData:         witness,
-			SplitCommitmentRoot: splitCommitmentRoot,
-			ProofSuffix:         proofSuffixBuf.Bytes(),
-			ProofCourierAddr:    proofCourierAddrBytes,
+			parcel.Outputs = append(parcel.Outputs, *tOut)
 		}
 	}
 
 	return parcel, nil
 }
 
-// createProofSuffix creates the new proof for the given output. This is the
-// final state transition that will be added to the proofs of the receiver. The
-// proof returned will have all the Taproot Asset level proof information, but
-// contains dummy data for the on-chain part.
-func (s *sendPackage) createProofSuffix(outIndex int) (*proof.Proof, error) {
-	inputPrevID := s.VirtualPacket.Inputs[0].PrevID
-
-	params, err := proofParams(s.AnchorTx, s.VirtualPacket, outIndex)
-	if err != nil {
-		return nil, err
+// transferInput creates a TransferInput from a virtual input and the anchor
+// packet.
+func transferInput(vIn *tappsbt.VInput) (*TransferInput, error) {
+	var emptyPrevID asset.PrevID
+	if vIn.PrevID == emptyPrevID {
+		return nil, fmt.Errorf("invalid input, prev id missing")
 	}
 
-	// We also need to account for any P2TR change outputs.
-	if len(s.AnchorTx.FundedPsbt.Pkt.UnsignedTx.TxOut) > 1 {
-		isAnchor := func(idx uint32) bool {
-			for outIdx := range s.VirtualPacket.Outputs {
-				vOut := s.VirtualPacket.Outputs[outIdx]
-				if vOut.AnchorOutputIndex == idx {
-					return true
-				}
-			}
-
-			return false
-		}
-
-		err := proof.AddExclusionProofs(
-			&params.BaseProofParams, s.AnchorTx.FundedPsbt.Pkt,
-			isAnchor,
-		)
-		if err != nil {
-			return nil, fmt.Errorf("error adding exclusion "+
-				"proof for output %d: %w", outIndex, err)
-		}
-	}
-
-	proofSuffix, err := proof.CreateTransitionProof(
-		inputPrevID.OutPoint, params,
-	)
-	if err != nil {
-		return nil, err
-	}
-
-	return proofSuffix, nil
+	return &TransferInput{
+		PrevID: vIn.PrevID,
+		Amount: vIn.Asset().Amount,
+	}, nil
 }
 
-// newParams is used to create a set of new params for the final state
-// transition.
-func newParams(anchorTx *AnchorTransaction, a *asset.Asset, outputIndex int,
-	internalKey *btcec.PublicKey, taprootAssetRoot *commitment.TapCommitment,
-	siblingPreimage *commitment.TapscriptPreimage) *proof.TransitionParams {
+// transferOutput creates a TransferOutput from a virtual output and the anchor
+// packet.
+func transferOutput(vPkt *tappsbt.VPacket, vOutIdx int, position uint64,
+	anchorTx *tapsend.AnchorTransaction, passiveAssets []*tappsbt.VPacket,
+	isLocalKey func(asset.ScriptKey) bool) (*TransferOutput, error) {
 
-	return &proof.TransitionParams{
-		BaseProofParams: proof.BaseProofParams{
-			Block: &wire.MsgBlock{
-				Transactions: []*wire.MsgTx{
-					anchorTx.FinalTx,
-				},
-			},
-			Tx:               anchorTx.FinalTx,
-			TxIndex:          0,
-			OutputIndex:      outputIndex,
-			InternalKey:      internalKey,
-			TaprootAssetRoot: taprootAssetRoot,
-			TapscriptSibling: siblingPreimage,
-		},
-		NewAsset: a,
+	vOut := vPkt.Outputs[vOutIdx]
+
+	// Convert any proof courier address associated with this output
+	// to bytes for db storage.
+	var proofCourierAddrBytes []byte
+	if vOut.ProofDeliveryAddress != nil {
+		proofCourierAddrBytes = []byte(
+			vOut.ProofDeliveryAddress.String(),
+		)
 	}
+
+	// We should have an asset and proof suffix now.
+	if vOut.Asset == nil || vOut.ProofSuffix == nil {
+		return nil, fmt.Errorf("invalid output %d, asset or proof "+
+			"missing", vOutIdx)
+	}
+
+	proofSuffixBytes, err := vOut.ProofSuffix.Bytes()
+	if err != nil {
+		return nil, fmt.Errorf("unable to encode proof %d: %w",
+			vOutIdx, err)
+	}
+
+	anchor, err := outputAnchor(anchorTx, vOut, passiveAssets)
+	if err != nil {
+		return nil, fmt.Errorf("unable to create anchor: %w", err)
+	}
+
+	out := TransferOutput{
+		Anchor:              *anchor,
+		Type:                vOut.Type,
+		ScriptKey:           vOut.ScriptKey,
+		Amount:              vOut.Amount,
+		LockTime:            vOut.Asset.LockTime,
+		RelativeLockTime:    vOut.Asset.RelativeLockTime,
+		AssetVersion:        vOut.AssetVersion,
+		WitnessData:         vOut.Asset.PrevWitnesses,
+		SplitCommitmentRoot: vOut.Asset.SplitCommitmentRoot,
+		ProofSuffix:         proofSuffixBytes,
+		ProofCourierAddr:    proofCourierAddrBytes,
+		ScriptKeyLocal:      isLocalKey(vOut.ScriptKey),
+		Position:            position,
+	}
+
+	// Determine whether an associated proof needs to be delivered to a peer
+	// based on the currently set fields.
+	shouldDeliverProof, err := out.ShouldDeliverProof()
+	if err != nil {
+		return nil, fmt.Errorf("unable to determine if transfer "+
+			"output proof should be delivery to a peer: %w", err)
+	}
+
+	if shouldDeliverProof {
+		// Set the `ProofDeliveryComplete` field to `Some(false)` to
+		// indicate that proof delivery is pending. Once the proof has
+		// been successfully  delivered, this field will be updated to
+		// `Some(true)`.
+		//
+		// If it was determined that the proof should not be delivered,
+		// the `ProofDeliveryComplete` field would remain `None`.
+		out.ProofDeliveryComplete = fn.Some(false)
+	}
+
+	return &out, nil
 }
 
-// proofParams creates the set of parameters that will be used to create the
-// proofs for the sender and receiver.
-func proofParams(anchorTx *AnchorTransaction, vPkt *tappsbt.VPacket,
-	outIndex int) (*proof.TransitionParams, error) {
+// outputAnchor creates an Anchor from an anchor transaction and a virtual
+// output.
+func outputAnchor(anchorTx *tapsend.AnchorTransaction, vOut *tappsbt.VOutput,
+	passiveAssets []*tappsbt.VPacket) (*Anchor, error) {
 
-	outputCommitments := anchorTx.OutputCommitments
-
-	isSplit, err := vPkt.HasSplitCommitment()
-	if err != nil {
-		return nil, err
+	anchorTXID := anchorTx.FinalTx.TxHash()
+	anchorInternalKey := keychain.KeyDescriptor{
+		PubKey: vOut.AnchorOutputInternalKey,
 	}
-
-	// Is this the split root? Then we need exclusion proofs from all the
-	// split outputs. We can also use this path for interactive full value
-	// send case, where we also just commit to an asset that has a TX
-	// witness. We just need an inclusion proof and the exclusion proofs for
-	// any other outputs.
-	if vPkt.Outputs[outIndex].Type.IsSplitRoot() || !isSplit {
-		rootOut := vPkt.Outputs[outIndex]
-		rootIndex := rootOut.AnchorOutputIndex
-		rootTapTree := outputCommitments[rootIndex]
-
-		rootParams := newParams(
-			anchorTx, rootOut.Asset, int(rootIndex),
-			rootOut.AnchorOutputInternalKey, rootTapTree,
-			rootOut.AnchorOutputTapscriptSibling,
-		)
-
-		// Add exclusion proofs for all the other outputs.
-		err = addOtherOutputExclusionProofs(
-			vPkt.Outputs, rootOut.Asset, rootParams,
-			outputCommitments,
-			func(i int, _ *tappsbt.VOutput) bool {
-				return i == outIndex
-			},
-		)
+	if vOut.AnchorOutputBip32Derivation != nil {
+		var err error
+		anchorInternalKey, err = vOut.AnchorKeyToDesc()
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("unable to get anchor "+
+				"key desc: %w", err)
 		}
-
-		return rootParams, nil
 	}
 
-	// If this isn't the split root, then we need an exclusion proof from
-	// just the split root.
-	splitRootOut, err := vPkt.SplitRootOutput()
-	if err != nil {
-		return nil, fmt.Errorf("error getting split root output: %w",
-			err)
-	}
-
-	splitRootIndex := splitRootOut.AnchorOutputIndex
-	splitRootTree := outputCommitments[splitRootIndex]
-
-	splitOut := vPkt.Outputs[outIndex]
-	splitIndex := splitOut.AnchorOutputIndex
-	splitTapTree := outputCommitments[splitIndex]
-
-	_, splitRootExclusionProof, err := splitRootTree.Proof(
-		splitOut.Asset.TapCommitmentKey(),
-		splitOut.Asset.AssetCommitmentKey(),
+	preimageBytes, _, err := commitment.MaybeEncodeTapscriptPreimage(
+		vOut.AnchorOutputTapscriptSibling,
 	)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("unable to encode tapscript "+
+			"preimage: %w", err)
 	}
 
-	splitRootPreimage := splitRootOut.AnchorOutputTapscriptSibling
-	splitParams := newParams(
-		anchorTx, splitOut.Asset, int(splitIndex),
-		splitOut.AnchorOutputInternalKey, splitTapTree,
-		splitOut.AnchorOutputTapscriptSibling,
+	anchorOut := &anchorTx.FundedPsbt.Pkt.Outputs[vOut.AnchorOutputIndex]
+	merkleRoot := tappsbt.ExtractCustomField(
+		anchorOut.Unknowns, tappsbt.PsbtKeyTypeOutputTaprootMerkleRoot,
 	)
-	splitParams.RootOutputIndex = splitRootIndex
-	splitParams.RootInternalKey = splitRootOut.AnchorOutputInternalKey
-	splitParams.RootTaprootAssetTree = splitRootTree
-	splitParams.ExclusionProofs = []proof.TaprootProof{{
-		OutputIndex: splitRootIndex,
-		InternalKey: splitRootOut.AnchorOutputInternalKey,
-		CommitmentProof: &proof.CommitmentProof{
-			Proof:              *splitRootExclusionProof,
-			TapSiblingPreimage: splitRootPreimage,
-		},
-	}}
+	taprootAssetRoot := tappsbt.ExtractCustomField(
+		anchorOut.Unknowns, tappsbt.PsbtKeyTypeOutputAssetRoot,
+	)
 
-	// Add exclusion proofs for all the other outputs.
-	err = addOtherOutputExclusionProofs(
-		vPkt.Outputs, splitOut.Asset, splitParams, outputCommitments,
-		func(i int, vOut *tappsbt.VOutput) bool {
-			// We don't need exclusion proofs for:
-			//	- The split output itself.
-			//	- The split root output.
-			//	- Any output that is committed to the same
-			//	  anchor output as our split output.
-			return i == outIndex || vOut == splitRootOut ||
-				vOut.AnchorOutputIndex == splitIndex
-		},
-	)
+	// Fetch the Taproot asset commitment version from the output's proof
+	// suffix.
+	commitmentVersion, err := vOut.TapCommitmentVersion()
 	if err != nil {
 		return nil, err
 	}
 
-	return splitParams, nil
-}
-
-// addOtherOutputExclusionProofs adds exclusion proofs for all the outputs that
-// are asset outputs but haven't been processed yet (the skip function needs to
-// return false for not yet processed outputs, otherwise they'll be skipped).
-func addOtherOutputExclusionProofs(outputs []*tappsbt.VOutput,
-	asset *asset.Asset, params *proof.TransitionParams,
-	outputCommitments map[uint32]*commitment.TapCommitment,
-	skip func(int, *tappsbt.VOutput) bool) error {
-
-	for idx := range outputs {
-		vOut := outputs[idx]
-
-		haveProof := params.HaveExclusionProof(vOut.AnchorOutputIndex)
-		if skip(idx, vOut) || haveProof {
-			continue
+	// If there are passive assets, are they anchored in the same anchor
+	// output as this transfer output? If yes, then we show this to the user
+	// by just attaching the number of passive assets.
+	var numPassiveAssets uint32
+	if len(passiveAssets) > 0 {
+		// All passive assets should be at the same anchor output index.
+		firstPassive := passiveAssets[0]
+		anchorOutputIndex := firstPassive.Outputs[0].AnchorOutputIndex
+		if anchorOutputIndex == vOut.AnchorOutputIndex {
+			numPassiveAssets = uint32(len(passiveAssets))
 		}
-
-		outIndex := vOut.AnchorOutputIndex
-		tapTree := outputCommitments[outIndex]
-
-		_, splitExclusionProof, err := tapTree.Proof(
-			asset.TapCommitmentKey(),
-			asset.AssetCommitmentKey(),
-		)
-		if err != nil {
-			return err
-		}
-
-		log.Tracef("Generated exclusion proof for anchor output index "+
-			"%d with asset_id=%v, taproot_asset_root=%x, "+
-			"internal_key=%x", outIndex, asset.ID(),
-			fn.ByteSlice(tapTree.TapscriptRoot(nil)),
-			vOut.AnchorOutputInternalKey.SerializeCompressed())
-
-		siblingPreimage := vOut.AnchorOutputTapscriptSibling
-		exclusionProof := proof.TaprootProof{
-			OutputIndex: outIndex,
-			InternalKey: vOut.AnchorOutputInternalKey,
-			CommitmentProof: &proof.CommitmentProof{
-				Proof:              *splitExclusionProof,
-				TapSiblingPreimage: siblingPreimage,
-			},
-		}
-		params.ExclusionProofs = append(
-			params.ExclusionProofs, exclusionProof,
-		)
 	}
 
-	return nil
-}
-
-// createReAnchorProof creates the new proof for the re-anchoring of a passive
-// asset.
-func (s *sendPackage) createReAnchorProof(
-	passivePkt *tappsbt.VPacket) (*proof.Proof, error) {
-
-	// Passive asset transfers only have a single input and a single output.
-	passiveIn := passivePkt.Inputs[0]
-	passiveOut := passivePkt.Outputs[0]
-
-	// Passive assets are always anchored at a specific marked output, which
-	// normally contains asset change. But it can also be that the split
-	// root output was just created for the passive assets, if there is no
-	// active transfer or no change.
-	passiveCarrierOut, err := s.VirtualPacket.PassiveAssetsOutput()
-	if err != nil {
-		return nil, fmt.Errorf("anchor output for passive assets not "+
-			"found: %w", err)
-	}
-
-	outputCommitments := s.AnchorTx.OutputCommitments
-	passiveOutputIndex := passiveOut.AnchorOutputIndex
-	passiveTapTree := outputCommitments[passiveOutputIndex]
-
-	// The base parameters include the inclusion proof of the passive asset
-	// in the split root output.
-	passiveParams := newParams(
-		s.AnchorTx, passiveOut.Asset, int(passiveOutputIndex),
-		passiveCarrierOut.AnchorOutputInternalKey, passiveTapTree,
-		passiveCarrierOut.AnchorOutputTapscriptSibling,
-	)
-
-	// Since a transfer might contain other anchor outputs, we need to
-	// provide an exclusion proof of the passive asset for each of the other
-	// BTC level outputs.
-	err = addOtherOutputExclusionProofs(
-		s.VirtualPacket.Outputs, passiveOut.Asset, passiveParams,
-		outputCommitments, func(i int, vOut *tappsbt.VOutput) bool {
-			return vOut.AnchorOutputIndex == passiveOutputIndex
+	txOut := anchorTx.FinalTx.TxOut[vOut.AnchorOutputIndex]
+	return &Anchor{
+		OutPoint: wire.OutPoint{
+			Hash:  anchorTXID,
+			Index: vOut.AnchorOutputIndex,
 		},
-	)
-	if err != nil {
-		return nil, err
-	}
-
-	// Add exclusion proof(s) for any P2TR (=BIP-0086, not carrying any
-	// assets) change outputs.
-	if len(s.AnchorTx.FundedPsbt.Pkt.UnsignedTx.TxOut) > 1 {
-		isAnchor := func(idx uint32) bool {
-			for outIdx := range s.VirtualPacket.Outputs {
-				vOut := s.VirtualPacket.Outputs[outIdx]
-				if vOut.AnchorOutputIndex == idx {
-					return true
-				}
-			}
-
-			return false
-		}
-
-		err := proof.AddExclusionProofs(
-			&passiveParams.BaseProofParams,
-			s.AnchorTx.FundedPsbt.Pkt, isAnchor,
-		)
-		if err != nil {
-			return nil, fmt.Errorf("error adding exclusion "+
-				"proof for change output: %w", err)
-		}
-	}
-
-	// Generate a proof of this new state transition.
-	reAnchorProof, err := proof.CreateTransitionProof(
-		passiveIn.PrevID.OutPoint, passiveParams,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("error creating re-anchor proof: %w",
-			err)
-	}
-
-	return reAnchorProof, nil
+		Value:             btcutil.Amount(txOut.Value),
+		InternalKey:       anchorInternalKey,
+		TaprootAssetRoot:  taprootAssetRoot[:],
+		CommitmentVersion: fn.Ptr(uint8(*commitmentVersion)),
+		MerkleRoot:        merkleRoot[:],
+		TapscriptSibling:  preimageBytes,
+		NumPassiveAssets:  numPassiveAssets,
+		PkScript:          txOut.PkScript,
+	}, nil
 }
 
 // deliverTxBroadcastResp delivers a response for the parcel back to the
@@ -834,4 +788,37 @@ func (s *sendPackage) deliverTxBroadcastResp() {
 		len(s.OutboundPkg.Inputs), len(s.OutboundPkg.Outputs))
 
 	s.Parcel.kit().respChan <- s.OutboundPkg
+}
+
+// validateReadyForPublish checks that the virtual packets are ready to be
+// published to the network. The pruned assets (assets that were present in the
+// input TAP tree but are not re-created by any of the active or passive packets
+// because they were burns or tombstones) are required to be supplied in order
+// for the full input TAP tree to be reconstructed and validated.
+func (s *sendPackage) validateReadyForPublish(
+	prunedAssets map[wire.OutPoint][]*asset.Asset) error {
+
+	// At this point all the virtual packet inputs and outputs should fully
+	// match the BTC level anchor transaction. Version 0 assets should also
+	// be signed now.
+	allPackets := append([]*tappsbt.VPacket{}, s.VirtualPackets...)
+	allPackets = append(allPackets, s.PassiveAssets...)
+	if err := tapsend.AssertInputAnchorsEqual(allPackets); err != nil {
+		return fmt.Errorf("input anchors don't match: %w", err)
+	}
+	if err := tapsend.AssertOutputAnchorsEqual(allPackets); err != nil {
+		return fmt.Errorf("output anchors don't match: %w", err)
+	}
+
+	btcPkt := s.AnchorTx.FundedPsbt.Pkt
+	err := tapsend.ValidateAnchorInputs(btcPkt, allPackets, prunedAssets)
+	if err != nil {
+		return fmt.Errorf("error validating anchor inputs: %w", err)
+	}
+	err = tapsend.ValidateAnchorOutputs(btcPkt, allPackets, true)
+	if err != nil {
+		return fmt.Errorf("error validating anchor outputs: %w", err)
+	}
+
+	return nil
 }

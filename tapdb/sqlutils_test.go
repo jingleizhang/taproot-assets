@@ -13,6 +13,7 @@ import (
 	"github.com/btcsuite/btcd/wire"
 	"github.com/lightninglabs/taproot-assets/asset"
 	"github.com/lightninglabs/taproot-assets/commitment"
+	"github.com/lightninglabs/taproot-assets/fn"
 	"github.com/lightninglabs/taproot-assets/internal/test"
 	"github.com/lightninglabs/taproot-assets/proof"
 	"github.com/lightninglabs/taproot-assets/tapdb/sqlc"
@@ -55,11 +56,18 @@ func (d *DbHandler) AddRandomAssetProof(t *testing.T) (*asset.Asset,
 	// Next, we'll make a new random asset that also has a few inputs with
 	// dummy witness information.
 	testAsset := randAsset(t)
+	testAltLeaves := asset.ToAltLeaves(asset.RandAltLeaves(t, true))
 
 	assetRoot, err := commitment.NewAssetCommitment(testAsset)
 	require.NoError(t, err)
 
-	taprootAssetRoot, err := commitment.NewTapCommitment(assetRoot)
+	commitVersion := test.RandFlip(nil, fn.Ptr(commitment.TapCommitmentV2))
+	taprootAssetRoot, err := commitment.NewTapCommitment(
+		commitVersion, assetRoot,
+	)
+	require.NoError(t, err)
+
+	err = taprootAssetRoot.MergeAltLeaves(testAltLeaves)
 	require.NoError(t, err)
 
 	// With our asset created, we can now create the AnnotatedProof we use
@@ -83,12 +91,11 @@ func (d *DbHandler) AddRandomAssetProof(t *testing.T) (*asset.Asset,
 
 	// Generate a random proof and encode it into a proof blob.
 	testProof := randProof(t, testAsset)
+	testProof.AltLeaves = testAltLeaves
 
-	var proofBlobBuffer bytes.Buffer
-	err = testProof.Encode(&proofBlobBuffer)
+	proofBlob, err := testProof.Bytes()
 	require.NoError(t, err)
 
-	proofBlob := proofBlobBuffer.Bytes()
 	scriptKey := testAsset.ScriptKey
 
 	annotatedProof := &proof.AnnotatedProof{
@@ -101,7 +108,7 @@ func (d *DbHandler) AddRandomAssetProof(t *testing.T) (*asset.Asset,
 			Asset:             testAsset,
 			OutPoint:          anchorPoint,
 			AnchorBlockHash:   blockHash,
-			AnchorBlockHeight: test.RandInt[uint32](),
+			AnchorBlockHeight: uint32(test.RandIntn(1000) + 1),
 			AnchorTxIndex:     test.RandInt[uint32](),
 			AnchorTx:          anchorTx,
 			OutputIndex:       0,
@@ -162,8 +169,7 @@ func (d *DbHandler) AddRandomAssetProof(t *testing.T) (*asset.Asset,
 	// With all our test data constructed, we'll now attempt to import the
 	// asset into the database.
 	require.NoError(t, assetStore.ImportProofs(
-		ctx, proof.MockHeaderVerifier, proof.MockGroupVerifier, false,
-		annotatedProof,
+		ctx, proof.MockVerifierCtx, false, annotatedProof,
 	))
 
 	// Now the HasProof should return true.
@@ -185,7 +191,7 @@ func (d *DbHandler) AddUniProofLeaf(t *testing.T, testAsset *asset.Asset,
 	// populate the universe root and universe leaves tables.
 	uniId := universe.NewUniIDFromAsset(*testAsset)
 
-	leafKey := universe.LeafKey{
+	leafKey := universe.BaseLeafKey{
 		OutPoint:  annotatedProof.AssetSnapshot.OutPoint,
 		ScriptKey: &testAsset.ScriptKey,
 	}
@@ -253,7 +259,9 @@ func newDbHandleFromDb(db *BaseDB) *DbHandler {
 			return db.WithTx(tx)
 		},
 	)
-	multiverseStore := NewMultiverseStore(multiverseTxCreator)
+	multiverseStore := NewMultiverseStore(
+		multiverseTxCreator, DefaultMultiverseStoreConfig(),
+	)
 
 	// Gain a handle to the pending (minting) assets store.
 	assetMintingDB := NewTransactionExecutor(
@@ -269,7 +277,17 @@ func newDbHandleFromDb(db *BaseDB) *DbHandler {
 			return db.WithTx(tx)
 		},
 	)
-	activeAssetsStore := NewAssetStore(assetsDB, testClock)
+
+	// Gain a handle to the meta store.
+	metaDB := NewTransactionExecutor(
+		db, func(tx *sql.Tx) MetaStore {
+			return db.WithTx(tx)
+		},
+	)
+
+	activeAssetsStore := NewAssetStore(
+		assetsDB, metaDB, testClock, db.Backend(),
+	)
 
 	return &DbHandler{
 		UniverseFederationStore: fedStore,

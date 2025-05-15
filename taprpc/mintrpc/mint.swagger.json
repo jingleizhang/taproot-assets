@@ -82,6 +82,13 @@
             "in": "query",
             "required": false,
             "type": "string"
+          },
+          {
+            "name": "verbose",
+            "description": "If true, pending asset group details will be included for any funded,\nnon-empty pending batch. Unfunded or empty batches will be excluded.",
+            "in": "query",
+            "required": false,
+            "type": "boolean"
           }
         ],
         "tags": [
@@ -154,6 +161,114 @@
           "Mint"
         ]
       }
+    },
+    "/v1/taproot-assets/assets/mint/fund": {
+      "post": {
+        "summary": "tapcli `assets mint fund`\nFundBatch will attempt to fund the current pending batch with a genesis\ninput, or create a new funded batch if no batch exists yet. This RPC is only\nneeded if a custom witness is needed to finalize the batch. Otherwise,\nFinalizeBatch can be called directly.",
+        "operationId": "Mint_FundBatch",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/mintrpcFundBatchResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/mintrpcFundBatchRequest"
+            }
+          }
+        ],
+        "tags": [
+          "Mint"
+        ]
+      }
+    },
+    "/v1/taproot-assets/assets/mint/seal": {
+      "post": {
+        "summary": "tapcli `assets mint seal`\nSealBatch will attempt to seal the current pending batch by creating and\nvalidating asset group witness for all assets in the batch. If a witness\nis not provided, a signature will be derived to serve as the witness. This\nRPC is only needed if any assets in the batch have a custom asset group key\nthat require an external signer. Otherwise, FinalizeBatch can be called\ndirectly.",
+        "operationId": "Mint_SealBatch",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/mintrpcSealBatchResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/mintrpcSealBatchRequest"
+            }
+          }
+        ],
+        "tags": [
+          "Mint"
+        ]
+      }
+    },
+    "/v1/taproot-assets/events/asset-mint": {
+      "post": {
+        "summary": "tapcli: `events mint`\nSubscribeMintEvents allows a caller to subscribe to mint events for asset\ncreation batches.",
+        "operationId": "Mint_SubscribeMintEvents",
+        "responses": {
+          "200": {
+            "description": "A successful response.(streaming responses)",
+            "schema": {
+              "type": "object",
+              "properties": {
+                "result": {
+                  "$ref": "#/definitions/mintrpcMintEvent"
+                },
+                "error": {
+                  "$ref": "#/definitions/rpcStatus"
+                }
+              },
+              "title": "Stream result of mintrpcMintEvent"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/mintrpcSubscribeMintEventsRequest"
+            }
+          }
+        ],
+        "tags": [
+          "Mint"
+        ]
+      }
     }
   },
   "definitions": {
@@ -196,6 +311,14 @@
           "type": "integer",
           "format": "int64",
           "description": "The optional fee rate to use for the minting transaction, in sat/kw."
+        },
+        "full_tree": {
+          "$ref": "#/definitions/taprpcTapscriptFullTree",
+          "description": "An ordered list of TapLeafs, which will be used to construct a\nTapscript tree."
+        },
+        "branch": {
+          "$ref": "#/definitions/taprpcTapBranch",
+          "description": "A TapBranch that represents a Tapscript tree managed externally."
         }
       }
     },
@@ -208,13 +331,45 @@
         }
       }
     },
+    "mintrpcFundBatchRequest": {
+      "type": "object",
+      "properties": {
+        "short_response": {
+          "type": "boolean",
+          "description": "If true, then the assets currently in the batch won't be returned in the\nresponse. This is mainly to avoid a lot of data being transmitted and\npossibly printed on the command line in the case of a very large batch."
+        },
+        "fee_rate": {
+          "type": "integer",
+          "format": "int64",
+          "description": "The optional fee rate to use for the minting transaction, in sat/kw."
+        },
+        "full_tree": {
+          "$ref": "#/definitions/taprpcTapscriptFullTree",
+          "description": "An ordered list of TapLeafs, which will be used to construct a\nTapscript tree."
+        },
+        "branch": {
+          "$ref": "#/definitions/taprpcTapBranch",
+          "description": "A TapBranch that represents a Tapscript tree managed externally."
+        }
+      }
+    },
+    "mintrpcFundBatchResponse": {
+      "type": "object",
+      "properties": {
+        "batch": {
+          "$ref": "#/definitions/mintrpcVerboseBatch",
+          "description": "The funded batch."
+        }
+      }
+    },
     "mintrpcListBatchResponse": {
       "type": "object",
       "properties": {
         "batches": {
           "type": "array",
           "items": {
-            "$ref": "#/definitions/mintrpcMintingBatch"
+            "type": "object",
+            "$ref": "#/definitions/mintrpcVerboseBatch"
           }
         }
       }
@@ -254,11 +409,37 @@
         "group_key": {
           "type": "string",
           "format": "byte",
-          "description": "The specific group key this asset should be minted with."
+          "description": "The specific existing group key this asset should be minted with."
         },
         "group_anchor": {
           "type": "string",
           "description": "The name of the asset in the batch that will anchor a new asset group.\nThis asset will be minted with the same group key as the anchor asset."
+        },
+        "group_internal_key": {
+          "$ref": "#/definitions/taprpcKeyDescriptor",
+          "description": "The optional key that will be used as the internal key for an asset group\ncreated with this asset.\n\nIf this field is set then external_group_key must be unset, and vice versa."
+        },
+        "group_tapscript_root": {
+          "type": "string",
+          "format": "byte",
+          "description": "An optional root of a Tapscript tree used when constructing a new asset\ngroup key. This allows for future asset issuance authorized using a\nscript witness.\n\nIf an external group key is provided, the V1 scheme for group key script\nconstruction will be used, which supports PSBT signing. In this scheme,\nthe user-supplied Tapscript root is extended by two levels of Tapscript\nsiblings that commit to the group anchor's asset ID. As a result, the\nprovided Tapscript root becomes a branch within a larger Tapscript tree,\nand the final Tapscript root will differ from the one specified here."
+        },
+        "script_key": {
+          "$ref": "#/definitions/taprpcScriptKey",
+          "description": "The optional script key to use for the new asset. If no script key is given,\na BIP-86 key will be derived from the underlying wallet."
+        },
+        "decimal_display": {
+          "type": "integer",
+          "format": "int64",
+          "description": "Decimal display dictates the number of decimal places to shift the amount to\nthe left converting from Taproot Asset integer representation to a\nUX-recognizable fractional quantity.\n\nFor example, if the decimal_display value is 2 and there's 100 of those\nassets, then a wallet would display the amount as \"1.00\". This field is\nintended as information for wallets that display balances and has no impact\non the behavior of the daemon or any other part of the protocol. This value\nis encoded in the MetaData field as a JSON field, therefore it is only\ncompatible with assets that have a JSON MetaData field."
+        },
+        "external_group_key": {
+          "$ref": "#/definitions/taprpcExternalKey",
+          "description": "The external group key is an optional field that allows specifying an\nexternal signing key for the group virtual transaction during minting.\nThis key enables signing operations to be performed externally, outside\nthe daemon.\n\nIf this field is set then group_internal_key must be unset, and vice versa."
+        },
+        "universe_commitments": {
+          "type": "boolean",
+          "description": "Enabling this flag allows the creation of universe commitments for a new\nasset group.\n\nUniverse commitments are minter-controlled, on-chain attestations that\nanchor and verify the state of an asset group.\n\nThis flag imposes restrictions on the minting process by limiting the batch\nto assets within the same universe, meaning they share the same group key.\nThis option is applicable only for the creation of a new asset group\n(i.e., the first minting tranche of an asset group) and ensures that the\nbatch is limited to a single asset group."
         }
       }
     },
@@ -284,6 +465,28 @@
         }
       }
     },
+    "mintrpcMintEvent": {
+      "type": "object",
+      "properties": {
+        "timestamp": {
+          "type": "string",
+          "format": "int64",
+          "description": "Execute timestamp (Unix timestamp in microseconds)."
+        },
+        "batch_state": {
+          "$ref": "#/definitions/mintrpcBatchState",
+          "description": "The last state of the batch that was successfully executed. If error\nbelow is set, then the batch_state is the state that lead to the error\nduring its execution."
+        },
+        "batch": {
+          "$ref": "#/definitions/mintrpcMintingBatch",
+          "description": "The batch that the event is for."
+        },
+        "error": {
+          "type": "string",
+          "description": "An optional error, indicating that executing the batch_state failed."
+        }
+      }
+    },
     "mintrpcMintingBatch": {
       "type": "object",
       "properties": {
@@ -303,9 +506,25 @@
         "assets": {
           "type": "array",
           "items": {
+            "type": "object",
             "$ref": "#/definitions/mintrpcPendingAsset"
           },
           "description": "The assets that are part of the batch."
+        },
+        "created_at": {
+          "type": "string",
+          "format": "int64",
+          "description": "The time the batch was created as a Unix timestamp (in seconds)."
+        },
+        "height_hint": {
+          "type": "integer",
+          "format": "int64",
+          "description": "The current height of the block chain at the time of the batch creation."
+        },
+        "batch_psbt": {
+          "type": "string",
+          "format": "byte",
+          "description": "The genesis transaction as a PSBT packet. Only populated if the batch has\nbeen committed."
         }
       }
     },
@@ -340,25 +559,115 @@
         "group_key": {
           "type": "string",
           "format": "byte",
-          "description": "The specific group key this asset should be minted with."
+          "description": "The specific existing group key this asset should be minted with."
         },
         "group_anchor": {
           "type": "string",
           "description": "The name of the asset in the batch that will anchor a new asset group.\nThis asset will be minted with the same group key as the anchor asset."
+        },
+        "group_internal_key": {
+          "$ref": "#/definitions/taprpcKeyDescriptor",
+          "description": "The optional key that will be used as the internal key for an asset group\ncreated with this asset."
+        },
+        "group_tapscript_root": {
+          "type": "string",
+          "format": "byte",
+          "description": "The optional root of a tapscript tree that will be used when constructing a\nnew asset group key. This enables future issuance authorized with a script\nwitness."
+        },
+        "script_key": {
+          "$ref": "#/definitions/taprpcScriptKey",
+          "description": "The optional script key to use for the new asset. If no script key is given,\na BIP-86 key will be derived from the underlying wallet."
+        }
+      }
+    },
+    "mintrpcSealBatchRequest": {
+      "type": "object",
+      "properties": {
+        "short_response": {
+          "type": "boolean",
+          "description": "If true, then the assets currently in the batch won't be returned in the\nresponse. This is mainly to avoid a lot of data being transmitted and\npossibly printed on the command line in the case of a very large batch."
+        },
+        "group_witnesses": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "$ref": "#/definitions/taprpcGroupWitness"
+          },
+          "description": "The assetID, witness pairs that authorize asset membership in a group.\nThis field should not be used in conjunction with\n`signed_group_virtual_psbts`; use one or the other."
+        },
+        "signed_group_virtual_psbts": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "The base64 encoded signed group virtual PSBTs.\nThis field should not be used in conjunction with `group_witnesses`;\nuse one or the other."
+        }
+      }
+    },
+    "mintrpcSealBatchResponse": {
+      "type": "object",
+      "properties": {
+        "batch": {
+          "$ref": "#/definitions/mintrpcMintingBatch",
+          "description": "The sealed batch."
+        }
+      }
+    },
+    "mintrpcSubscribeMintEventsRequest": {
+      "type": "object",
+      "properties": {
+        "short_response": {
+          "type": "boolean",
+          "description": "If true, then the assets currently in the batch won't be returned in the\nevent's batch. This is mainly to avoid a lot of data being transmitted and\npossibly printed on the command line in the case of a very large batch."
+        }
+      }
+    },
+    "mintrpcUnsealedAsset": {
+      "type": "object",
+      "properties": {
+        "asset": {
+          "$ref": "#/definitions/mintrpcPendingAsset",
+          "description": "The pending asset with an unsealed asset group."
+        },
+        "group_key_request": {
+          "$ref": "#/definitions/taprpcGroupKeyRequest",
+          "description": "The group key request for the asset."
+        },
+        "group_virtual_tx": {
+          "$ref": "#/definitions/taprpcGroupVirtualTx",
+          "description": "The group virtual transaction for the asset."
+        },
+        "group_virtual_psbt": {
+          "type": "string",
+          "description": "The byte serialized PSBT equivalent of the group virtual transaction."
+        }
+      }
+    },
+    "mintrpcVerboseBatch": {
+      "type": "object",
+      "properties": {
+        "batch": {
+          "$ref": "#/definitions/mintrpcMintingBatch",
+          "description": "The minting batch, without any assets."
+        },
+        "unsealed_assets": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "$ref": "#/definitions/mintrpcUnsealedAsset"
+          },
+          "description": "The assets that are part of the batch."
         }
       }
     },
     "protobufAny": {
       "type": "object",
       "properties": {
-        "type_url": {
+        "@type": {
           "type": "string"
-        },
-        "value": {
-          "type": "string",
-          "format": "byte"
         }
-      }
+      },
+      "additionalProperties": {}
     },
     "rpcStatus": {
       "type": "object",
@@ -373,6 +682,7 @@
         "details": {
           "type": "array",
           "items": {
+            "type": "object",
             "$ref": "#/definitions/protobufAny"
           }
         }
@@ -400,10 +710,11 @@
     "taprpcAssetMetaType": {
       "type": "string",
       "enum": [
-        "META_TYPE_OPAQUE"
+        "META_TYPE_OPAQUE",
+        "META_TYPE_JSON"
       ],
       "default": "META_TYPE_OPAQUE",
-      "description": " - META_TYPE_OPAQUE: Opaque is used for asset meta blobs that have no true structure and instead\nshould be interpreted as opaque blobs."
+      "description": " - META_TYPE_OPAQUE: Opaque is used for asset meta blobs that have no true structure and instead\nshould be interpreted as opaque blobs.\n - META_TYPE_JSON: JSON is used for asset meta blobs that are to be interpreted as valid JSON\nstrings."
     },
     "taprpcAssetType": {
       "type": "string",
@@ -422,6 +733,244 @@
       ],
       "default": "ASSET_VERSION_V0",
       "description": " - ASSET_VERSION_V0: ASSET_VERSION_V0 is the default asset version. This version will include\nthe witness vector in the leaf for a tap commitment.\n - ASSET_VERSION_V1: ASSET_VERSION_V1 is the asset version that leaves out the witness vector\nfrom the MS-SMT leaf encoding."
+    },
+    "taprpcExternalKey": {
+      "type": "object",
+      "properties": {
+        "xpub": {
+          "type": "string",
+          "description": "This field specifies the extended public key derived at depth 3 of the\nBIP-86 hierarchy (e.g., m/86'/0'/0'). This key serves as the parent key for\nderiving child public keys and addresses."
+        },
+        "master_fingerprint": {
+          "type": "string",
+          "format": "byte",
+          "description": "This field specifies the fingerprint of the master key, derived from the\nfirst 4 bytes of the hash160 of the master public key. It is used to\nidentify the master key in BIP-86 derivation schemes."
+        },
+        "derivation_path": {
+          "type": "string",
+          "description": "This field specifies the extended BIP-86 derivation path used to derive a\nchild key from the XPub. Starting from the base path of the XPub\n(e.g., m/86'/0'/0'), this path must contain exactly 5 components in total\n(e.g., m/86'/0'/0'/0/0), with the additional components defining specific\nchild keys, such as individual addresses."
+        }
+      },
+      "description": "This message represents an external key used for deriving and managing\nhierarchical deterministic (HD) wallet addresses according to BIP-86."
+    },
+    "taprpcGenesisInfo": {
+      "type": "object",
+      "properties": {
+        "genesis_point": {
+          "type": "string",
+          "description": "The first outpoint of the transaction that created the asset (txid:vout)."
+        },
+        "name": {
+          "type": "string",
+          "description": "The name of the asset."
+        },
+        "meta_hash": {
+          "type": "string",
+          "format": "byte",
+          "description": "The hash of the meta data for this genesis asset."
+        },
+        "asset_id": {
+          "type": "string",
+          "format": "byte",
+          "description": "The asset ID that uniquely identifies the asset."
+        },
+        "asset_type": {
+          "$ref": "#/definitions/taprpcAssetType",
+          "description": "The type of the asset."
+        },
+        "output_index": {
+          "type": "integer",
+          "format": "int64",
+          "description": "The index of the output that carries the unique Taproot Asset commitment in\nthe genesis transaction."
+        }
+      }
+    },
+    "taprpcGroupKeyRequest": {
+      "type": "object",
+      "properties": {
+        "raw_key": {
+          "$ref": "#/definitions/taprpcKeyDescriptor",
+          "description": "The internal key for the asset group before any tweaks have been applied.\nIf this field is set then external_key must be empty, and vice versa."
+        },
+        "anchor_genesis": {
+          "$ref": "#/definitions/taprpcGenesisInfo",
+          "description": "The genesis of the group anchor asset, which is used to derive the single\ntweak for the group key. For a new group key, this will be the genesis of\nnew_asset."
+        },
+        "tapscript_root": {
+          "type": "string",
+          "format": "byte",
+          "description": "The optional root of a tapscript tree that will be used when constructing a\nnew asset group key. This enables future issuance authorized with a script\nwitness."
+        },
+        "new_asset": {
+          "type": "string",
+          "format": "byte",
+          "description": "The serialized asset which we are requesting group membership for. A\nsuccessful request will produce a witness that authorizes this asset to be a\nmember of this asset group."
+        },
+        "external_key": {
+          "$ref": "#/definitions/taprpcExternalKey",
+          "description": "The external key is an optional field that allows specifying an\nexternal signing key for the group virtual transaction during minting.\nThis key enables signing operations to be performed externally, outside\nthe daemon.\n\nIf this field is set then raw_key must be empty, and vice versa."
+        }
+      }
+    },
+    "taprpcGroupVirtualTx": {
+      "type": "object",
+      "properties": {
+        "transaction": {
+          "type": "string",
+          "format": "byte",
+          "description": "The virtual transaction that represents the genesis state transition of a\ngrouped asset."
+        },
+        "prev_out": {
+          "$ref": "#/definitions/taprpcTxOut",
+          "description": "The transaction output that represents a grouped asset. The tweaked\ngroup key is set as the PkScript of this output. This is used in combination\nwith Tx to produce an asset group witness."
+        },
+        "genesis_id": {
+          "type": "string",
+          "format": "byte",
+          "description": "The asset ID of the grouped asset in a GroupKeyRequest. This ID is\nneeded to construct a sign descriptor, as it is the single tweak for the\ngroup internal key."
+        },
+        "tweaked_key": {
+          "type": "string",
+          "format": "byte",
+          "description": "The tweaked group key for a specific GroupKeyRequest. This is used to\nconstruct a complete group key after producing an asset group witness."
+        }
+      }
+    },
+    "taprpcGroupWitness": {
+      "type": "object",
+      "properties": {
+        "genesis_id": {
+          "type": "string",
+          "format": "byte",
+          "description": "The asset ID of the pending asset that should be assigned this asset\ngroup witness."
+        },
+        "witness": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "format": "byte"
+          },
+          "description": "The serialized witness stack for the asset group."
+        }
+      }
+    },
+    "taprpcKeyDescriptor": {
+      "type": "object",
+      "properties": {
+        "raw_key_bytes": {
+          "type": "string",
+          "format": "byte",
+          "description": "The raw bytes of the key being identified."
+        },
+        "key_loc": {
+          "$ref": "#/definitions/taprpcKeyLocator",
+          "description": "The key locator that identifies which key to use for signing."
+        }
+      }
+    },
+    "taprpcKeyLocator": {
+      "type": "object",
+      "properties": {
+        "key_family": {
+          "type": "integer",
+          "format": "int32",
+          "description": "The family of key being identified."
+        },
+        "key_index": {
+          "type": "integer",
+          "format": "int32",
+          "description": "The precise index of the key being identified."
+        }
+      }
+    },
+    "taprpcScriptKey": {
+      "type": "object",
+      "properties": {
+        "pub_key": {
+          "type": "string",
+          "format": "byte",
+          "description": "The full Taproot output key the asset is locked to. This is either a BIP-86\nkey if the tap_tweak below is empty, or a key with the tap tweak applied to\nit."
+        },
+        "key_desc": {
+          "$ref": "#/definitions/taprpcKeyDescriptor",
+          "description": "The key descriptor describing the internal key of the above Taproot key."
+        },
+        "tap_tweak": {
+          "type": "string",
+          "format": "byte",
+          "description": "The optional Taproot tweak to apply to the above internal key. If this is\nempty then a BIP-86 style tweak is applied to the internal key."
+        },
+        "type": {
+          "$ref": "#/definitions/taprpcScriptKeyType",
+          "description": "The type of the script key. This type is either user-declared when custom\nscript keys are added, or automatically determined by the daemon for\nstandard operations (e.g. BIP-86 keys, burn keys, tombstone keys, channel\nrelated keys)."
+        }
+      }
+    },
+    "taprpcScriptKeyType": {
+      "type": "string",
+      "enum": [
+        "SCRIPT_KEY_UNKNOWN",
+        "SCRIPT_KEY_BIP86",
+        "SCRIPT_KEY_SCRIPT_PATH_EXTERNAL",
+        "SCRIPT_KEY_BURN",
+        "SCRIPT_KEY_TOMBSTONE",
+        "SCRIPT_KEY_CHANNEL"
+      ],
+      "default": "SCRIPT_KEY_UNKNOWN",
+      "description": " - SCRIPT_KEY_UNKNOWN: The type of script key is not known. This should only be stored for assets\nwhere we don't know the internal key of the script key (e.g. for\nimported proofs).\n - SCRIPT_KEY_BIP86: The script key is a normal BIP-86 key. This means that the internal key is\nturned into a Taproot output key by applying a BIP-86 tweak to it.\n - SCRIPT_KEY_SCRIPT_PATH_EXTERNAL: The script key is a key that contains a script path that is defined by the\nuser and is therefore external to the tapd wallet. Spending this key\nrequires providing a specific witness and must be signed through the vPSBT\nsigning flow.\n - SCRIPT_KEY_BURN: The script key is a specific un-spendable key that indicates a burnt asset.\nAssets with this key type can never be spent again, as a burn key is a\ntweaked NUMS key that nobody knows the private key for.\n - SCRIPT_KEY_TOMBSTONE: The script key is a specific un-spendable key that indicates a tombstone\noutput. This is only the case for zero-value assets that result from a\nnon-interactive (TAP address) send where no change was left over.\n - SCRIPT_KEY_CHANNEL: The script key is used for an asset that resides within a Taproot Asset\nChannel. That means the script key is either a funding key (OP_TRUE), a\ncommitment output key (to_local, to_remote, htlc), or a HTLC second-level\ntransaction output key. Keys related to channels are not shown in asset\nbalances (unless specifically requested) and are never used for coin\nselection."
+    },
+    "taprpcTapBranch": {
+      "type": "object",
+      "properties": {
+        "left_taphash": {
+          "type": "string",
+          "format": "byte",
+          "description": "The TapHash of the left child of the root hash of a Tapscript tree."
+        },
+        "right_taphash": {
+          "type": "string",
+          "format": "byte",
+          "description": "The TapHash of the right child of the root hash of a Tapscript tree."
+        }
+      }
+    },
+    "taprpcTapLeaf": {
+      "type": "object",
+      "properties": {
+        "script": {
+          "type": "string",
+          "format": "byte",
+          "description": "The script of the tap leaf."
+        }
+      }
+    },
+    "taprpcTapscriptFullTree": {
+      "type": "object",
+      "properties": {
+        "all_leaves": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "$ref": "#/definitions/taprpcTapLeaf"
+          },
+          "description": "The complete, ordered list of all tap leaves of the tree."
+        }
+      }
+    },
+    "taprpcTxOut": {
+      "type": "object",
+      "properties": {
+        "value": {
+          "type": "string",
+          "format": "int64",
+          "description": "The value of the output being spent."
+        },
+        "pk_script": {
+          "type": "string",
+          "format": "byte",
+          "description": "The script of the output being spent."
+        }
+      }
     }
   }
 }

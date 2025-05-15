@@ -2,11 +2,13 @@ package proof
 
 import (
 	"bytes"
+	"net/url"
 
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/lightninglabs/taproot-assets/asset"
 	"github.com/lightninglabs/taproot-assets/commitment"
+	"github.com/lightninglabs/taproot-assets/fn"
 	"github.com/lightningnetwork/lnd/tlv"
 )
 
@@ -26,6 +28,7 @@ const (
 	BlockHeightType      tlv.Type = 22
 	GenesisRevealType    tlv.Type = 23
 	GroupKeyRevealType   tlv.Type = 25
+	AltLeavesType        tlv.Type = 27
 
 	TaprootProofOutputIndexType     tlv.Type = 0
 	TaprootProofInternalKeyType     tlv.Type = 2
@@ -41,8 +44,53 @@ const (
 	TapscriptProofTapPreimage2 tlv.Type = 3
 	TapscriptProofBip86        tlv.Type = 4
 
-	MetaRevealEncodingType tlv.Type = 0
-	MetaRevealDataType     tlv.Type = 2
+	MetaRevealEncodingType           tlv.Type = 0
+	MetaRevealDataType               tlv.Type = 2
+	MetaRevealDecimalDisplay         tlv.Type = 5
+	MetaRevealUniverseCommitments    tlv.Type = 7
+	MetaRevealCanonicalUniversesType tlv.Type = 9
+	MetaRevealDelegationKeyType      tlv.Type = 11
+)
+
+// KnownProofTypes is a set of all known proof TLV types. This set is asserted
+// to be complete by a check in the BIP test vector unit tests.
+var KnownProofTypes = fn.NewSet(
+	VersionType, PrevOutType, BlockHeaderType, AnchorTxType,
+	TxMerkleProofType, AssetLeafType, InclusionProofType,
+	ExclusionProofsType, SplitRootProofType, MetaRevealType,
+	AdditionalInputsType, ChallengeWitnessType, BlockHeightType,
+	GenesisRevealType, GroupKeyRevealType, AltLeavesType,
+)
+
+// KnownTaprootProofTypes is a set of all known Taproot proof TLV types. This
+// set is asserted to be complete by a check in the BIP test vector unit tests.
+var KnownTaprootProofTypes = fn.NewSet(
+	TaprootProofOutputIndexType, TaprootProofInternalKeyType,
+	TaprootProofCommitmentProofType, TaprootProofTapscriptProofType,
+)
+
+// KnownCommitmentProofTypes is a set of all known commitment proof TLV types.
+// This set is asserted to be complete by a check in the BIP test vector unit
+// tests.
+var KnownCommitmentProofTypes = fn.NewSet(
+	commitment.ProofAssetProofType, commitment.ProofTaprootAssetProofType,
+	CommitmentProofTapSiblingPreimageType,
+)
+
+// KnownTapscriptProofTypes is a set of all known Tapscript proof TLV types.
+// This set is asserted to be complete by a check in the BIP test vector unit
+// tests.
+var KnownTapscriptProofTypes = fn.NewSet(
+	TapscriptProofTapPreimage1, TapscriptProofTapPreimage2,
+	TapscriptProofBip86,
+)
+
+// KnownMetaRevealTypes is a set of all known meta reveal TLV types. This set is
+// asserted to be complete by a check in the BIP test vector unit tests.
+var KnownMetaRevealTypes = fn.NewSet(
+	MetaRevealEncodingType, MetaRevealDataType, MetaRevealDecimalDisplay,
+	MetaRevealUniverseCommitments, MetaRevealCanonicalUniversesType,
+	MetaRevealDelegationKeyType,
 )
 
 func VersionRecord(version *TransitionVersion) tlv.Record {
@@ -224,8 +272,14 @@ func CommitmentProofTapSiblingPreimageRecord(
 	preimage **commitment.TapscriptPreimage) tlv.Record {
 
 	sizeFunc := func() uint64 {
-		// 1 byte for the type, and then the pre-image itself.
-		return 1 + uint64(len((*preimage).SiblingPreimage))
+		var buf bytes.Buffer
+		err := commitment.TapscriptPreimageEncoder(
+			&buf, preimage, &[8]byte{},
+		)
+		if err != nil {
+			panic(err)
+		}
+		return uint64(len(buf.Bytes()))
 	}
 	return tlv.MakeDynamicRecord(
 		CommitmentProofTapSiblingPreimageType, preimage, sizeFunc,
@@ -238,10 +292,15 @@ func TapscriptProofTapPreimage1Record(
 	preimage **commitment.TapscriptPreimage) tlv.Record {
 
 	sizeFunc := func() uint64 {
-		// 1 byte for the type, and then the pre-image itself.
-		return 1 + uint64(len((*preimage).SiblingPreimage))
+		var buf bytes.Buffer
+		err := commitment.TapscriptPreimageEncoder(
+			&buf, preimage, &[8]byte{},
+		)
+		if err != nil {
+			panic(err)
+		}
+		return uint64(len(buf.Bytes()))
 	}
-
 	return tlv.MakeDynamicRecord(
 		TapscriptProofTapPreimage1, preimage,
 		sizeFunc, commitment.TapscriptPreimageEncoder,
@@ -253,10 +312,15 @@ func TapscriptProofTapPreimage2Record(
 	preimage **commitment.TapscriptPreimage) tlv.Record {
 
 	sizeFunc := func() uint64 {
-		// 1 byte for the type, and then the pre-image itself.
-		return 1 + uint64(len((*preimage).SiblingPreimage))
+		var buf bytes.Buffer
+		err := commitment.TapscriptPreimageEncoder(
+			&buf, preimage, &[8]byte{},
+		)
+		if err != nil {
+			panic(err)
+		}
+		return uint64(len(buf.Bytes()))
 	}
-
 	return tlv.MakeDynamicRecord(
 		TapscriptProofTapPreimage2, preimage,
 		sizeFunc, commitment.TapscriptPreimageEncoder,
@@ -305,6 +369,70 @@ func MetaRevealDataRecord(data *[]byte) tlv.Record {
 	)
 }
 
+func MetaRevealDecimalDisplayRecord(
+	decimalDisplay *fn.Option[uint32]) tlv.Record {
+
+	// If the option is not set, we'll encode it as a zero-length record.
+	// But because we'll not include the record at all if it's not set at
+	// the call site when encoding, this will not be the case for this
+	// specific record.
+	var size uint64
+	if decimalDisplay != nil && decimalDisplay.IsSome() {
+		size = 4
+	}
+
+	return tlv.MakeStaticRecord(
+		MetaRevealDecimalDisplay, decimalDisplay, size,
+		EUint32Option, DUint32Option,
+	)
+}
+
+func MetaRevealUniverseCommitmentsRecord(useCommitments *bool) tlv.Record {
+	return tlv.MakeStaticRecord(
+		MetaRevealUniverseCommitments, useCommitments, 1,
+		BoolEncoder, BoolDecoder,
+	)
+}
+
+func MetaRevealCanonicalUniversesRecord(
+	addrs *fn.Option[[]url.URL]) tlv.Record {
+
+	// If the option is not set, or it's an empty slice, we'll encode it as
+	// a zero-length record. But because we'll not include the record at all
+	// if it's not set at the call site when encoding, this will not be the
+	// case for this specific record.
+	recordSize := func() uint64 {
+		var (
+			b   bytes.Buffer
+			buf [8]byte
+		)
+		if err := UrlSliceOptionEncoder(&b, addrs, &buf); err != nil {
+			panic(err)
+		}
+		return uint64(len(b.Bytes()))
+	}
+	return tlv.MakeDynamicRecord(
+		MetaRevealCanonicalUniversesType, addrs, recordSize,
+		UrlSliceOptionEncoder, UrlSliceOptionDecoder,
+	)
+}
+
+func MetaRevealDelegationKeyRecord(key *fn.Option[btcec.PublicKey]) tlv.Record {
+	// If the option is not set, we'll encode it as a zero-length record.
+	// But because we'll not include the record at all if it's not set at
+	// the call site when encoding, this will not be the case for this
+	// specific record.
+	var size uint64
+	if key != nil && key.IsSome() {
+		size = btcec.PubKeyBytesLenCompressed
+	}
+
+	return tlv.MakeStaticRecord(
+		MetaRevealDelegationKeyType, key, size,
+		PublicKeyOptionEncoder, PublicKeyOptionDecoder,
+	)
+}
+
 func GenesisRevealRecord(genesis **asset.Genesis) tlv.Record {
 	recordSize := func() uint64 {
 		var (
@@ -322,18 +450,43 @@ func GenesisRevealRecord(genesis **asset.Genesis) tlv.Record {
 	)
 }
 
-func GroupKeyRevealRecord(reveal **asset.GroupKeyReveal) tlv.Record {
+func GroupKeyRevealRecord(reveal *asset.GroupKeyReveal) tlv.Record {
+	// recordSize returns the size of the record in bytes. This is used to
+	// determine the size of the record when encoding it.
 	recordSize := func() uint64 {
 		if reveal == nil || *reveal == nil {
 			return 0
 		}
-		r := *reveal
-		return uint64(
-			btcec.PubKeyBytesLenCompressed + len(r.TapscriptRoot),
+
+		var (
+			b   bytes.Buffer
+			buf [8]byte
 		)
+		err := asset.GroupKeyRevealEncoder(&b, reveal, &buf)
+		if err != nil {
+			panic(err)
+		}
+
+		return uint64(len(b.Bytes()))
+	}
+
+	return tlv.MakeDynamicRecord(
+		GroupKeyRevealType, reveal, recordSize,
+		asset.GroupKeyRevealEncoder, asset.GroupKeyRevealDecoder,
+	)
+}
+
+func AltLeavesRecord(leaves *[]asset.AltLeaf[asset.Asset]) tlv.Record {
+	sizeFunc := func() uint64 {
+		var buf bytes.Buffer
+		err := asset.AltLeavesEncoder(&buf, leaves, &[8]byte{})
+		if err != nil {
+			panic(err)
+		}
+		return uint64(len(buf.Bytes()))
 	}
 	return tlv.MakeDynamicRecord(
-		GroupKeyRevealType, reveal, recordSize, GroupKeyRevealEncoder,
-		GroupKeyRevealDecoder,
+		AltLeavesType, leaves, sizeFunc, asset.AltLeavesEncoder,
+		asset.AltLeavesDecoder,
 	)
 }

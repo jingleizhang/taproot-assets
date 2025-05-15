@@ -1,15 +1,17 @@
 package taprootassets
 
 import (
-	"github.com/btcsuite/btclog"
+	"github.com/btcsuite/btclog/v2"
 	"github.com/lightninglabs/taproot-assets/address"
 	"github.com/lightninglabs/taproot-assets/commitment"
 	"github.com/lightninglabs/taproot-assets/monitoring"
 	"github.com/lightninglabs/taproot-assets/proof"
+	"github.com/lightninglabs/taproot-assets/rfq"
+	"github.com/lightninglabs/taproot-assets/tapchannel"
 	"github.com/lightninglabs/taproot-assets/tapdb"
 	"github.com/lightninglabs/taproot-assets/tapfreighter"
 	"github.com/lightninglabs/taproot-assets/tapgarden"
-	"github.com/lightninglabs/taproot-assets/tapscript"
+	"github.com/lightninglabs/taproot-assets/tapsend"
 	"github.com/lightninglabs/taproot-assets/universe"
 	"github.com/lightningnetwork/lnd/build"
 	"github.com/lightningnetwork/lnd/signal"
@@ -51,13 +53,13 @@ var (
 	// SetupLoggers function should always be called as soon as possible to
 	// finish setting them up properly with a root logger.
 	tapdLog = addTapPkgLogger("TAPD")
-	srvrLog = addTapPkgLogger("SRVR")
+	srvrLog = addTapPkgLogger("TSVR")
 	rpcsLog = addTapPkgLogger("RPCS")
 )
 
 // genSubLogger creates a logger for a subsystem. We provide an instance of a
-// signal.Interceptor to be able to shutdown in the case of a critical error.
-func genSubLogger(root *build.RotatingLogWriter,
+// signal.Interceptor to be able to shut down in the case of a critical error.
+func genSubLogger(root *build.SubLoggerManager,
 	interceptor signal.Interceptor) func(string) btclog.Logger {
 
 	// Create a shutdown function which will request shutdown from our
@@ -78,7 +80,9 @@ func genSubLogger(root *build.RotatingLogWriter,
 }
 
 // SetupLoggers initializes all package-global logger variables.
-func SetupLoggers(root *build.RotatingLogWriter, interceptor signal.Interceptor) {
+func SetupLoggers(root *build.SubLoggerManager,
+	interceptor signal.Interceptor) {
+
 	genLogger := genSubLogger(root, interceptor)
 
 	// Now that we have the proper root logger, we can replace the
@@ -92,16 +96,17 @@ func SetupLoggers(root *build.RotatingLogWriter, interceptor signal.Interceptor)
 	// also used in sub packages.
 	signal.UseLogger(tapdLog)
 
-	AddSubLogger(root, tapgarden.Subsystem, interceptor, tapgarden.UseLogger)
 	AddSubLogger(
-		root, tapfreighter.Subsystem, interceptor, tapfreighter.UseLogger,
+		root, tapgarden.Subsystem, interceptor, tapgarden.UseLogger,
+	)
+	AddSubLogger(
+		root, tapfreighter.Subsystem, interceptor,
+		tapfreighter.UseLogger,
 	)
 	AddSubLogger(root, proof.Subsystem, interceptor, proof.UseLogger)
 	AddSubLogger(root, tapdb.Subsystem, interceptor, tapdb.UseLogger)
 	AddSubLogger(root, address.Subsystem, interceptor, address.UseLogger)
-	AddSubLogger(
-		root, tapscript.Subsystem, interceptor, tapscript.UseLogger,
-	)
+	AddSubLogger(root, tapsend.Subsystem, interceptor, tapsend.UseLogger)
 	AddSubLogger(root, universe.Subsystem, interceptor, universe.UseLogger)
 	AddSubLogger(
 		root, commitment.Subsystem, interceptor, commitment.UseLogger,
@@ -109,11 +114,15 @@ func SetupLoggers(root *build.RotatingLogWriter, interceptor signal.Interceptor)
 	AddSubLogger(
 		root, monitoring.Subsystem, interceptor, monitoring.UseLogger,
 	)
+	AddSubLogger(root, rfq.Subsystem, interceptor, rfq.UseLogger)
+	AddSubLogger(
+		root, tapchannel.Subsystem, interceptor, tapchannel.UseLogger,
+	)
 }
 
 // AddSubLogger is a helper method to conveniently create and register the
 // logger of one or more sub systems.
-func AddSubLogger(root *build.RotatingLogWriter, subsystem string,
+func AddSubLogger(root *build.SubLoggerManager, subsystem string,
 	interceptor signal.Interceptor, useLoggers ...func(btclog.Logger)) {
 
 	// genSubLogger will return a callback for creating a logger instance,
@@ -128,7 +137,7 @@ func AddSubLogger(root *build.RotatingLogWriter, subsystem string,
 
 // SetSubLogger is a helper method to conveniently register the logger of a sub
 // system.
-func SetSubLogger(root *build.RotatingLogWriter, subsystem string,
+func SetSubLogger(root *build.SubLoggerManager, subsystem string,
 	logger btclog.Logger, useLoggers ...func(btclog.Logger)) {
 
 	root.RegisterSubLogger(subsystem, logger)

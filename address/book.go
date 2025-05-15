@@ -15,6 +15,7 @@ import (
 	"github.com/lightninglabs/taproot-assets/asset"
 	"github.com/lightninglabs/taproot-assets/commitment"
 	"github.com/lightninglabs/taproot-assets/fn"
+	"github.com/lightninglabs/taproot-assets/proof"
 	"github.com/lightningnetwork/lnd/keychain"
 )
 
@@ -23,6 +24,10 @@ var (
 	// This means an address can't be created until a Universe bootstrap or
 	// manual issuance proof insertion.
 	ErrAssetGroupUnknown = fmt.Errorf("asset group is unknown")
+
+	// ErrAssetMetaNotFound is returned when an asset meta is not found in
+	// the database.
+	ErrAssetMetaNotFound = fmt.Errorf("asset meta not found")
 )
 
 // AddrWithKeyInfo wraps a normal Taproot Asset struct with key descriptor
@@ -100,6 +105,16 @@ type Storage interface {
 	// (genesis + group key) associated with a given asset.
 	QueryAssetGroup(context.Context, asset.ID) (*asset.AssetGroup, error)
 
+	// FetchAssetMetaByHash attempts to fetch an asset meta based on an
+	// asset hash.
+	FetchAssetMetaByHash(ctx context.Context,
+		metaHash [asset.MetaHashLen]byte) (*proof.MetaReveal, error)
+
+	// FetchAssetMetaForAsset attempts to fetch an asset meta based on an
+	// asset ID.
+	FetchAssetMetaForAsset(ctx context.Context,
+		assetID asset.ID) (*proof.MetaReveal, error)
+
 	// AddrByTaprootOutput returns a single address based on its Taproot
 	// output key or a sql.ErrNoRows error if no such address exists.
 	AddrByTaprootOutput(ctx context.Context,
@@ -120,7 +135,8 @@ type Storage interface {
 	// InsertScriptKey inserts an address related script key into the
 	// database, so it can be recognized as belonging to the wallet when a
 	// transfer comes in later on.
-	InsertScriptKey(ctx context.Context, scriptKey asset.ScriptKey) error
+	InsertScriptKey(ctx context.Context, scriptKey asset.ScriptKey,
+		keyType asset.ScriptKeyType) error
 }
 
 // KeyRing is used to create script and internal keys for Taproot Asset
@@ -190,10 +206,10 @@ func NewBook(cfg BookConfig) *Book {
 	}
 }
 
-// queryAssetInfo attempts to locate asset genesis information by querying
+// QueryAssetInfo attempts to locate asset genesis information by querying
 // geneses already known to this node. If asset issuance was not previously
 // verified, we then query universes in our federation for issuance proofs.
-func (b *Book) queryAssetInfo(ctx context.Context,
+func (b *Book) QueryAssetInfo(ctx context.Context,
 	id asset.ID) (*asset.AssetGroup, error) {
 
 	// Check if we know of this asset ID already.
@@ -213,7 +229,7 @@ func (b *Book) queryAssetInfo(ctx context.Context,
 		return nil, err
 	}
 
-	log.Debugf("asset %v is unknown, attempting to bootstrap", id.String())
+	log.Debugf("Asset %v is unknown, attempting to bootstrap", id.String())
 
 	// Use the AssetSyncer to query our universe federation for the asset.
 	err = b.cfg.Syncer.SyncAssetInfo(ctx, &id)
@@ -228,7 +244,7 @@ func (b *Book) queryAssetInfo(ctx context.Context,
 		return nil, err
 	}
 
-	log.Debugf("bootstrap succeeded for asset %v", id.String())
+	log.Debugf("Bootstrap succeeded for asset %v", id.String())
 
 	// If the asset was found after sync, and has an asset group, update our
 	// universe sync config to ensure that we sync future issuance proofs.
@@ -248,15 +264,65 @@ func (b *Book) queryAssetInfo(ctx context.Context,
 	return assetGroup, nil
 }
 
+// FetchAssetMetaByHash attempts to fetch an asset meta based on an asset hash.
+func (b *Book) FetchAssetMetaByHash(ctx context.Context,
+	metaHash [asset.MetaHashLen]byte) (*proof.MetaReveal, error) {
+
+	return b.cfg.Store.FetchAssetMetaByHash(ctx, metaHash)
+}
+
+// FetchAssetMetaForAsset attempts to fetch an asset meta based on an asset ID.
+func (b *Book) FetchAssetMetaForAsset(ctx context.Context,
+	assetID asset.ID) (*proof.MetaReveal, error) {
+
+	// Check if we know of this meta hash already.
+	meta, err := b.cfg.Store.FetchAssetMetaForAsset(ctx, assetID)
+	switch {
+	case meta != nil:
+		return meta, nil
+
+	// Asset lookup failed gracefully; continue to asset lookup using the
+	// AssetSyncer if enabled.
+	case errors.Is(err, ErrAssetMetaNotFound):
+		if b.cfg.Syncer == nil {
+			return nil, ErrAssetMetaNotFound
+		}
+
+	case err != nil:
+		return nil, err
+	}
+
+	log.Debugf("Asset %v is unknown, attempting to bootstrap",
+		assetID.String())
+
+	// Use the AssetSyncer to query our universe federation for the asset.
+	err = b.cfg.Syncer.SyncAssetInfo(ctx, &assetID)
+	if err != nil {
+		return nil, err
+	}
+
+	// The asset meta info may have been synced from a universe server;
+	// query for the asset ID again.
+	meta, err = b.cfg.Store.FetchAssetMetaForAsset(ctx, assetID)
+	if err != nil {
+		return nil, err
+	}
+
+	log.Debugf("Bootstrap succeeded for asset %v", assetID.String())
+
+	return meta, nil
+}
+
 // NewAddress creates a new Taproot Asset address based on the input parameters.
-func (b *Book) NewAddress(ctx context.Context, assetID asset.ID, amount uint64,
+func (b *Book) NewAddress(ctx context.Context, addrVersion Version,
+	assetID asset.ID, amount uint64,
 	tapscriptSibling *commitment.TapscriptPreimage,
-	proofCourierAddr url.URL, addrOpts ...NewAddrOpt,
-) (*AddrWithKeyInfo, error) {
+	proofCourierAddr url.URL, addrOpts ...NewAddrOpt) (*AddrWithKeyInfo,
+	error) {
 
 	// Before we proceed and make new keys, make sure that we actually know
 	// of this asset ID, or can import it.
-	if _, err := b.queryAssetInfo(ctx, assetID); err != nil {
+	if _, err := b.QueryAssetInfo(ctx, assetID); err != nil {
 		return nil, fmt.Errorf("unable to make address for unknown "+
 			"asset %x: %w", assetID[:], err)
 	}
@@ -277,24 +343,24 @@ func (b *Book) NewAddress(ctx context.Context, assetID asset.ID, amount uint64,
 	}
 
 	return b.NewAddressWithKeys(
-		ctx, assetID, amount, scriptKey, internalKeyDesc,
+		ctx, addrVersion, assetID, amount, scriptKey, internalKeyDesc,
 		tapscriptSibling, proofCourierAddr, addrOpts...,
 	)
 }
 
 // NewAddressWithKeys creates a new Taproot Asset address based on the input
 // parameters that include pre-derived script and internal keys.
-func (b *Book) NewAddressWithKeys(ctx context.Context, assetID asset.ID,
-	amount uint64, scriptKey asset.ScriptKey,
+func (b *Book) NewAddressWithKeys(ctx context.Context, addrVersion Version,
+	assetID asset.ID, amount uint64, scriptKey asset.ScriptKey,
 	internalKeyDesc keychain.KeyDescriptor,
 	tapscriptSibling *commitment.TapscriptPreimage,
-	proofCourierAddr url.URL,
-	addrOpts ...NewAddrOpt) (*AddrWithKeyInfo, error) {
+	proofCourierAddr url.URL, addrOpts ...NewAddrOpt) (*AddrWithKeyInfo,
+	error) {
 
 	// Before we proceed, we'll make sure that the asset group is known to
 	// the local store. Otherwise, we can't make an address as we haven't
 	// bootstrapped it.
-	assetGroup, err := b.queryAssetInfo(ctx, assetID)
+	assetGroup, err := b.QueryAssetInfo(ctx, assetID)
 	if err != nil {
 		return nil, err
 	}
@@ -310,7 +376,7 @@ func (b *Book) NewAddressWithKeys(ctx context.Context, assetID asset.ID,
 	}
 
 	baseAddr, err := New(
-		V0, *assetGroup.Genesis, groupKey, groupWitness,
+		addrVersion, *assetGroup.Genesis, groupKey, groupWitness,
 		*scriptKey.PubKey, *internalKeyDesc.PubKey, amount,
 		tapscriptSibling, &b.cfg.Chain, proofCourierAddr,
 		addrOpts...,
@@ -331,7 +397,13 @@ func (b *Book) NewAddressWithKeys(ctx context.Context, assetID asset.ID,
 	if err != nil {
 		return nil, fmt.Errorf("unable to insert internal key: %w", err)
 	}
-	if err := b.cfg.Store.InsertScriptKey(ctx, scriptKey); err != nil {
+
+	// We might not know the type of script key, if it was given to us
+	// through an RPC call. So we make a guess here.
+	keyType := scriptKey.DetermineType()
+
+	err = b.cfg.Store.InsertScriptKey(ctx, scriptKey, keyType)
+	if err != nil {
 		return nil, fmt.Errorf("unable to insert script key: %w", err)
 	}
 
@@ -363,6 +435,13 @@ func (b *Book) IsLocalKey(ctx context.Context,
 	key keychain.KeyDescriptor) bool {
 
 	return b.cfg.KeyRing.IsLocalKey(ctx, key)
+}
+
+// InsertScriptKey inserts an address related script key into the database.
+func (b *Book) InsertScriptKey(ctx context.Context, scriptKey asset.ScriptKey,
+	keyType asset.ScriptKeyType) error {
+
+	return b.cfg.Store.InsertScriptKey(ctx, scriptKey, keyType)
 }
 
 // NextInternalKey derives then inserts an internal key into the database to
@@ -397,7 +476,8 @@ func (b *Book) NextScriptKey(ctx context.Context,
 	}
 
 	scriptKey := asset.NewScriptKeyBip86(keyDesc)
-	if err := b.cfg.Store.InsertScriptKey(ctx, scriptKey); err != nil {
+	err = b.cfg.Store.InsertScriptKey(ctx, scriptKey, asset.ScriptKeyBip86)
+	if err != nil {
 		return asset.ScriptKey{}, err
 	}
 
@@ -437,6 +517,13 @@ func (b *Book) GetOrCreateEvent(ctx context.Context, status Status,
 	return b.cfg.Store.GetOrCreateEvent(
 		ctx, status, addr, walletTx, outputIdx,
 	)
+}
+
+// QueryEvent returns a single address event by its address and outpoint.
+func (b *Book) QueryEvent(ctx context.Context,
+	addr *AddrWithKeyInfo, outpoint wire.OutPoint) (*Event, error) {
+
+	return b.cfg.Store.QueryEvent(ctx, addr, outpoint)
 }
 
 // GetPendingEvents returns all events that are not yet in status complete from

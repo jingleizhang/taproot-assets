@@ -13,11 +13,15 @@ cmd/tapd/tapd
 
 /itest/lnd-itest
 /itest/btcd-itest
+/itest/chantools
 /itest/regtest/*
 /itest/*.log
+/itest/*.log.*
 /itest/.backendlogs/*
 /itest/.minerlogs/*
 /itest/tapd-itest
+
+/docs/examples/basic-price-oracle/basic-price-oracle
 
 # Load test binaries and config
 /loadtest
@@ -25,6 +29,10 @@ cmd/tapd/tapd
 
 # Test binary, built with `go test -c`
 *.test
+
+# Ignore Rapid testing framework .fail files. These files are used for
+# reproducing test failures locally during development.
+*.fail
 
 # Output of the go coverage tool, specifically when used with LiteIDE
 *.out
@@ -44,3 +52,4 @@ vendor/
 
 # Release builds
 /taproot-assets-*
+.aider*

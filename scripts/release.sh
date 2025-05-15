@@ -80,9 +80,10 @@ function red() {
 
 # check_tag_correct makes sure the given git tag is checked out and the git tree
 # is not dirty.
-#   arguments: <version-tag>
+#   arguments: <version-tag> <version-file-path>
 function check_tag_correct() {
   local tag=$1
+  local version_file_path=$2
 
   # For automated builds we can skip this check as they will only be triggered
   # on tags.
@@ -102,41 +103,38 @@ function check_tag_correct() {
     echo "Tag $tag checked out. Git commit: $commit_hash"
   fi
 
-  # Build tapd to extract version.
-  go build ${PKG}/cmd/tapd
+  # Ensure that the git tag matches the version string derived from the version
+  # file.
+  local expected_tag
+  expected_tag=$(./scripts/get-git-tag-name.sh "$version_file_path")
 
-  # Extract version command output.
-  tapd_version_output=$(./tapd --version)
-
-  # Use a regex to isolate the version string.
-  if [[ $tapd_version_output =~ $TAPD_VERSION_REGEX ]]; then
-    # Prepend 'v' to match git tag naming scheme.
-    tapd_version="v${BASH_REMATCH[1]}"
-    green "version: $tapd_version"
-
-    # If the tapd reported version contains a suffix, remove it, so we can match
-    # the tag properly.
-    # shellcheck disable=SC2001
-    tapd_version=$(echo "$tapd_version" | sed -e 's/-\(alpha\|beta\)\(\.rc[0-9]\+\)\?//g')
-
-    # Match git tag with tapd version.
-    if [[ $tag != "${tapd_version}" ]]; then
-      red "tapd version $tapd_version does not match tag $tag"
-      exit 1
-    fi
-  else
-    red "malformed tapd version output"
+  if [[ $tag != "$expected_tag" ]]; then
+    red "Error: tag $tag does not match git tag version string derived from $version_file_path"
     exit 1
+  else
+    green "tag $tag matches git tag version string derived from $version_file_path"
   fi
 }
 
 # build_release builds the actual release binaries.
 #   arguments: <version-tag> <build-system(s)> <build-tags> <ldflags>
+#              <go-version>
 function build_release() {
   local tag=$1
   local sys=$2
   local buildtags=$3
   local ldflags=$4
+  local goversion=$5
+
+  # Check if the active Go version matches the specified Go version.
+  active_go_version=$(go version | awk '{print $3}' | sed 's/go//')
+  if [ "$active_go_version" != "$goversion" ]; then
+    echo "Error: active Go version ($active_go_version) does not match \
+required Go version ($goversion)."
+    exit 1
+  fi
+
+  echo "Building release for tag $tag with Go version $goversion"
 
   green " - Packaging vendor"
   go mod vendor
@@ -181,8 +179,8 @@ function build_release() {
     pushd "${dir}"
 
     green " - Building: ${os} ${arch} ${arm} with build tags '${buildtags}'"
-    env GOEXPERIMENT=loopvar CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" GOARM=$arm GOAMD64="v1" go build -v -trimpath -ldflags="${ldflags}" -tags="${buildtags}" ${PKG}/cmd/tapd
-    env GOEXPERIMENT=loopvar CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" GOARM=$arm GOAMD64="v1" go build -v -trimpath -ldflags="${ldflags}" -tags="${buildtags}" ${PKG}/cmd/tapcli
+    env CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" GOARM=$arm GOAMD64="v1" go build -v -trimpath -ldflags="${ldflags}" -tags="${buildtags}" ${PKG}/cmd/tapd
+    env CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" GOARM=$arm GOAMD64="v1" go build -v -trimpath -ldflags="${ldflags}" -tags="${buildtags}" ${PKG}/cmd/tapcli
     popd
 
     # Add the hashes for the individual binaries as well for easy verification
@@ -206,7 +204,7 @@ function build_release() {
 function usage() {
   red "Usage: "
   red "release.sh check-tag <version-tag>"
-  red "release.sh build-release <version-tag> <build-system(s)> <build-tags> <ldflags>"
+  red "release.sh build-release <version-tag> <build-system(s)> <build-tags> <ldflags> <go-version>"
 }
 
 # Whatever sub command is passed in, we need at least 2 arguments.

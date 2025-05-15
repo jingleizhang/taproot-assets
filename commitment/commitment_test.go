@@ -1,6 +1,7 @@
 package commitment
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
 	"math/rand"
@@ -12,9 +13,11 @@ import (
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/lightninglabs/taproot-assets/asset"
+	"github.com/lightninglabs/taproot-assets/fn"
 	"github.com/lightninglabs/taproot-assets/internal/test"
 	"github.com/lightninglabs/taproot-assets/mssmt"
 	"github.com/lightningnetwork/lnd/keychain"
+	"github.com/lightningnetwork/lnd/tlv"
 	"github.com/stretchr/testify/require"
 )
 
@@ -50,7 +53,7 @@ func randAssetDetails(t *testing.T, assetType asset.Type) *AssetDetails {
 		Version: assetVersion,
 		Type:    assetType,
 		ScriptKey: keychain.KeyDescriptor{
-			PubKey: test.RandPrivKey(t).PubKey(),
+			PubKey: test.RandPrivKey().PubKey(),
 		},
 		Amount:           &amount,
 		LockTime:         rand.Uint64(),
@@ -67,6 +70,51 @@ func randAsset(t *testing.T, genesis asset.Genesis,
 	return asset.RandAssetWithValues(t, genesis, groupKey, scriptKey)
 }
 
+func proveAssets(t *testing.T, commit *TapCommitment, assets []*asset.Asset,
+	includesAsset, includesAssetGroup bool) {
+
+	t.Helper()
+	for _, asset := range assets {
+		proofAsset, proof, err := commit.Proof(
+			asset.TapCommitmentKey(),
+			asset.AssetCommitmentKey(),
+		)
+		require.NoError(t, err)
+		require.Equal(t, includesAsset, proofAsset != nil)
+		require.Equal(
+			t, commit.Version, proof.TaprootAssetProof.Version,
+		)
+
+		if includesAssetGroup {
+			require.NotNil(t, proof.AssetProof)
+		} else {
+			require.Nil(t, proof.AssetProof)
+		}
+
+		var tapCommitment *TapCommitment
+
+		switch {
+		case includesAsset && includesAssetGroup:
+			tapCommitment, err = proof.DeriveByAssetInclusion(
+				asset,
+			)
+		case !includesAsset && includesAssetGroup:
+			tapCommitment, err = proof.DeriveByAssetExclusion(
+				asset.AssetCommitmentKey(),
+			)
+		case !includesAsset && !includesAssetGroup:
+			tapCommitment, err = proof.
+				DeriveByAssetCommitmentExclusion(
+					asset.TapCommitmentKey(),
+				)
+		}
+		require.NoError(t, err)
+		require.Equal(
+			t, commit.TapLeaf(), tapCommitment.TapLeaf(),
+		)
+	}
+}
+
 // TestNewAssetCommitment tests edge cases around NewAssetCommitment.
 func TestNewAssetCommitment(t *testing.T) {
 	t.Parallel()
@@ -79,7 +127,7 @@ func TestNewAssetCommitment(t *testing.T) {
 	)
 	group1Anchor := randAsset(t, genesis1, nil)
 	groupKey1, group1PrivBytes := asset.RandGroupKeyWithSigner(
-		t, genesis1, group1Anchor,
+		t, nil, genesis1, group1Anchor,
 	)
 	group1Anchor = asset.NewAssetNoErr(
 		t, genesis1, group1Anchor.Amount, group1Anchor.LockTime,
@@ -101,12 +149,17 @@ func TestNewAssetCommitment(t *testing.T) {
 	genTxBuilder := asset.MockGroupTxBuilder{}
 	group1Priv, group1Pub := btcec.PrivKeyFromBytes(group1PrivBytes)
 	group1ReissuedGroupReq := asset.NewGroupKeyRequestNoErr(
-		t, test.PubToKeyDesc(group1Pub), genesis1, genesis2ProtoAsset,
-		nil,
+		t, test.PubToKeyDesc(group1Pub), fn.None[asset.ExternalKey](),
+		genesis1, genesis2ProtoAsset, nil, fn.None[chainhash.Hash](),
 	)
+	group1ReissuedGenTx, err := group1ReissuedGroupReq.BuildGroupVirtualTx(
+		&genTxBuilder,
+	)
+	require.NoError(t, err)
+
 	group1ReissuedGroupKey, err := asset.DeriveGroupKey(
-		asset.NewMockGenesisSigner(group1Priv), &genTxBuilder,
-		*group1ReissuedGroupReq,
+		asset.NewMockGenesisSigner(group1Priv), *group1ReissuedGenTx,
+		*group1ReissuedGroupReq, nil,
 	)
 	require.NoError(t, err)
 	group1Reissued = asset.NewAssetNoErr(
@@ -236,7 +289,7 @@ func TestMintTapCommitment(t *testing.T) {
 	genesisNormal := asset.RandGenesis(t, asset.Normal)
 	genesisCollectible := asset.RandGenesis(t, asset.Collectible)
 	pubKey := keychain.KeyDescriptor{
-		PubKey: test.RandPrivKey(t).PubKey(),
+		PubKey: test.RandPrivKey().PubKey(),
 	}
 
 	testCases := []struct {
@@ -360,9 +413,13 @@ func TestMintTapCommitment(t *testing.T) {
 			invalidCollctibleAmt := amt != nil && *amt != oneAmt &&
 				details.Type == asset.Collectible
 
+			tapCommitVersion := RandTapCommitVersion()
 			switch {
 			case invalidNormalAmt || invalidCollctibleAmt:
-				_, _, err = Mint(testCase.g, nil, details)
+				_, _, err = Mint(
+					tapCommitVersion, testCase.g, nil,
+					details,
+				)
 
 			default:
 				trueAmt := amt
@@ -382,7 +439,10 @@ func TestMintTapCommitment(t *testing.T) {
 					t, testCase.g, protoAsset,
 				)
 
-				_, _, err = Mint(testCase.g, groupKey, details)
+				_, _, err = Mint(
+					RandTapCommitVersion(),
+					testCase.g, groupKey, details,
+				)
 			}
 
 			if testCase.valid {
@@ -408,6 +468,7 @@ func TestMintAndDeriveTapCommitment(t *testing.T) {
 	const numAssets = 5
 	var anchorDetails *AssetDetails
 
+	tapCommitVersion := RandTapCommitVersion()
 	genesis1 := asset.RandGenesis(t, assetType)
 	assetDetails := make([]*AssetDetails, 0, numAssets)
 	for i := 0; i < numAssets; i++ {
@@ -427,60 +488,23 @@ func TestMintAndDeriveTapCommitment(t *testing.T) {
 	groupKey1 := asset.RandGroupKey(t, genesis1, genesis1ProtoAsset)
 
 	// Mint a new Taproot Asset commitment with the included assets.
-	commitment, assets, err := Mint(genesis1, groupKey1, assetDetails...)
+	commitment, assets, err := Mint(
+		tapCommitVersion, genesis1, groupKey1, assetDetails...,
+	)
 	require.NoError(t, err)
 
-	proveAssets := func(assets []*asset.Asset, includesAsset,
-		includesAssetGroup bool) {
-
-		t.Helper()
-		for _, asset := range assets {
-			proofAsset, proof, err := commitment.Proof(
-				asset.TapCommitmentKey(),
-				asset.AssetCommitmentKey(),
-			)
-			require.NoError(t, err)
-			require.Equal(t, includesAsset, proofAsset != nil)
-
-			if includesAssetGroup {
-				require.NotNil(t, proof.AssetProof)
-			} else {
-				require.Nil(t, proof.AssetProof)
-			}
-
-			var tapCommitment *TapCommitment
-
-			if includesAsset && includesAssetGroup {
-				tapCommitment, err = proof.DeriveByAssetInclusion(
-					asset,
-				)
-			} else if includesAssetGroup {
-				tapCommitment, err = proof.DeriveByAssetExclusion(
-					asset.AssetCommitmentKey(),
-				)
-			} else {
-				tapCommitment, err = proof.DeriveByAssetCommitmentExclusion(
-					asset.TapCommitmentKey(),
-				)
-			}
-			require.NoError(t, err)
-			require.Equal(
-				t, commitment.TapLeaf(), tapCommitment.TapLeaf(),
-			)
-		}
-	}
-
 	// Prove that all assets minted are properly committed to.
-	proveAssets(assets, true, true)
+	proveAssets(t, commitment, assets, true, true)
 
 	// Now, we'll compute proofs for assets of the same group but not
 	// included in the above Taproot Asset commitment (non-inclusion
 	// proofs).
 	_, nonExistentAssets, err := Mint(
-		genesis1, groupKey1, randAssetDetails(t, assetType),
+		tapCommitVersion, genesis1, groupKey1,
+		randAssetDetails(t, assetType),
 	)
 	require.NoError(t, err)
-	proveAssets(nonExistentAssets, false, true)
+	proveAssets(t, commitment, nonExistentAssets, false, true)
 
 	// Finally, we'll compute proofs for assets with a different group and
 	// not included in the above Taproot Asset commitment (non-inclusion
@@ -495,10 +519,10 @@ func TestMintAndDeriveTapCommitment(t *testing.T) {
 	)
 	groupKey2 := asset.RandGroupKey(t, genesis2, genesis2ProtoAsset)
 	_, nonExistentAssetGroup, err := Mint(
-		genesis2, groupKey2, assetDetails...,
+		tapCommitVersion, genesis2, groupKey2, assetDetails...,
 	)
 	require.NoError(t, err)
-	proveAssets(nonExistentAssetGroup, false, false)
+	proveAssets(t, commitment, nonExistentAssetGroup, false, false)
 }
 
 // TestSplitCommitment assets that we can properly create and prove split
@@ -606,6 +630,43 @@ func TestSplitCommitment(t *testing.T) {
 					t, genesisNormal, groupKeyNormal,
 				)
 				input.Amount = 3
+
+				root := &SplitLocator{
+					OutputIndex: 0,
+					AssetID:     genesisNormal.ID(),
+					ScriptKey: asset.ToSerialized(
+						input.ScriptKey.PubKey,
+					),
+					Amount: 1,
+				}
+				external := []*SplitLocator{{
+					OutputIndex: 1,
+					AssetID:     genesisNormal.ID(),
+					ScriptKey:   asset.RandSerializedKey(t),
+					Amount:      1,
+				}, {
+
+					OutputIndex: 2,
+					AssetID:     genesisNormal.ID(),
+					ScriptKey:   asset.RandSerializedKey(t),
+					Amount:      1,
+				}}
+
+				return input, root, external
+			},
+			err: nil,
+		},
+		{
+			name: "single input split commitment lock time input",
+			f: func() (*asset.Asset, *SplitLocator,
+				[]*SplitLocator) {
+
+				input := randAsset(
+					t, genesisNormal, groupKeyNormal,
+				)
+				input.Amount = 3
+				input.RelativeLockTime = 1
+				input.LockTime = 1
 
 				root := &SplitLocator{
 					OutputIndex: 0,
@@ -847,6 +908,11 @@ func TestSplitCommitment(t *testing.T) {
 				require.Contains(t, split.SplitAssets, *l)
 				splitAsset := split.SplitAssets[*l]
 
+				// Make sure that the splits don't inherit lock
+				// time information from the root asset.
+				require.Zero(t, splitAsset.LockTime)
+				require.Zero(t, splitAsset.RelativeLockTime)
+
 				// If this is a leaf split, then we need to
 				// ensure that the prev ID is zero.
 				if splitAsset.SplitCommitmentRoot == nil {
@@ -887,7 +953,7 @@ func TestSplitCommitment(t *testing.T) {
 	}
 }
 
-// TestTapCommitmentPopulation tests a series of invariants related to the
+// TestTapCommitmentKeyPopulation tests a series of invariants related to the
 // Taproot Asset commitment key.
 func TestTapCommitmentKeyPopulation(t *testing.T) {
 	type assetDescription struct {
@@ -942,7 +1008,7 @@ func TestUpdateAssetCommitment(t *testing.T) {
 	genesis1collect.Type = asset.Collectible
 	group1Anchor := randAsset(t, genesis1, nil)
 	groupKey1, group1PrivBytes := asset.RandGroupKeyWithSigner(
-		t, genesis1, group1Anchor,
+		t, nil, genesis1, group1Anchor,
 	)
 	group1Anchor = asset.NewAssetNoErr(
 		t, genesis1, group1Anchor.Amount, group1Anchor.LockTime,
@@ -955,11 +1021,17 @@ func TestUpdateAssetCommitment(t *testing.T) {
 	genTxBuilder := asset.MockGroupTxBuilder{}
 	group1Priv, group1Pub := btcec.PrivKeyFromBytes(group1PrivBytes)
 	group1ReissuedGroupReq := asset.NewGroupKeyRequestNoErr(
-		t, test.PubToKeyDesc(group1Pub), genesis1, group1Reissued, nil,
+		t, test.PubToKeyDesc(group1Pub), fn.None[asset.ExternalKey](),
+		genesis1, group1Reissued, nil, fn.None[chainhash.Hash](),
 	)
+	group1ReissuedGenTx, err := group1ReissuedGroupReq.BuildGroupVirtualTx(
+		&genTxBuilder,
+	)
+	require.NoError(t, err)
+
 	group1ReissuedGroupKey, err := asset.DeriveGroupKey(
-		asset.NewMockGenesisSigner(group1Priv), &genTxBuilder,
-		*group1ReissuedGroupReq,
+		asset.NewMockGenesisSigner(group1Priv), *group1ReissuedGenTx,
+		*group1ReissuedGroupReq, nil,
 	)
 	require.NoError(t, err)
 	group1Reissued = asset.NewAssetNoErr(
@@ -1093,7 +1165,7 @@ func TestUpdateTapCommitment(t *testing.T) {
 	groupKey1 := asset.RandGroupKey(t, genesis1, protoAsset1)
 	groupKey2 := asset.RandGroupKey(t, genesis2, protoAsset2)
 
-	// We also create a thirds asset which is in the same group as the first
+	// We also create a third asset which is in the same group as the first
 	// one, to ensure that we can properly create Taproot Asset commitments
 	// from asset commitments of the same group.
 	genesis3 := asset.RandGenesis(t, asset.Normal)
@@ -1126,13 +1198,14 @@ func TestUpdateTapCommitment(t *testing.T) {
 
 	// When creating a Taproot Asset commitment from all three assets, we
 	// expect two commitments to be created, one for each group.
+	tapCommitVersion := RandTapCommitVersion()
 	cp1, err := assetCommitment1.Copy()
 	require.NoError(t, err)
 	cp2, err := assetCommitment2.Copy()
 	require.NoError(t, err)
 	cp3, err := assetCommitment3.Copy()
 	require.NoError(t, err)
-	commitment, err := NewTapCommitment(cp1, cp2, cp3)
+	commitment, err := NewTapCommitment(tapCommitVersion, cp1, cp2, cp3)
 	require.NoError(t, err)
 	require.Len(t, commitment.Commitments(), 2)
 	require.Len(t, commitment.CommittedAssets(), 3)
@@ -1158,10 +1231,12 @@ func TestUpdateTapCommitment(t *testing.T) {
 
 	// Mint a new Taproot Asset commitment with only the first
 	// assetCommitment.
-	commitment, err = NewTapCommitment(assetCommitment1)
+	commitment, err = NewTapCommitment(tapCommitVersion, assetCommitment1)
 	require.NoError(t, err)
 
-	copyOfCommitment, err := NewTapCommitment(assetCommitment1)
+	copyOfCommitment, err := NewTapCommitment(
+		tapCommitVersion, assetCommitment1,
+	)
 	require.NoError(t, err)
 
 	// Check that the assetCommitment map has only the first assetCommitment.
@@ -1197,7 +1272,9 @@ func TestUpdateTapCommitment(t *testing.T) {
 
 	// Make a new Taproot Asset commitment directly from the same assets,
 	// and check equality with the version made via upserts.
-	commitmentFromAssets, err := FromAssets(asset1, asset2)
+	commitmentFromAssets, err := FromAssets(
+		tapCommitVersion, asset1, asset2,
+	)
 	require.NoError(t, err)
 
 	require.Equal(
@@ -1237,6 +1314,90 @@ func TestUpdateTapCommitment(t *testing.T) {
 	require.Equal(
 		t, mssmt.EmptyTreeRootHash,
 		copyOfCommitment.TreeRoot.NodeHash(),
+	)
+}
+
+// TestTapCommitmentAltLeaves asserts that we can properly fetch, trim, and
+// merge alt leaves to and from a TapCommitment.
+func TestTapCommitmentAltLeaves(t *testing.T) {
+	t.Parallel()
+
+	// Create two random assets, to populate our Tap commitment.
+	asset1 := asset.RandAsset(t, asset.Normal)
+	asset2 := asset.RandAsset(t, asset.Collectible)
+
+	// We'll create three AltLeaves. Leaves 1 and 2 are valid, and leaf 3
+	// will collide with leaf 1.
+	leaf1 := asset.RandAltLeaf(t)
+	leaf2 := asset.RandAltLeaf(t)
+	leaf3 := asset.RandAltLeaf(t)
+	leaf3.ScriptKey.PubKey = leaf1.ScriptKey.PubKey
+	leaf4 := asset.RandAltLeaf(t)
+
+	// Create our initial, asset-only, Tap commitment.
+	commitment, err := FromAssets(nil, asset1, asset2)
+	require.NoError(t, err)
+	assetOnlyTapLeaf := commitment.TapLeaf()
+
+	// If we try to trim any alt leaves, we should get none back.
+	_, altLeaves, err := TrimAltLeaves(commitment)
+	require.NoError(t, err)
+	require.Empty(t, altLeaves)
+
+	// Trying to merge colliding alt leaves should fail.
+	err = commitment.MergeAltLeaves([]asset.AltLeaf[asset.Asset]{
+		leaf1, leaf3,
+	})
+	require.ErrorIs(t, err, asset.ErrDuplicateAltLeafKey)
+
+	// Merging non-colliding, valid alt leaves should succeed. The new
+	// commitment should contain three AssetCommitments, since we've created
+	// an AltCommitment.
+	err = commitment.MergeAltLeaves([]asset.AltLeaf[asset.Asset]{
+		leaf1, leaf2,
+	})
+	require.NoError(t, err)
+	require.Len(t, commitment.assetCommitments, 3)
+
+	// Trying to merge an alt leaf that will collide with an existing leaf
+	// should also fail.
+	err = commitment.MergeAltLeaves([]asset.AltLeaf[asset.Asset]{leaf3})
+	require.ErrorIs(t, err, asset.ErrDuplicateAltLeafKey)
+
+	// Merging a valid, non-colliding, new alt leaf into an existing
+	// AltCommitment should succeed.
+	err = commitment.MergeAltLeaves([]asset.AltLeaf[asset.Asset]{leaf4})
+	require.NoError(t, err)
+
+	// If we fetch the alt leaves, they should not be removed from the
+	// commitment.
+	finalTapLeaf := commitment.TapLeaf()
+	fetchedAltLeaves, err := commitment.FetchAltLeaves()
+	require.NoError(t, err)
+	require.Equal(t, finalTapLeaf, commitment.TapLeaf())
+	insertedAltLeaves := []*asset.Asset{leaf1, leaf2, leaf4}
+
+	// The fetched leaves must be equal to the three leaves we successfully
+	// inserted.
+	asset.CompareAltLeaves(
+		t, asset.ToAltLeaves(insertedAltLeaves),
+		asset.ToAltLeaves(fetchedAltLeaves),
+	)
+
+	// Now, if we trim out the alt leaves, the AltCommitment should be fully
+	// removed.
+	originalCommitment, _, err := TrimAltLeaves(commitment)
+	require.NoError(t, err)
+
+	trimmedTapLeaf := originalCommitment.TapLeaf()
+	require.NotEqual(t, finalTapLeaf, trimmedTapLeaf)
+	require.Equal(t, assetOnlyTapLeaf, trimmedTapLeaf)
+
+	// The trimmed leaves should match the leaves we successfully merged
+	// into the commitment.
+	asset.CompareAltLeaves(
+		t, asset.ToAltLeaves(fetchedAltLeaves),
+		asset.ToAltLeaves(insertedAltLeaves),
 	)
 }
 
@@ -1301,7 +1462,7 @@ func TestTapCommitmentDeepCopy(t *testing.T) {
 	// With both commitments created, we'll now make a new Taproot Asset
 	// commitment then copy it.
 	tapCommitment, err := NewTapCommitment(
-		assetCommitment1, assetCommitment2,
+		RandTapCommitVersion(), assetCommitment1, assetCommitment2,
 	)
 	require.NoError(t, err)
 
@@ -1316,8 +1477,8 @@ func TestTapCommitmentDeepCopy(t *testing.T) {
 	)
 }
 
-// TestTaprootAssetCommitmentScript tests that we're able to properly verify if
-// a given script is a valid Taproot Asset commitment script or not.
+// TestIsTaprootAssetCommitmentScript tests that we're able to properly
+// verify if a given script is a valid Taproot Asset commitment script or not.
 func TestIsTaprootAssetCommitmentScript(t *testing.T) {
 	t.Parallel()
 
@@ -1359,10 +1520,11 @@ func TestAssetCommitmentNoWitness(t *testing.T) {
 	asset1.PrevWitnesses[0].TxWitness = [][]byte{randTxid[:]}
 
 	// Next, we'll use the assets to create two root tap commitments.
-	commitmentWitness, err := FromAssets(asset1)
+	tapCommitVersion := RandTapCommitVersion()
+	commitmentWitness, err := FromAssets(tapCommitVersion, asset1)
 	require.NoError(t, err)
 
-	commitmentNoWitness, err := FromAssets(assetNoWitness)
+	commitmentNoWitness, err := FromAssets(tapCommitVersion, assetNoWitness)
 	require.NoError(t, err)
 
 	// The two commitment should be identical as this asset version leaves
@@ -1375,7 +1537,7 @@ func TestAssetCommitmentNoWitness(t *testing.T) {
 	// If we make the asset into a V0 asset, then recompute the commitment,
 	// we should get a distinct root.
 	asset1.Version = asset.V0
-	commitmentV0, err := FromAssets(asset1)
+	commitmentV0, err := FromAssets(tapCommitVersion, asset1)
 	require.NoError(t, err)
 
 	require.NotEqual(
@@ -1401,11 +1563,11 @@ func TestTapCommitmentUpsertMaxVersion(t *testing.T) {
 	asset2.Version = asset.V1
 
 	// Next, we'll create a new commitment with just the first asset.
-	tapCommitment, err := FromAssets(asset1)
+	tapCommitment, err := FromAssets(nil, asset1)
 	require.NoError(t, err)
 
 	// The version should be zero, as the asset version is 0.
-	require.Equal(t, asset.V0, tapCommitment.Version)
+	require.Equal(t, TapCommitmentV0, tapCommitment.Version)
 
 	// Next, we'll upsert the second asset, which should bump the version
 	// to v1.
@@ -1414,7 +1576,7 @@ func TestTapCommitmentUpsertMaxVersion(t *testing.T) {
 
 	require.NoError(t, tapCommitment.Upsert(assetCommitment))
 
-	require.Equal(t, asset.V1, tapCommitment.Version)
+	require.Equal(t, TapCommitmentV1, tapCommitment.Version)
 
 	// Finally, we'll test the delete behavior of Upsert. We'll remove all
 	// the commitments in the assetCommitment above, then Upsert. We should
@@ -1425,7 +1587,7 @@ func TestTapCommitmentUpsertMaxVersion(t *testing.T) {
 
 	// Only a V0 asset remains now after the upsert, so the version should
 	// have reverted.
-	require.Equal(t, asset.V0, tapCommitment.Version)
+	require.Equal(t, TapCommitmentV0, tapCommitment.Version)
 }
 
 // TestTapCommitmentDeleteMaxVersion tests that when we delete commitments, the
@@ -1445,11 +1607,11 @@ func TestTapCommitmentDeleteMaxVersion(t *testing.T) {
 	asset2.Version = asset.V1
 
 	// Next, we'll create a new commitment with both assets.
-	tapCommitment, err := FromAssets(asset1, asset2)
+	tapCommitment, err := FromAssets(nil, asset1, asset2)
 	require.NoError(t, err)
 
 	// The version should be 1 as that's the max version of the assets.
-	require.Equal(t, asset.V1, tapCommitment.Version)
+	require.Equal(t, TapCommitmentV1, tapCommitment.Version)
 
 	// Now we'll delete the asset with a version of 1. This should caause
 	// the version to go back down to v0.
@@ -1457,7 +1619,91 @@ func TestTapCommitmentDeleteMaxVersion(t *testing.T) {
 	require.True(t, ok)
 	require.NoError(t, tapCommitment.Delete(v1Commitment))
 
-	require.Equal(t, asset.V0, tapCommitment.Version)
+	require.Equal(t, TapCommitmentV0, tapCommitment.Version)
+}
+
+// TestTapCommitmentVersionCompatibility tests that we can properly create and
+// merge commitments of different versions.
+func TestTapCommitmentVersionCompatibility(t *testing.T) {
+	t.Parallel()
+
+	// We'll start with two assets; a V0 and a V1 asset.
+	genesis1 := asset.RandGenesis(t, asset.Normal)
+	asset1 := randAsset(t, genesis1, nil)
+	asset1.Version = asset.V0
+
+	genesis2 := asset.RandGenesis(t, asset.Collectible)
+	asset2 := randAsset(t, genesis2, nil)
+	asset2.Version = asset.V1
+
+	// If the commitment is V2, the version of the input assets should not
+	// affect the final version of the commitment.
+	asset1TapCommitment, err := FromAssets(fn.Ptr(TapCommitmentV2), asset1)
+	require.NoError(t, err)
+	require.Equal(t, TapCommitmentV2, asset1TapCommitment.Version)
+
+	asset2TapCommitment, err := FromAssets(fn.Ptr(TapCommitmentV2), asset2)
+	require.NoError(t, err)
+	require.Equal(t, TapCommitmentV2, asset2TapCommitment.Version)
+
+	// Asset deletion should not affect the tap commitment version.
+	tapCommitment, err := FromAssets(
+		fn.Ptr(TapCommitmentV2), asset1, asset2,
+	)
+	require.NoError(t, err)
+	require.Equal(t, TapCommitmentV2, tapCommitment.Version)
+
+	assetCommitment, err := NewAssetCommitment(asset1)
+	require.NoError(t, err)
+
+	require.NoError(t, assetCommitment.Delete(asset1))
+	require.NoError(t, tapCommitment.Upsert(assetCommitment))
+	require.Equal(t, TapCommitmentV2, tapCommitment.Version)
+
+	// Unknown commitment versions should be rejected.
+	invalidCommitment, err := FromAssets(
+		fn.Ptr(TapCommitmentVersion(22)), asset1, asset2,
+	)
+	require.Nil(t, invalidCommitment)
+	require.ErrorIs(t, err, ErrInvalidTapCommitmentVersion)
+
+	// Tap commitment merging should fail if only one commitment is V2.
+	notV2Commitment, err := FromAssets(nil, asset1, asset2)
+	require.NoError(t, err)
+
+	err = tapCommitment.Merge(notV2Commitment)
+	require.ErrorContains(t, err, "commitment version mismatch: 2, 1")
+
+	err = notV2Commitment.Merge(tapCommitment)
+	require.ErrorContains(t, err, "commitment version mismatch: 1, 2")
+
+	// Merging two V2 commitments should succeed.
+	genesis3 := asset.RandGenesis(t, asset.Collectible)
+	asset3 := randAsset(t, genesis3, nil)
+
+	newCommitment, err := FromAssets(fn.Ptr(TapCommitmentV2), asset3)
+	require.NoError(t, err)
+
+	err = newCommitment.Merge(tapCommitment)
+	require.NoError(t, err)
+
+	// If we make a proof from a V2 commitment, and then mutate the tap
+	// commitment version in the proof, the computed tap leaves should not
+	// match.
+	_, proof, err := newCommitment.Proof(
+		asset2.TapCommitmentKey(), asset2.AssetCommitmentKey(),
+	)
+	require.NoError(t, err)
+	require.NotNil(t, proof)
+
+	proof.TaprootAssetProof.Version = test.RandFlip(
+		TapCommitmentV0, TapCommitmentV1,
+	)
+	derivedCommitment, err := proof.DeriveByAssetInclusion(asset2)
+	require.NoError(t, err)
+	require.NotEqual(
+		t, newCommitment.TapLeaf(), derivedCommitment.TapLeaf(),
+	)
 }
 
 // TestAssetCommitmentUpsertMaxVersion tests that when we upsert with different
@@ -1516,4 +1762,161 @@ func TestAssetCommitmentDeleteMaxVersion(t *testing.T) {
 	require.NoError(t, assetCommitment.Delete(asset2))
 
 	require.Equal(t, asset.V0, assetCommitment.Version)
+}
+
+// TestProofUnknownOddType tests that an unknown odd type is allowed in a
+// commitment proof and that we can still arrive at the correct root hash with
+// it.
+func TestProofUnknownOddType(t *testing.T) {
+	genesis := asset.RandGenesis(t, asset.Normal)
+	asset1 := randAsset(t, genesis, nil)
+
+	singleCommitment, err := FromAssets(nil, asset1)
+	require.NoError(t, err)
+
+	_, knownProof, err := singleCommitment.Proof(
+		asset1.TapCommitmentKey(), asset1.AssetCommitmentKey(),
+	)
+	require.NoError(t, err)
+
+	var knownProofBytes []byte
+	test.RunUnknownOddTypeTest(
+		t, knownProof, &asset.ErrUnknownType{},
+		func(buf *bytes.Buffer, proof *Proof) error {
+			err := proof.Encode(buf)
+
+			knownProofBytes = fn.CopySlice(buf.Bytes())
+
+			return err
+		},
+		func(buf *bytes.Buffer) (*Proof, error) {
+			var parsedProof Proof
+			return &parsedProof, parsedProof.Decode(buf)
+		},
+		func(parsedProof *Proof, unknownTypes tlv.TypeMap) {
+			require.Equal(
+				t, unknownTypes, parsedProof.UnknownOddTypes,
+			)
+
+			// The proof should've changed, to make sure the
+			// unknown value was taken into account when creating
+			// the serialized proof.
+			var newBuf bytes.Buffer
+			err = parsedProof.Encode(&newBuf)
+			require.NoError(t, err)
+
+			require.NotEqual(t, knownProofBytes, newBuf.Bytes())
+
+			parsedProof.UnknownOddTypes = nil
+			require.Equal(t, knownProof, parsedProof)
+		},
+	)
+}
+
+// TestAssetProofUnknownOddType tests that an unknown odd type is allowed in an
+// asset proof and that we can still arrive at the correct root hash with it.
+func TestAssetProofUnknownOddType(t *testing.T) {
+	genesis := asset.RandGenesis(t, asset.Normal)
+	asset1 := randAsset(t, genesis, nil)
+
+	singleCommitment, err := FromAssets(nil, asset1)
+	require.NoError(t, err)
+
+	_, commitmentProof, err := singleCommitment.Proof(
+		asset1.TapCommitmentKey(), asset1.AssetCommitmentKey(),
+	)
+	require.NoError(t, err)
+
+	require.NotNil(t, commitmentProof.AssetProof)
+	knownAssetProof := commitmentProof.AssetProof
+
+	var knownProofBytes []byte
+	test.RunUnknownOddTypeTest(
+		t, knownAssetProof, &asset.ErrUnknownType{},
+		func(buf *bytes.Buffer, proof *AssetProof) error {
+			err := AssetProofEncoder(buf, &proof, nil)
+
+			knownProofBytes = fn.CopySlice(buf.Bytes())
+
+			return err
+		},
+		func(buf *bytes.Buffer) (*AssetProof, error) {
+			parsedProof := &AssetProof{}
+			return parsedProof, AssetProofDecoder(
+				buf, &parsedProof, nil, uint64(buf.Len()),
+			)
+		},
+		func(parsedProof *AssetProof, unknownTypes tlv.TypeMap) {
+			require.Equal(
+				t, unknownTypes, parsedProof.UnknownOddTypes,
+			)
+
+			// The proof should've changed, to make sure the unknown
+			// value was taken into account when creating the
+			// serialized proof.
+			var newBuf bytes.Buffer
+			err = AssetProofEncoder(&newBuf, &parsedProof, nil)
+			require.NoError(t, err)
+
+			require.NotEqual(t, knownProofBytes, newBuf.Bytes())
+
+			parsedProof.UnknownOddTypes = nil
+			require.Equal(t, knownAssetProof, parsedProof)
+		},
+	)
+}
+
+// TestTaprootAssetProofUnknownOddType tests that an unknown odd type is allowed
+// in a Taproot asset proof and that we can still arrive at the correct root
+// hash with it.
+func TestTaprootAssetProofUnknownOddType(t *testing.T) {
+	genesis := asset.RandGenesis(t, asset.Normal)
+	asset1 := randAsset(t, genesis, nil)
+
+	singleCommitment, err := FromAssets(nil, asset1)
+	require.NoError(t, err)
+
+	_, commitmentProof, err := singleCommitment.Proof(
+		asset1.TapCommitmentKey(), asset1.AssetCommitmentKey(),
+	)
+	require.NoError(t, err)
+
+	knownTaprootAssetProof := commitmentProof.TaprootAssetProof
+
+	var knownProofBytes []byte
+	test.RunUnknownOddTypeTest(
+		t, knownTaprootAssetProof, &asset.ErrUnknownType{},
+		func(buf *bytes.Buffer, proof TaprootAssetProof) error {
+			err := TaprootAssetProofEncoder(buf, &proof, nil)
+
+			knownProofBytes = fn.CopySlice(buf.Bytes())
+
+			return err
+		},
+		func(buf *bytes.Buffer) (TaprootAssetProof, error) {
+			var parsedProof TaprootAssetProof
+			return parsedProof, TaprootAssetProofDecoder(
+				buf, &parsedProof, nil, uint64(buf.Len()),
+			)
+		},
+		func(parsedProof TaprootAssetProof, unknownTypes tlv.TypeMap) {
+			require.Equal(
+				t, unknownTypes, parsedProof.UnknownOddTypes,
+			)
+
+			// The proof should've changed, to make sure the unknown
+			// value was taken into account when creating the
+			// serialized proof.
+			var newBuf bytes.Buffer
+			err = TaprootAssetProofEncoder(
+				&newBuf, &parsedProof, nil,
+			)
+			require.NoError(t, err)
+
+			require.NotEqual(t, knownProofBytes, newBuf.Bytes())
+
+			parsedProof.UnknownOddTypes = nil
+			require.Equal(t, knownTaprootAssetProof, parsedProof)
+		},
+	)
 }

@@ -155,7 +155,7 @@ type assetEventsCache = *lru.Cache[eventQuery, cachedAssetEvents]
 
 // statsQueryCacheSize is the total number of asset query responses that we'll
 // hold inside the cache.
-const statsQueryCacheSize = 80_000
+const statsQueryCacheSize = 200_000
 
 // cachedSyncStats is a cached set of sync stats.
 type cachedSyncStats []universe.AssetSyncSnapshot
@@ -271,7 +271,9 @@ func (a *atomicSyncStatsCache) storeQuery(q universe.SyncStatsQuery,
 
 	log.Debugf("Storing asset stats query: %v", spew.Sdump(q))
 
-	_, _ = statsCache.Put(query, cachedSyncStats(resp))
+	if _, err := statsCache.Put(query, cachedSyncStats(resp)); err != nil {
+		log.Errorf("unable to store assets stats query: %v", err)
+	}
 }
 
 // UniverseStats is an implementation of the universe.Telemetry interface that
@@ -288,11 +290,11 @@ type UniverseStats struct {
 	statsCacheLogger *cacheLogger
 	statsRefresh     *time.Timer
 
-	eventsMtx         sync.Mutex
+	eventsMtx         sync.RWMutex
 	assetEventsCache  assetEventsCache
 	eventsCacheLogger *cacheLogger
 
-	syncStatsMtx     sync.Mutex
+	syncStatsMtx     sync.RWMutex
 	syncStatsCache   *atomicSyncStatsCache
 	syncStatsRefresh *time.Timer
 }
@@ -365,7 +367,7 @@ func (u *UniverseStats) LogSyncEvent(ctx context.Context,
 			EventTimestamp: u.clock.Now().UTC().Unix(),
 			AssetID:        uniID.AssetID[:],
 			GroupKeyXOnly:  groupKeyXOnly,
-			ProofType:      uniID.ProofType.String(),
+			ProofType:      sqlStr(uniID.ProofType.String()),
 		})
 	})
 }
@@ -391,7 +393,9 @@ func (u *UniverseStats) LogSyncEvents(ctx context.Context,
 				EventTimestamp: u.clock.Now().UTC().Unix(),
 				AssetID:        uniID.AssetID[:],
 				GroupKeyXOnly:  groupKeyXOnly,
-				ProofType:      uniID.ProofType.String(),
+				ProofType: sqlStr(
+					uniID.ProofType.String(),
+				),
 			})
 			if err != nil {
 				return err
@@ -418,7 +422,7 @@ func (u *UniverseStats) LogNewProofEvent(ctx context.Context,
 			EventTimestamp: u.clock.Now().UTC().Unix(),
 			AssetID:        uniID.AssetID[:],
 			GroupKeyXOnly:  groupKeyXOnly,
-			ProofType:      uniID.ProofType.String(),
+			ProofType:      sqlStr(uniID.ProofType.String()),
 		})
 	})
 }
@@ -443,7 +447,9 @@ func (u *UniverseStats) LogNewProofEvents(ctx context.Context,
 				EventTimestamp: u.clock.Now().UTC().Unix(),
 				AssetID:        uniID.AssetID[:],
 				GroupKeyXOnly:  groupKeyXOnly,
-				ProofType:      uniID.ProofType.String(),
+				ProofType: sqlStr(
+					uniID.ProofType.String(),
+				),
 			})
 			if err != nil {
 				return err
@@ -573,14 +579,50 @@ func (u *UniverseStats) AggregateSyncStats(
 
 	log.Debugf("Populating aggregate sync stats")
 
-	dbStats, err := u.querySyncStats(ctx)
-	if err != nil {
-		return dbStats, err
-	}
+	var (
+		resChan = make(chan universe.AggregateStats, 1)
+		errChan = make(chan error, 1)
+	)
 
-	// We'll store the DB stats then start our time after function to wipe
-	// the stats pointer so we'll refresh it after a period of time.
-	u.statsSnapshot.Store(&dbStats)
+	// We'll fire the db query in a separate go routine, with an undefined
+	// timeout. This way, we'll always retrieve the result regardless of
+	// what happens in the current context. This way we're always waiting
+	// for the call to complete and caching the result even if this
+	// function's result is an error.
+	go func() {
+		// Note: we have the statsMtx held, so even if a burst of
+		// requests took place in an un-cached state, this call would
+		// not be triggered multiple times.
+		dbStats, err := u.querySyncStats(context.Background())
+		if err != nil {
+			errChan <- err
+			return
+		}
+
+		log.Debugf("Retrieved aggregate sync stats: %+v", dbStats)
+
+		// We'll store the DB stats so that it can be read from cache
+		// later.
+		u.statsSnapshot.Store(&dbStats)
+
+		resChan <- dbStats
+	}()
+
+	var dbStats universe.AggregateStats
+
+	select {
+	case <-ctx.Done():
+		log.Debugf("Client context timeout before retrieving " +
+			"aggregate sync stats")
+		return dbStats, ctx.Err()
+
+	case err := <-errChan:
+		log.Debugf("Error while querying aggregate sync stats: %v", err)
+		return dbStats, err
+
+	case res := <-resChan:
+		dbStats = res
+	}
 
 	// Reset the timer so we'll refresh again after the cache duration.
 	if u.statsRefresh != nil && !u.statsRefresh.Stop() {
@@ -589,6 +631,9 @@ func (u *UniverseStats) AggregateSyncStats(
 		default:
 		}
 	}
+
+	log.Debugf("Refreshing sync stats cache in %v", u.opts.cacheDuration)
+
 	u.statsRefresh = time.AfterFunc(
 		u.opts.cacheDuration, u.populateSyncStatsCache,
 	)
@@ -633,7 +678,9 @@ func (u *UniverseStats) QueryAssetStatsPerDay(ctx context.Context,
 	// First, we'll check to see if we already have a cached result for
 	// this query.
 	query := newEventQuery(q)
+	u.eventsMtx.RLock()
 	cachedResult, err := u.assetEventsCache.Get(query)
+	u.eventsMtx.RUnlock()
 	if err == nil {
 		u.eventsCacheLogger.Hit()
 		return cachedResult, nil
@@ -728,7 +775,9 @@ func (u *UniverseStats) QueryAssetStatsPerDay(ctx context.Context,
 	}
 
 	// We have a fresh result, so we'll cache it now.
-	_, _ = u.assetEventsCache.Put(query, results)
+	if _, err := u.assetEventsCache.Put(query, results); err != nil {
+		log.Errorf("unable to query events cache: %v", err)
+	}
 
 	return results, nil
 }
@@ -746,13 +795,16 @@ func (u *UniverseStats) QuerySyncStats(ctx context.Context,
 
 	// First, check the cache to see if we already have a cached result for
 	// this query.
+	u.syncStatsMtx.RLock()
 	syncSnapshots := u.syncStatsCache.fetchQuery(q)
+	u.syncStatsMtx.RUnlock()
+
 	if syncSnapshots != nil {
 		resp.SyncStats = syncSnapshots
 		return resp, nil
 	}
 
-	// Otherwise, we'll grab the main mutex so we can qury the db then
+	// Otherwise, we'll grab the main mutex so we can query the db then
 	// cache the result.
 	u.syncStatsMtx.Lock()
 	defer u.syncStatsMtx.Unlock()

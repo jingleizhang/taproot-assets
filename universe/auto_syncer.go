@@ -141,9 +141,7 @@ func (f *FederationEnvoy) Start() error {
 		// Before we start the main goroutine, we'll add the set of
 		// static Universe servers.
 		addrs := f.cfg.StaticFederationMembers
-		serverAddrs := fn.Map(addrs, func(a string) ServerAddr {
-			return NewServerAddrFromStr(a)
-		})
+		serverAddrs := fn.Map(addrs, NewServerAddrFromStr)
 
 		serverAddrs = fn.Filter(serverAddrs, func(a ServerAddr) bool {
 			// Before we add the server as a federation member, we
@@ -201,7 +199,7 @@ func (f *FederationEnvoy) Stop() error {
 func (f *FederationEnvoy) syncServerState(ctx context.Context,
 	addr ServerAddr, syncConfigs SyncConfigs) error {
 
-	log.Infof("Syncing Universe state with server=%v", spew.Sdump(addr))
+	log.Infof("Syncing Universe state with server=%s", addr.HostStr())
 
 	// Attempt to sync with the remote Universe server, if this errors then
 	// we'll bail out early as something wrong happened.
@@ -766,9 +764,9 @@ func (f *FederationEnvoy) SyncServers(serverAddrs []ServerAddr) error {
 	return nil
 }
 
-// SetAllowPublicAccess sets the global sync config to allow public access
-// for proof insert and export across all universes.
-func (f *FederationEnvoy) SetAllowPublicAccess() error {
+// SetConfigSyncAllAssets sets the global (default) sync config to sync all
+// assets.
+func (f *FederationEnvoy) SetConfigSyncAllAssets() error {
 	ctx, cancel := f.WithCtxQuit()
 	defer cancel()
 
@@ -848,8 +846,14 @@ func (f *FederationEnvoy) SyncAssetInfo(ctx context.Context,
 		// Sync failures are expected from Universe servers that do not
 		// have a relevant universe root.
 		if err != nil {
-			log.Debugf("asset lookup for %v failed with remote"+
-				"server: %v", assetID.String(), addr.HostStr())
+			log.Warnf("Asset lookup failed: asset_id=%v, "+
+				"remote_server=%v: %v", assetID.String(),
+				addr.HostStr(), err)
+
+			// We don't want to abort syncing here, as this might
+			// just be one server in our list and returning an error
+			// would cause us to stop trying the other servers.
+			// lint:ignore nilerr failure is expected and logged.
 			return nil
 		}
 
@@ -857,8 +861,16 @@ func (f *FederationEnvoy) SyncAssetInfo(ctx context.Context,
 		// one universe root.
 		if syncDiff != nil {
 			if len(syncDiff) != 1 {
-				log.Debugf("unexpected number of sync diffs: "+
-					"%v", len(syncDiff))
+				log.Warnf("Unexpected number of sync diffs "+
+					"when looking up asset: num_diffs=%d, "+
+					"asset_id=%v, remote_server=%v",
+					len(syncDiff), assetID.String(),
+					addr.HostStr())
+
+				// We don't want to abort syncing here, as this
+				// might just be one server in our list and
+				// returning an error would cause us to stop
+				// trying the other servers.
 				return nil
 			}
 

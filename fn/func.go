@@ -1,6 +1,10 @@
 package fn
 
-import "fmt"
+import (
+	"fmt"
+
+	"github.com/lightningnetwork/lnd/fn/v2"
+)
 
 // Reducer represents a function that takes an accumulator and the value, then
 // returns a new accumulator.
@@ -60,6 +64,18 @@ func FilterMap[T any, K comparable](s map[K]T, f func(T) bool) []T {
 	return output
 }
 
+// FlatMap applies the given mapping function to each element of the given
+// slice and concatenates the results into a new slice.
+func FlatMap[I, O any, S []I](s S, f func(I) []O) []O {
+	var output []O
+
+	for _, x := range s {
+		output = append(output, f(x)...)
+	}
+
+	return output
+}
+
 // MapErr applies the given fallible mapping function to each element of the
 // given slice and generates a new slice. This is identical to Map, but
 // returns early if any single mapping fails.
@@ -72,6 +88,24 @@ func MapErr[I, O any, S []I](s S, f func(I) (O, error)) ([]O, error) {
 		if err != nil {
 			return nil, err
 		}
+	}
+
+	return output, nil
+}
+
+// FlatMapErr applies the given mapping function to each element of the given
+// slice, concatenates the results into a new slice, and returns an error if
+// the mapping function fails.
+func FlatMapErr[I, O any, S []I](s S, f func(I) ([]O, error)) ([]O, error) {
+	var output []O
+
+	for _, x := range s {
+		mapped, err := f(x)
+		if err != nil {
+			return nil, err
+		}
+
+		output = append(output, mapped...)
 	}
 
 	return output, nil
@@ -232,4 +266,20 @@ func Last[T any](xs []*T, pred func(*T) bool) (*T, error) {
 	}
 
 	return matches[len(matches)-1], nil
+}
+
+// KV is a generic struct that holds a key-value pair.
+type KV[K any, V any] struct {
+	Key   K
+	Value V
+}
+
+// PeekMap non-deterministically selects and returns a single key-value pair
+// from the given map.
+func PeekMap[K comparable, V any](m map[K]V) fn.Option[KV[K, V]] {
+	for k, v := range m {
+		return fn.Some(KV[K, V]{Key: k, Value: v})
+	}
+
+	return fn.None[KV[K, V]]()
 }

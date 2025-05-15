@@ -1,6 +1,7 @@
 package proof
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -8,15 +9,61 @@ import (
 	"sync"
 
 	"github.com/btcsuite/btcd/btcec/v2"
+	"github.com/btcsuite/btcd/btcec/v2/schnorr"
 	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
-	"github.com/lightninglabs/taproot-assets/address"
+	"github.com/davecgh/go-spew/spew"
 	"github.com/lightninglabs/taproot-assets/asset"
 	"github.com/lightninglabs/taproot-assets/commitment"
-	"github.com/lightninglabs/taproot-assets/tappsbt"
+	"github.com/lightninglabs/taproot-assets/fn"
 	"github.com/lightninglabs/taproot-assets/vm"
+	lfn "github.com/lightningnetwork/lnd/fn/v2"
+	"golang.org/x/exp/maps"
 	"golang.org/x/sync/errgroup"
 )
+
+// ChainLookupGenerator is an interface that allows the creation of a chain
+// lookup interface for a given proof file or single proof.
+type ChainLookupGenerator interface {
+	// GenFileChainLookup generates a chain lookup interface for the given
+	// proof file that can be used to validate proofs.
+	GenFileChainLookup(f *File) asset.ChainLookup
+
+	// GenProofChainLookup generates a chain lookup interface for the given
+	// single proof that can be used to validate proofs.
+	GenProofChainLookup(p *Proof) (asset.ChainLookup, error)
+}
+
+// AssetPoint is similar to PrevID but is meant to be used for created asset
+// outputs rather than those that are spent. This is similar to the concept of
+// an outpoint in normal Bitcoin.
+type AssetPoint = asset.PrevID
+
+// IgnoreChecker is used during proof validation to optionally fail validation
+// if a proof is known to be invalid. This can be used as a caching mechanism to
+// avoid expensive validation for already known invalid proofs.
+type IgnoreChecker interface {
+	// IsIgnored returns true if the given prevID is known to be invalid. A
+	// prevID is used here, but the check should be tested against a proof
+	// result, or produced output.
+	IsIgnored(prevID AssetPoint) bool
+}
+
+// VerifierCtx is a context struct that is used to pass in various interfaces
+// needed during proof verification.
+type VerifierCtx struct {
+	HeaderVerifier HeaderVerifier
+
+	MerkleVerifier MerkleVerifier
+
+	GroupVerifier GroupVerifier
+
+	GroupAnchorVerifier GroupAnchorVerifier
+
+	ChainLookupGen ChainLookupGenerator
+
+	IgnoreChecker lfn.Option[IgnoreChecker]
+}
 
 // Verifier abstracts away from the task of verifying a proof file blob.
 type Verifier interface {
@@ -24,8 +71,7 @@ type Verifier interface {
 	// error if the proof file is valid. A valid file should return an
 	// AssetSnapshot of the final state transition of the file.
 	Verify(c context.Context, blobReader io.Reader,
-		headerVerifier HeaderVerifier,
-		groupVerifier GroupVerifier) (*AssetSnapshot, error)
+		ctx VerifierCtx) (*AssetSnapshot, error)
 }
 
 // BaseVerifier implements a simple verifier that loads the entire proof file
@@ -37,8 +83,7 @@ type BaseVerifier struct {
 // error if the proof file is valid. A valid file should return an
 // AssetSnapshot of the final state transition of the file.
 func (b *BaseVerifier) Verify(ctx context.Context, blobReader io.Reader,
-	headerVerifier HeaderVerifier,
-	groupVerifier GroupVerifier) (*AssetSnapshot, error) {
+	vCtx VerifierCtx) (*AssetSnapshot, error) {
 
 	var proofFile File
 	err := proofFile.Decode(blobReader)
@@ -46,7 +91,7 @@ func (b *BaseVerifier) Verify(ctx context.Context, blobReader io.Reader,
 		return nil, fmt.Errorf("unable to parse proof: %w", err)
 	}
 
-	return proofFile.Verify(ctx, headerVerifier, groupVerifier)
+	return proofFile.Verify(ctx, vCtx)
 }
 
 // verifyTaprootProof attempts to verify a TaprootProof for inclusion or
@@ -67,10 +112,7 @@ func verifyTaprootProof(anchor *wire.MsgTx, proof *TaprootProof,
 
 	// For each proof type, we'll map this to a single key based on the
 	// self-identified pre-image type in the specified proof.
-	var (
-		derivedKey    *btcec.PublicKey
-		tapCommitment *commitment.TapCommitment
-	)
+	var derivedKeys ProofCommitmentKeys
 	switch {
 	// If this is an inclusion proof, then we'll derive the expected
 	// taproot output key based on the revealed asset MS-SMT proof. The
@@ -79,9 +121,7 @@ func verifyTaprootProof(anchor *wire.MsgTx, proof *TaprootProof,
 	// internal key to derive the expected output key.
 	case inclusion:
 		log.Tracef("Verifying inclusion proof for asset %v", asset.ID())
-		derivedKey, tapCommitment, err = proof.DeriveByAssetInclusion(
-			asset,
-		)
+		derivedKeys, err = proof.DeriveByAssetInclusion(asset, nil)
 
 	// If the commitment proof is present, then this is actually a
 	// non-inclusion proof: we want to verify that either no root
@@ -89,7 +129,7 @@ func verifyTaprootProof(anchor *wire.MsgTx, proof *TaprootProof,
 	// present.
 	case proof.CommitmentProof != nil:
 		log.Tracef("Verifying exclusion proof for asset %v", asset.ID())
-		derivedKey, err = proof.DeriveByAssetExclusion(
+		derivedKeys, err = proof.DeriveByAssetExclusion(
 			asset.AssetCommitmentKey(),
 			asset.TapCommitmentKey(),
 		)
@@ -98,18 +138,29 @@ func verifyTaprootProof(anchor *wire.MsgTx, proof *TaprootProof,
 	// output DOES NOT contain any sort of Taproot Asset commitment.
 	case proof.TapscriptProof != nil:
 		log.Tracef("Verifying tapscript proof")
+		var derivedKey *btcec.PublicKey
 		derivedKey, err = proof.DeriveByTapscriptProof()
+
+		// The derived key must match the expected taproot key.
+		if derivedKey.IsEqual(expectedTaprootKey) {
+			return nil, nil
+		}
 	}
 	if err != nil {
 		return nil, err
 	}
 
-	// The derive key should match the extracted key.
-	if derivedKey.IsEqual(expectedTaprootKey) {
-		return tapCommitment, nil
+	// One of the derived keys should match the expected key.
+	expectedKey := schnorr.SerializePubKey(expectedTaprootKey)
+	for derivedKey, derivedCommitment := range derivedKeys {
+		if bytes.Equal(expectedKey, derivedKey.SchnorrSerialized()) {
+			return derivedCommitment, nil
+		}
 	}
 
-	return nil, commitment.ErrInvalidTaprootProof
+	return nil, fmt.Errorf("%w: derived_keys=%s, expected_key=%x",
+		commitment.ErrInvalidTaprootProof,
+		spew.Sdump(maps.Keys(derivedKeys)), expectedKey)
 }
 
 // verifyInclusionProof verifies the InclusionProof is valid.
@@ -130,7 +181,9 @@ func (p *Proof) verifySplitRootProof() error {
 }
 
 // verifyExclusionProofs verifies all ExclusionProofs are valid.
-func (p *Proof) verifyExclusionProofs() error {
+func (p *Proof) verifyExclusionProofs() (*commitment.TapCommitmentVersion,
+	error) {
+
 	// Gather all P2TR outputs in the on-chain transaction.
 	p2trOutputs := make(map[uint32]struct{})
 	for i, txOut := range p.AnchorTx.TxOut {
@@ -143,30 +196,63 @@ func (p *Proof) verifyExclusionProofs() error {
 	}
 
 	// Verify all of the encoded exclusion proofs.
+	commitVersions := make(map[uint32]commitment.TapCommitmentVersion)
 	for _, exclusionProof := range p.ExclusionProofs {
 		exclusionProof := exclusionProof
-		_, err := verifyTaprootProof(
+		derivedCommitment, err := verifyTaprootProof(
 			&p.AnchorTx, &exclusionProof, &p.Asset, false,
 		)
 		if err != nil {
-			return err
+			return nil, err
 		}
-		delete(p2trOutputs, exclusionProof.OutputIndex)
+
+		outputIdx := exclusionProof.OutputIndex
+		delete(p2trOutputs, outputIdx)
+
+		// Store the commitment version. If there was no Taproot Asset
+		// commitment present, then there is nothing to store.
+		if derivedCommitment != nil {
+			commitVersions[outputIdx] = derivedCommitment.Version
+		}
 	}
 
 	// If any outputs are missing a proof, fail.
 	if len(p2trOutputs) > 0 {
-		return ErrMissingExclusionProofs
+		return nil, ErrMissingExclusionProofs
 	}
-	return nil
+
+	// If there were no commitments in any exclusion proofs, then there is
+	// no version to return.
+	if len(commitVersions) == 0 {
+		return nil, nil
+	}
+
+	// All ExclusionProofs must have similar versions.
+	firstCommitVersion := maps.Values(commitVersions)[0]
+	for outputIdx, commitVersion := range commitVersions {
+		outputCommitVersion := commitVersion
+		if !commitment.IsSimilarTapCommitmentVersion(
+			&firstCommitVersion, &outputCommitVersion,
+		) {
+
+			log.Tracef("output %d commit version %d, first output "+
+				"commit version %d", outputIdx, commitVersion,
+				firstCommitVersion)
+
+			return nil, fmt.Errorf("mixed anchor commitment " +
+				"versions for exclusion proofs")
+		}
+	}
+
+	return &firstCommitVersion, nil
 }
 
 // verifyAssetStateTransition verifies an asset's witnesses resulting from a
 // state transition. This method returns the split asset information if this
 // state transition represents an asset split.
 func (p *Proof) verifyAssetStateTransition(ctx context.Context,
-	prev *AssetSnapshot, headerVerifier HeaderVerifier,
-	groupVerifier GroupVerifier) (bool, error) {
+	prev *AssetSnapshot, chainLookup asset.ChainLookup,
+	vCtx VerifierCtx) (bool, error) {
 
 	// Determine whether we have an asset split based on the resulting
 	// asset's witness. If so, extract the root asset from the split asset.
@@ -203,16 +289,14 @@ func (p *Proof) verifyAssetStateTransition(ctx context.Context,
 	// bail out as soon as any of the active goroutines encounters an
 	// error.
 	errGroup, ctx := errgroup.WithContext(ctx)
-	errGroup.SetLimit(runtime.NumCPU())
+	errGroup.SetLimit(runtime.GOMAXPROCS(0))
 
 	var assetsMtx sync.Mutex
 	for _, inputProof := range p.AdditionalInputs {
 		inputProof := inputProof
 
 		errGroup.Go(func() error {
-			result, err := inputProof.Verify(
-				ctx, headerVerifier, groupVerifier,
-			)
+			result, err := inputProof.Verify(ctx, vCtx)
 			if err != nil {
 				return err
 			}
@@ -240,7 +324,12 @@ func (p *Proof) verifyAssetStateTransition(ctx context.Context,
 	if splitAsset != nil {
 		splitAssets = append(splitAssets, splitAsset)
 	}
-	engine, err := vm.New(newAsset, splitAssets, prevAssets)
+
+	verifyOpts := []vm.NewEngineOpt{
+		vm.WithChainLookup(chainLookup),
+		vm.WithBlockHeight(p.BlockHeight),
+	}
+	engine, err := vm.New(newAsset, splitAssets, prevAssets, verifyOpts...)
 	if err != nil {
 		return false, err
 	}
@@ -250,31 +339,78 @@ func (p *Proof) verifyAssetStateTransition(ctx context.Context,
 // verifyChallengeWitness verifies the challenge witness by constructing a
 // well-defined 1-in-1-out packet and verifying the witness is valid for that
 // virtual transaction.
-func (p *Proof) verifyChallengeWitness() (bool, error) {
+func (p *Proof) verifyChallengeWitness(_ context.Context,
+	chainLookup asset.ChainLookup,
+	challengeBytes fn.Option[[32]byte]) (bool, error) {
+
 	// The challenge witness packet always has one input and one output,
 	// independent of how the asset was created. The chain params are only
 	// needed when encoding/decoding a vPkt, so it doesn't matter what
 	// network we choose as we only need the packet to get the witness.
-	vPkt := tappsbt.OwnershipProofPacket(
-		p.Asset.Copy(), &address.MainNetTap,
+	ownedAsset := p.Asset.Copy()
+	prevId, proofAsset := CreateOwnershipProofAsset(
+		ownedAsset, challengeBytes,
 	)
-	vIn := vPkt.Inputs[0]
-	vOut := vPkt.Outputs[0]
 
 	// The 1-in-1-out packet for the challenge witness is well-defined, we
 	// don't have to do any extra checks, just set the witness and then
 	// validate it.
-	vOut.Asset.PrevWitnesses[0].TxWitness = p.ChallengeWitness
+	proofAsset.PrevWitnesses[0].TxWitness = p.ChallengeWitness
 
 	prevAssets := commitment.InputSet{
-		vIn.PrevID: vIn.Asset(),
+		prevId: ownedAsset,
 	}
-	engine, err := vm.New(vOut.Asset, nil, prevAssets)
+
+	verifyOpts := vm.WithChainLookup(chainLookup)
+	engine, err := vm.New(proofAsset, nil, prevAssets, verifyOpts)
 	if err != nil {
 		return false, err
 	}
 
 	return p.Asset.HasSplitCommitmentWitness(), engine.Execute()
+}
+
+// CreateOwnershipProofAsset creates a virtual asset that can be used to prove
+// ownership of an asset. The virtual asset is created by spending the full
+// asset into a NUMS key. If a challenge is defined, the NUMS key will be
+// modified based on that value.
+func CreateOwnershipProofAsset(ownedAsset *asset.Asset,
+	challengeBytes fn.Option[[32]byte]) (asset.PrevID, *asset.Asset) {
+
+	// We create the ownership proof by creating a virtual input and output
+	// that spends the full asset into a NUMS key. But in order to prevent
+	// that witness to be used in an actual state transition by a malicious
+	// actor, we create the signature over an empty outpoint. This means the
+	// witness is fully valid, but a full transition proof can never be
+	// created, as the previous outpoint would not match the one that
+	// actually goes on chain.
+	//
+	// TODO(guggero): Revisit this proof once we support pocket universes.
+	emptyOutPoint := wire.OutPoint{}
+	prevId := asset.PrevID{
+		ID:       ownedAsset.ID(),
+		OutPoint: emptyOutPoint,
+		ScriptKey: asset.ToSerialized(
+			ownedAsset.ScriptKey.PubKey,
+		),
+	}
+
+	// The ownership proof needs to be a 1-in-1-out transaction. So it will
+	// definitely not have a split commitment. Keeping the split commitment
+	// of the copied owned asset would lead to an issue with the
+	// non-inflation check we have in the VM that takes the split commitment
+	// root sum as the expected total output amount. We also clear any time
+	// locks, as they don't apply to the ownership proof.
+	//
+	// This is handled by CopySpendTemplate.
+	outputAsset := ownedAsset.CopySpendTemplate()
+
+	outputAsset.ScriptKey = asset.GenChallengeNUMS(challengeBytes)
+	outputAsset.PrevWitnesses = []asset.Witness{{
+		PrevID: &prevId,
+	}}
+
+	return prevId, outputAsset
 }
 
 // verifyGenesisReveal checks that the genesis reveal present in the proof at
@@ -328,7 +464,7 @@ func (p *Proof) verifyGenesisGroupKey(groupVerifier GroupVerifier) error {
 	groupKey := p.Asset.GroupKey.GroupPubKey
 	err := groupVerifier(&groupKey)
 	if err != nil {
-		return fmt.Errorf("%w: %v", ErrGroupKeyUnknown, err)
+		return fmt.Errorf("%w: %s", ErrGroupKeyUnknown, err.Error())
 	}
 
 	return nil
@@ -357,6 +493,24 @@ func (p *Proof) verifyGroupKeyReveal() error {
 // block header is invalid (usually: not present on chain).
 type HeaderVerifier func(blockHeader wire.BlockHeader, blockHeight uint32) error
 
+// MerkleVerifier is a callback function which returns an error if the given
+// merkle proof is invalid.
+type MerkleVerifier func(tx *wire.MsgTx, proof *TxMerkleProof,
+	merkleRoot [32]byte) error
+
+// DefaultMerkleVerifier is a default implementation of the MerkleVerifier
+// callback function. It verifies the merkle proof by checking that the
+// transaction hash is included in the merkle tree with the given merkle root.
+func DefaultMerkleVerifier(tx *wire.MsgTx, proof *TxMerkleProof,
+	merkleRoot [32]byte) error {
+
+	if !proof.Verify(tx, merkleRoot) {
+		return ErrInvalidTxMerkleProof
+	}
+
+	return nil
+}
+
 // GroupVerifier is a callback function which returns an error if the given
 // group key has not been imported by the tapd daemon. This can occur if the
 // issuance proof for the group anchor has not been imported or synced.
@@ -367,6 +521,29 @@ type GroupVerifier func(groupKey *btcec.PublicKey) error
 // should return an error for any reissuance into an existing group.
 type GroupAnchorVerifier func(gen *asset.Genesis,
 	groupKey *asset.GroupKey) error
+
+// ProofVerificationOption is an option that may be applied on
+// *proofVerificationOpts.
+type ProofVerificationOption func(p *proofVerificationParams)
+
+// proofVerificationParams is a struct containing various options that may be
+// used during proof verification
+type proofVerificationParams struct {
+	// ChallengeBytes is an optional field that is used when verifying an
+	// ownership proof. This field is only populated when the corresponding
+	// ProofVerificationOption option is defined.
+	ChallengeBytes fn.Option[[32]byte]
+}
+
+// WithChallengeBytes is a ProofVerificationOption that defines some challenge
+// bytes to be used when verifying this proof.
+func WithChallengeBytes(challenge [32]byte) ProofVerificationOption {
+	return func(p *proofVerificationParams) {
+		var byteCopy [32]byte
+		copy(byteCopy[:], challenge[:])
+		p.ChallengeBytes = fn.Some(byteCopy)
+	}
+}
 
 // Verify verifies the proof by ensuring that:
 //
@@ -380,8 +557,14 @@ type GroupAnchorVerifier func(gen *asset.Genesis,
 //  5. A set of asset inputs with valid witnesses are included that satisfy the
 //     resulting state transition.
 func (p *Proof) Verify(ctx context.Context, prev *AssetSnapshot,
-	headerVerifier HeaderVerifier,
-	groupVerifier GroupVerifier) (*AssetSnapshot, error) {
+	chainLookup asset.ChainLookup, vCtx VerifierCtx,
+	opts ...ProofVerificationOption) (*AssetSnapshot, error) {
+
+	var verificationParams proofVerificationParams
+
+	for _, opt := range opts {
+		opt(&verificationParams)
+	}
 
 	// 0. Check only for the proof version.
 	if p.IsUnknownVersion() {
@@ -394,51 +577,62 @@ func (p *Proof) Verify(ctx context.Context, prev *AssetSnapshot,
 			"%w", err)
 	}
 
+	assetPoint := AssetPoint{
+		OutPoint:  p.OutPoint(),
+		ID:        p.Asset.ID(),
+		ScriptKey: asset.ToSerialized(p.Asset.ScriptKey.PubKey),
+	}
+
+	// Before we do any other validation, we'll check to see if we can halt
+	// validation here, as the proof is already known to be invalid. This
+	// can be used as a rejection caching mechanism.
+	fail := lfn.MapOptionZ(vCtx.IgnoreChecker, func(c IgnoreChecker) bool {
+		return c.IsIgnored(assetPoint)
+	})
+	if fail {
+		return prev, fmt.Errorf("%w: asset_point=%v is ignored",
+			ErrProofInvalid, assetPoint)
+	}
+
 	// 1. A transaction that spends the previous asset output has a valid
 	// merkle proof within a block in the chain.
 	if prev != nil && p.PrevOut != prev.OutPoint {
-		return nil, commitment.ErrInvalidTaprootProof // TODO
+		return nil, fmt.Errorf("%w: prev output mismatch",
+			commitment.ErrInvalidTaprootProof)
 	}
 	if !txSpendsPrevOut(&p.AnchorTx, &p.PrevOut) {
-		return nil, commitment.ErrInvalidTaprootProof // TODO
+		return nil, fmt.Errorf("%w: doesn't spend prev output",
+			commitment.ErrInvalidTaprootProof)
 	}
 
 	// Cross-check block header with a bitcoin node.
-	err := headerVerifier(p.BlockHeader, p.BlockHeight)
+	err := vCtx.HeaderVerifier(p.BlockHeader, p.BlockHeight)
 	if err != nil {
 		return nil, fmt.Errorf("failed to validate proof block "+
 			"header: %w", err)
 	}
 
-	if !p.TxMerkleProof.Verify(&p.AnchorTx, p.BlockHeader.MerkleRoot) {
-		return nil, ErrInvalidTxMerkleProof
+	// Assert that the transaction is in the block via the merkle proof.
+	err = vCtx.MerkleVerifier(
+		&p.AnchorTx, &p.TxMerkleProof, p.BlockHeader.MerkleRoot,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("%w: failed to validate merkle proof: "+
+			"%w", err, ErrInvalidTxMerkleProof)
 	}
 
 	// TODO(jhb): check for genesis asset and populate asset fields before
 	// further verification
 
+	// The VerifyProofs method will verify the following steps:
 	// 2. A valid inclusion proof for the resulting asset is included.
-	tapCommitment, err := p.verifyInclusionProof()
-	if err != nil {
-		return nil, err
-	}
-
 	// 3. A valid inclusion proof for the split root, if the resulting asset
-	// is a split asset.
-	if p.Asset.HasSplitCommitmentWitness() {
-		if p.SplitRootProof == nil {
-			return nil, ErrMissingSplitRootProof
-		}
-
-		if err := p.verifySplitRootProof(); err != nil {
-			return nil, err
-		}
-	}
-
+	//    is a split asset.
 	// 4. A set of valid exclusion proofs for the resulting asset are
-	// included.
-	if err := p.verifyExclusionProofs(); err != nil {
-		return nil, err
+	//    included.
+	tapCommitment, err := p.VerifyProofs()
+	if err != nil {
+		return nil, fmt.Errorf("error verifying proofs: %w", err)
 	}
 
 	// 5. If this is a genesis asset, start by verifying the
@@ -477,7 +671,8 @@ func (p *Proof) Verify(ctx context.Context, prev *AssetSnapshot,
 	case isGenesisAsset && hasGroupKey && !hasGroupKeyReveal:
 		// A reissuance must be for an asset group that has already
 		// been imported and verified.
-		if err := p.verifyGenesisGroupKey(groupVerifier); err != nil {
+		err := p.verifyGenesisGroupKey(vCtx.GroupVerifier)
+		if err != nil {
 			return nil, err
 		}
 
@@ -490,7 +685,8 @@ func (p *Proof) Verify(ctx context.Context, prev *AssetSnapshot,
 	// 7. Verify group key for asset transfers. Any asset with a group key
 	// must carry a group key that has already been imported and verified.
 	if !isGenesisAsset && hasGroupKey {
-		if err := p.verifyGenesisGroupKey(groupVerifier); err != nil {
+		err := p.verifyGenesisGroupKey(vCtx.GroupVerifier)
+		if err != nil {
 			return nil, err
 		}
 	}
@@ -501,11 +697,13 @@ func (p *Proof) Verify(ctx context.Context, prev *AssetSnapshot,
 	var splitAsset bool
 	switch {
 	case prev == nil && p.ChallengeWitness != nil:
-		splitAsset, err = p.verifyChallengeWitness()
+		splitAsset, err = p.verifyChallengeWitness(
+			ctx, chainLookup, verificationParams.ChallengeBytes,
+		)
 
 	default:
 		splitAsset, err = p.verifyAssetStateTransition(
-			ctx, prev, headerVerifier, groupVerifier,
+			ctx, prev, chainLookup, vCtx,
 		)
 	}
 	if err != nil {
@@ -520,11 +718,8 @@ func (p *Proof) Verify(ctx context.Context, prev *AssetSnapshot,
 	// TODO(roasbeef): need tx index as well
 
 	return &AssetSnapshot{
-		Asset: &p.Asset,
-		OutPoint: wire.OutPoint{
-			Hash:  p.AnchorTx.TxHash(),
-			Index: p.InclusionProof.OutputIndex,
-		},
+		Asset:             &p.Asset,
+		OutPoint:          p.OutPoint(),
 		AnchorBlockHash:   p.BlockHeader.BlockHash(),
 		AnchorBlockHeight: p.BlockHeight,
 		AnchorTx:          &p.AnchorTx,
@@ -537,6 +732,53 @@ func (p *Proof) Verify(ctx context.Context, prev *AssetSnapshot,
 	}, nil
 }
 
+// VerifyProofs verifies the inclusion and exclusion proofs as well as the split
+// root proof.
+func (p *Proof) VerifyProofs() (*commitment.TapCommitment, error) {
+	// A valid inclusion proof for the resulting asset is included.
+	tapCommitment, err := p.verifyInclusionProof()
+	if err != nil {
+		return nil, fmt.Errorf("invalid inclusion proof: %w", err)
+	}
+
+	// A valid inclusion proof for the split root, if the resulting asset is
+	// a split asset.
+	if p.Asset.HasSplitCommitmentWitness() {
+		if p.SplitRootProof == nil {
+			return nil, ErrMissingSplitRootProof
+		}
+
+		if err := p.verifySplitRootProof(); err != nil {
+			return nil, err
+		}
+	}
+
+	// A set of valid exclusion proofs for the resulting asset are included.
+	exclusionCommitVersion, err := p.verifyExclusionProofs()
+	if err != nil {
+		return nil, fmt.Errorf("invalid exclusion proof: %w", err)
+	}
+
+	// If all exclusion proofs were Tapscript proofs, then no version
+	// checking is needed.
+	if exclusionCommitVersion == nil {
+		return tapCommitment, nil
+	}
+
+	// The inclusion proof must have a similar version to all exclusion
+	// proofs.
+	if !commitment.IsSimilarTapCommitmentVersion(
+		&tapCommitment.Version, exclusionCommitVersion,
+	) {
+
+		return nil, fmt.Errorf("mixed commitment versions, inclusion "+
+			"%d, exclusion %d", tapCommitment.Version,
+			*exclusionCommitVersion)
+	}
+
+	return tapCommitment, nil
+}
+
 // Verify attempts to verify a full proof file starting from the asset's
 // genesis.
 //
@@ -544,10 +786,8 @@ func (p *Proof) Verify(ctx context.Context, prev *AssetSnapshot,
 // verification loop.
 //
 // TODO(roasbeef): pass in the expected genesis point here?
-func (f *File) Verify(ctx context.Context, headerVerifier HeaderVerifier,
-	groupVerifier GroupVerifier) (
-
-	*AssetSnapshot, error) {
+func (f *File) Verify(ctx context.Context,
+	vCtx VerifierCtx) (*AssetSnapshot, error) {
 
 	select {
 	case <-ctx.Done():
@@ -560,6 +800,8 @@ func (f *File) Verify(ctx context.Context, headerVerifier HeaderVerifier,
 	if f.IsUnknownVersion() {
 		return nil, ErrUnknownVersion
 	}
+
+	chainLookup := vCtx.ChainLookupGen.GenFileChainLookup(f)
 
 	var prev *AssetSnapshot
 	for idx := range f.proofs {
@@ -575,11 +817,32 @@ func (f *File) Verify(ctx context.Context, headerVerifier HeaderVerifier,
 		}
 
 		result, err := decodedProof.Verify(
-			ctx, prev, headerVerifier, groupVerifier,
+			ctx, prev, chainLookup, vCtx,
 		)
 		if err != nil {
 			return nil, err
 		}
+
+		// At this point, we'll check to see if we can halt validation
+		// here, as the proof is already known to be invalid. This can
+		// be used as a rejection caching mechanism.
+		fail := lfn.MapOptionZ(
+			vCtx.IgnoreChecker, func(checker IgnoreChecker) bool {
+				assetPoint := AssetPoint{
+					OutPoint: result.OutPoint,
+					ID:       result.Asset.ID(),
+					ScriptKey: asset.ToSerialized(
+						result.Asset.ScriptKey.PubKey,
+					),
+				}
+
+				return checker.IsIgnored(assetPoint)
+			},
+		)
+		if fail {
+			return prev, ErrProofFileInvalid
+		}
+
 		prev = result
 	}
 

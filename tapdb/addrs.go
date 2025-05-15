@@ -20,6 +20,7 @@ import (
 	"github.com/lightninglabs/taproot-assets/asset"
 	"github.com/lightninglabs/taproot-assets/commitment"
 	"github.com/lightninglabs/taproot-assets/fn"
+	"github.com/lightninglabs/taproot-assets/proof"
 	"github.com/lightninglabs/taproot-assets/tapdb/sqlc"
 	"github.com/lightningnetwork/lnd/clock"
 	"github.com/lightningnetwork/lnd/keychain"
@@ -51,6 +52,14 @@ type (
 	// AddrEvent is a type alias for fetching an address event row.
 	AddrEvent = sqlc.FetchAddrEventRow
 
+	// FetchAddrEventByOutpoint is a type alias for the params to fetch an
+	// address event by address and outpoint.
+	FetchAddrEventByOutpoint = sqlc.FetchAddrEventByAddrKeyAndOutpointParams
+
+	// AddrEventByOutpoint is a type alias for fetching an address event
+	// row by outpoint.
+	AddrEventByOutpoint = sqlc.FetchAddrEventByAddrKeyAndOutpointRow
+
 	// AddrEventQuery is a type alias for a query into the set of known
 	// address events.
 	AddrEventQuery = sqlc.QueryEventIDsParams
@@ -64,6 +73,13 @@ type (
 
 	// ScriptKey is a type alias for fetching the script key information.
 	ScriptKey = sqlc.FetchScriptKeyByTweakedKeyRow
+
+	// KeyLocator is a type alias for fetching the key locator information
+	// for an internal key.
+	KeyLocator = sqlc.FetchInternalKeyLocatorRow
+
+	// AssetMeta is the metadata record for an asset.
+	AssetMeta = sqlc.FetchAssetMetaForAssetRow
 )
 
 // AddrBook is an interface that represents the storage backed needed to create
@@ -78,6 +94,10 @@ type AddrBook interface {
 	// GroupStore houses the methods related to fetching genesis assets and
 	// asset groups related to them.
 	GroupStore
+
+	// FetchScriptKeyStore houses the methods related to fetching all
+	// information about a script key.
+	FetchScriptKeyStore
 
 	// FetchAddrs returns all the addresses based on the constraints of the
 	// passed AddrQuery.
@@ -120,6 +140,11 @@ type AddrBook interface {
 	// key.
 	FetchAddrEvent(ctx context.Context, id int64) (AddrEvent, error)
 
+	// FetchAddrEventByAddrKeyAndOutpoint returns a single address event
+	// based on its address Taproot output key and outpoint.
+	FetchAddrEventByAddrKeyAndOutpoint(ctx context.Context,
+		arg FetchAddrEventByOutpoint) (AddrEventByOutpoint, error)
+
 	// QueryEventIDs returns a list of event IDs and their corresponding
 	// address IDs that match the given query parameters.
 	QueryEventIDs(ctx context.Context, query AddrEventQuery) ([]AddrEventID,
@@ -127,18 +152,25 @@ type AddrBook interface {
 
 	// FetchAssetProof fetches the asset proof for a given asset identified
 	// by its script key.
-	FetchAssetProof(ctx context.Context, scriptKey []byte) (AssetProofI,
-		error)
+	FetchAssetProof(ctx context.Context,
+		arg FetchAssetProof) ([]AssetProofI, error)
 
 	// FetchGenesisByAssetID attempts to fetch asset genesis information
 	// for a given asset ID.
 	FetchGenesisByAssetID(ctx context.Context,
 		assetID []byte) (sqlc.GenesisInfoView, error)
 
-	// FetchScriptKeyByTweakedKey attempts to fetch the script key and
-	// corresponding internal key from the database.
-	FetchScriptKeyByTweakedKey(ctx context.Context,
-		tweakedScriptKey []byte) (ScriptKey, error)
+	// FetchInternalKeyLocator fetches the key locator for an internal key.
+	FetchInternalKeyLocator(ctx context.Context, rawKey []byte) (KeyLocator,
+		error)
+
+	// FetchAssetMetaByHash fetches the asset meta for a given meta hash.
+	FetchAssetMetaByHash(ctx context.Context,
+		metaDataHash []byte) (sqlc.FetchAssetMetaByHashRow, error)
+
+	// FetchAssetMetaForAsset fetches the asset meta for a given asset.
+	FetchAssetMetaForAsset(ctx context.Context,
+		assetID []byte) (AssetMeta, error)
 }
 
 // AddrBookTxOptions defines the set of db txn options the AddrBook
@@ -236,6 +268,9 @@ func (t *TapAddressBook) InsertAddrs(ctx context.Context,
 				InternalKeyID:    rawScriptKeyID,
 				TweakedScriptKey: addr.ScriptKey.SerializeCompressed(),
 				Tweak:            addr.ScriptKeyTweak.Tweak,
+				KeyType: sqlInt16(
+					addr.ScriptKeyTweak.Type,
+				),
 			})
 			if err != nil {
 				return fmt.Errorf("unable to insert script "+
@@ -279,7 +314,7 @@ func (t *TapAddressBook) InsertAddrs(ctx context.Context,
 					&addr.TaprootOutputKey,
 				),
 				Amount:           int64(addr.Amount),
-				AssetType:        int16(assetGen.AssetType),
+				AssetType:        assetGen.AssetType,
 				CreationTime:     addr.CreationTime.UTC(),
 				ProofCourierAddr: proofCourierAddrBytes,
 			})
@@ -372,21 +407,12 @@ func (t *TapAddressBook) QueryAddrs(ctx context.Context,
 				}
 			}
 
-			rawScriptKey, err := btcec.ParsePubKey(
-				addr.RawScriptKey,
+			scriptKey, err := parseScriptKey(
+				addr.InternalKey, addr.ScriptKey,
 			)
 			if err != nil {
 				return fmt.Errorf("unable to decode "+
 					"script key: %w", err)
-			}
-			rawScriptKeyDesc := keychain.KeyDescriptor{
-				KeyLocator: keychain.KeyLocator{
-					Family: keychain.KeyFamily(
-						addr.ScriptKeyFamily,
-					),
-					Index: uint32(addr.ScriptKeyIndex),
-				},
-				PubKey: rawScriptKey,
 			}
 
 			internalKey, err := btcec.ParsePubKey(addr.RawTaprootKey)
@@ -402,11 +428,6 @@ func (t *TapAddressBook) QueryAddrs(ctx context.Context,
 					Index: uint32(addr.TaprootKeyIndex),
 				},
 				PubKey: internalKey,
-			}
-
-			scriptKey, err := btcec.ParsePubKey(addr.TweakedScriptKey)
-			if err != nil {
-				return err
 			}
 
 			taprootOutputKey, err := schnorr.ParsePubKey(
@@ -435,8 +456,8 @@ func (t *TapAddressBook) QueryAddrs(ctx context.Context,
 
 			tapAddr, err := address.New(
 				address.Version(addr.Version), assetGenesis,
-				groupKey, groupWitness,
-				*scriptKey, *internalKey, uint64(addr.Amount),
+				groupKey, groupWitness, *scriptKey.PubKey,
+				*internalKey, uint64(addr.Amount),
 				tapscriptSibling, t.params, *proofCourierAddr,
 				address.WithAssetVersion(
 					asset.Version(addr.AssetVersion),
@@ -447,11 +468,8 @@ func (t *TapAddressBook) QueryAddrs(ctx context.Context,
 			}
 
 			addrs = append(addrs, address.AddrWithKeyInfo{
-				Tap: tapAddr,
-				ScriptKeyTweak: asset.TweakedScriptKey{
-					RawKey: rawScriptKeyDesc,
-					Tweak:  addr.ScriptKeyTweak,
-				},
+				Tap:              tapAddr,
+				ScriptKeyTweak:   *scriptKey.TweakedScriptKey,
 				InternalKeyDesc:  internalKeyDesc,
 				TaprootOutputKey: *taprootOutputKey,
 				CreationTime:     addr.CreationTime.UTC(),
@@ -535,21 +553,7 @@ func fetchAddr(ctx context.Context, db AddrBook, params *address.ChainParams,
 		}
 	}
 
-	rawScriptKey, err := btcec.ParsePubKey(dbAddr.RawScriptKey)
-	if err != nil {
-		return nil, fmt.Errorf("unable to decode script key: %w", err)
-	}
-	scriptKeyDesc := keychain.KeyDescriptor{
-		KeyLocator: keychain.KeyLocator{
-			Family: keychain.KeyFamily(
-				dbAddr.ScriptKeyFamily,
-			),
-			Index: uint32(dbAddr.ScriptKeyIndex),
-		},
-		PubKey: rawScriptKey,
-	}
-
-	scriptKey, err := btcec.ParsePubKey(dbAddr.TweakedScriptKey)
+	scriptKey, err := parseScriptKey(dbAddr.InternalKey, dbAddr.ScriptKey)
 	if err != nil {
 		return nil, fmt.Errorf("unable to decode script key: %w", err)
 	}
@@ -586,8 +590,9 @@ func fetchAddr(ctx context.Context, db AddrBook, params *address.ChainParams,
 
 	tapAddr, err := address.New(
 		address.Version(dbAddr.Version), genesis, groupKey,
-		groupWitness, *scriptKey, *internalKey, uint64(dbAddr.Amount),
-		tapscriptSibling, params, *proofCourierAddr,
+		groupWitness, *scriptKey.PubKey, *internalKey,
+		uint64(dbAddr.Amount), tapscriptSibling, params,
+		*proofCourierAddr,
 		address.WithAssetVersion(asset.Version(dbAddr.AssetVersion)),
 	)
 	if err != nil {
@@ -595,11 +600,8 @@ func fetchAddr(ctx context.Context, db AddrBook, params *address.ChainParams,
 	}
 
 	return &address.AddrWithKeyInfo{
-		Tap: tapAddr,
-		ScriptKeyTweak: asset.TweakedScriptKey{
-			RawKey: scriptKeyDesc,
-			Tweak:  dbAddr.ScriptKeyTweak,
-		},
+		Tap:              tapAddr,
+		ScriptKeyTweak:   *scriptKey.TweakedScriptKey,
 		InternalKeyDesc:  internalKeyDesc,
 		TaprootOutputKey: *taprootOutputKey,
 		CreationTime:     dbAddr.CreationTime.UTC(),
@@ -650,7 +652,7 @@ func (t *TapAddressBook) InsertInternalKey(ctx context.Context,
 // it can be recognized as belonging to the wallet when a transfer comes in
 // later on.
 func (t *TapAddressBook) InsertScriptKey(ctx context.Context,
-	scriptKey asset.ScriptKey) error {
+	scriptKey asset.ScriptKey, keyType asset.ScriptKeyType) error {
 
 	var writeTxOpts AddrBookTxOptions
 	return t.db.ExecTx(ctx, &writeTxOpts, func(q AddrBook) error {
@@ -661,10 +663,12 @@ func (t *TapAddressBook) InsertScriptKey(ctx context.Context,
 			return fmt.Errorf("error inserting internal key: %w",
 				err)
 		}
+
 		_, err = q.UpsertScriptKey(ctx, NewScriptKey{
 			InternalKeyID:    internalKeyID,
 			TweakedScriptKey: scriptKey.PubKey.SerializeCompressed(),
 			Tweak:            scriptKey.Tweak,
+			KeyType:          sqlInt16(keyType),
 		})
 		return err
 	})
@@ -738,12 +742,14 @@ func (t *TapAddressBook) GetOrCreateEvent(ctx context.Context,
 		}
 		merkleRoot := tapCommitment.TapscriptRoot(siblingHash)
 		taprootAssetRoot := tapCommitment.TapscriptRoot(nil)
+		commitmentVersion := uint8(tapCommitment.Version)
 
 		utxoUpsert := RawManagedUTXO{
 			RawKey:           addr.InternalKey.SerializeCompressed(),
 			Outpoint:         outpointBytes,
 			AmtSats:          outputDetails.Amount,
 			TaprootAssetRoot: taprootAssetRoot[:],
+			RootVersion:      sqlInt16(commitmentVersion),
 			MerkleRoot:       merkleRoot[:],
 			TapscriptSibling: siblingBytes,
 			TxnID:            chainTxID,
@@ -778,6 +784,31 @@ func (t *TapAddressBook) GetOrCreateEvent(ctx context.Context,
 	return event, nil
 }
 
+// QueryEvent returns a single address event by its address and outpoint.
+func (t *TapAddressBook) QueryEvent(ctx context.Context,
+	addr *address.AddrWithKeyInfo, outpoint wire.OutPoint) (*address.Event,
+	error) {
+
+	var (
+		readTxOpts = NewAssetStoreReadTx()
+		event      *address.Event
+	)
+	dbErr := t.db.ExecTx(ctx, &readTxOpts, func(db AddrBook) error {
+		var err error
+		event, err = fetchEventByOutpoint(ctx, db, addr, outpoint)
+		return err
+	})
+	switch {
+	case errors.Is(dbErr, sql.ErrNoRows):
+		return nil, address.ErrNoEvent
+
+	case dbErr != nil:
+		return nil, dbErr
+	}
+
+	return event, nil
+}
+
 // QueryAddrEvents returns a list of event that match the given query
 // parameters.
 func (t *TapAddressBook) QueryAddrEvents(
@@ -785,8 +816,9 @@ func (t *TapAddressBook) QueryAddrEvents(
 	error) {
 
 	sqlQuery := AddrEventQuery{
-		StatusFrom: int16(address.StatusTransactionDetected),
-		StatusTo:   int16(address.StatusCompleted),
+		StatusFrom:   int16(address.StatusTransactionDetected),
+		StatusTo:     int16(address.StatusCompleted),
+		CreatedAfter: time.Unix(0, 0).UTC(),
 	}
 	if len(params.AddrTaprootOutputKey) > 0 {
 		sqlQuery.AddrTaprootKey = params.AddrTaprootOutputKey
@@ -796,6 +828,9 @@ func (t *TapAddressBook) QueryAddrEvents(
 	}
 	if params.StatusTo != nil {
 		sqlQuery.StatusTo = int16(*params.StatusTo)
+	}
+	if params.CreationTimeFrom != nil && !params.CreationTimeFrom.IsZero() {
+		sqlQuery.CreatedAfter = params.CreationTimeFrom.UTC()
 	}
 
 	var (
@@ -881,19 +916,89 @@ func fetchEvent(ctx context.Context, db AddrBook, eventID int64,
 	}, nil
 }
 
+// fetchEventByOutpoint fetches a single address event identified by its address
+// and outpoint.
+func fetchEventByOutpoint(ctx context.Context, db AddrBook,
+	addr *address.AddrWithKeyInfo, outpoint wire.OutPoint) (*address.Event,
+	error) {
+
+	dbEvent, err := db.FetchAddrEventByAddrKeyAndOutpoint(
+		ctx, FetchAddrEventByOutpoint{
+			TaprootOutputKey: schnorr.SerializePubKey(
+				&addr.TaprootOutputKey,
+			),
+			Txid:                outpoint.Hash[:],
+			ChainTxnOutputIndex: int32(outpoint.Index),
+		},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("error fetching addr event: %w", err)
+	}
+
+	internalKey, err := btcec.ParsePubKey(dbEvent.InternalKey)
+	if err != nil {
+		return nil, fmt.Errorf("error parsing internal key: %w", err)
+	}
+
+	hash, err := chainhash.NewHash(dbEvent.Txid)
+	if err != nil {
+		return nil, fmt.Errorf("error parsing txid: %w", err)
+	}
+	op := wire.OutPoint{
+		Hash:  *hash,
+		Index: uint32(dbEvent.OutputIndex),
+	}
+
+	return &address.Event{
+		ID:                 dbEvent.ID,
+		CreationTime:       dbEvent.CreationTime.UTC(),
+		Addr:               addr,
+		Status:             address.Status(dbEvent.Status),
+		Outpoint:           op,
+		Amt:                btcutil.Amount(dbEvent.AmtSats.Int64),
+		InternalKey:        internalKey,
+		ConfirmationHeight: uint32(dbEvent.ConfirmationHeight.Int32),
+		HasProof:           dbEvent.AssetProofID.Valid,
+	}, nil
+}
+
 // CompleteEvent updates an address event as being complete and links it with
 // the proof and asset that was imported/created for it.
 func (t *TapAddressBook) CompleteEvent(ctx context.Context,
 	event *address.Event, status address.Status,
 	anchorPoint wire.OutPoint) error {
 
-	scriptKeyBytes := event.Addr.ScriptKey.SerializeCompressed()
+	outpoint, err := encodeOutpoint(anchorPoint)
+	if err != nil {
+		return fmt.Errorf("unable to encode outpoint: %w", err)
+	}
+
+	args := FetchAssetProof{
+		TweakedScriptKey: event.Addr.ScriptKey.SerializeCompressed(),
+		Outpoint:         outpoint,
+	}
 
 	var writeTxOpts AddrBookTxOptions
 	return t.db.ExecTx(ctx, &writeTxOpts, func(db AddrBook) error {
-		proofData, err := db.FetchAssetProof(ctx, scriptKeyBytes)
+		proofData, err := db.FetchAssetProof(ctx, args)
 		if err != nil {
 			return fmt.Errorf("error fetching asset proof: %w", err)
+		}
+
+		switch {
+		// We have no proof for this script key and outpoint.
+		case len(proofData) == 0:
+			return fmt.Errorf("proof for script key %x and "+
+				"outpoint %v not found: %w",
+				args.TweakedScriptKey, anchorPoint,
+				proof.ErrProofNotFound)
+
+		// Something is quite wrong if we have multiple proofs for the
+		// same script key and outpoint.
+		case len(proofData) > 1:
+			return fmt.Errorf("expected exactly one proof, got "+
+				"%d: %w", len(proofData),
+				proof.ErrMultipleProofs)
 		}
 
 		_, err = db.UpsertAddrEvent(ctx, UpsertAddrEvent{
@@ -903,8 +1008,8 @@ func (t *TapAddressBook) CompleteEvent(ctx context.Context,
 			Status:              int16(status),
 			Txid:                anchorPoint.Hash[:],
 			ChainTxnOutputIndex: int32(anchorPoint.Index),
-			AssetProofID:        sqlInt64(proofData.ProofID),
-			AssetID:             sqlInt64(proofData.AssetID),
+			AssetProofID:        sqlInt64(proofData[0].ProofID),
+			AssetID:             sqlInt64(proofData[0].AssetID),
 		})
 		return err
 	})
@@ -955,9 +1060,10 @@ func (t *TapAddressBook) QueryAssetGroup(ctx context.Context,
 		}
 
 		assetGroup.GroupKey, err = parseGroupKeyInfo(
-			groupInfo.TweakedGroupKey, groupInfo.RawKey,
-			groupInfo.WitnessStack, groupInfo.TapscriptRoot,
-			groupInfo.KeyFamily, groupInfo.KeyIndex,
+			groupInfo.Version, groupInfo.TweakedGroupKey,
+			groupInfo.RawKey, groupInfo.WitnessStack,
+			groupInfo.TapscriptRoot, groupInfo.KeyFamily,
+			groupInfo.KeyIndex, groupInfo.CustomSubtreeRoot,
 		)
 
 		return err
@@ -973,8 +1079,80 @@ func (t *TapAddressBook) QueryAssetGroup(ctx context.Context,
 	return &assetGroup, nil
 }
 
+// FetchAssetMetaByHash attempts to fetch an asset meta based on an asset hash.
+func (t *TapAddressBook) FetchAssetMetaByHash(ctx context.Context,
+	metaHash [asset.MetaHashLen]byte) (*proof.MetaReveal, error) {
+
+	var assetMeta *proof.MetaReveal
+
+	readOpts := NewAssetStoreReadTx()
+	dbErr := t.db.ExecTx(ctx, &readOpts, func(q AddrBook) error {
+		dbMeta, err := q.FetchAssetMetaByHash(ctx, metaHash[:])
+		if err != nil {
+			return err
+		}
+
+		// If no record is present, we should get a sql.ErrNoRows error
+		// above.
+		metaOpt, err := parseAssetMetaReveal(dbMeta.AssetsMetum)
+		if err != nil {
+			return fmt.Errorf("unable to parse asset meta: %w", err)
+		}
+
+		metaOpt.WhenSome(func(meta proof.MetaReveal) {
+			assetMeta = &meta
+		})
+
+		return nil
+	})
+	switch {
+	case errors.Is(dbErr, sql.ErrNoRows):
+		return nil, address.ErrAssetMetaNotFound
+	case dbErr != nil:
+		return nil, dbErr
+	}
+
+	return assetMeta, nil
+}
+
+// FetchAssetMetaForAsset attempts to fetch an asset meta based on an asset ID.
+func (t *TapAddressBook) FetchAssetMetaForAsset(ctx context.Context,
+	assetID asset.ID) (*proof.MetaReveal, error) {
+
+	var assetMeta *proof.MetaReveal
+
+	readOpts := NewAssetStoreReadTx()
+	dbErr := t.db.ExecTx(ctx, &readOpts, func(q AddrBook) error {
+		dbMeta, err := q.FetchAssetMetaForAsset(ctx, assetID[:])
+		if err != nil {
+			return err
+		}
+
+		// If no record is present, we should get a sql.ErrNoRows error
+		// above.
+		metaOpt, err := parseAssetMetaReveal(dbMeta.AssetsMetum)
+		if err != nil {
+			return fmt.Errorf("unable to parse asset meta: %w", err)
+		}
+
+		metaOpt.WhenSome(func(meta proof.MetaReveal) {
+			assetMeta = &meta
+		})
+
+		return nil
+	})
+	switch {
+	case errors.Is(dbErr, sql.ErrNoRows):
+		return nil, address.ErrAssetMetaNotFound
+	case dbErr != nil:
+		return nil, dbErr
+	}
+
+	return assetMeta, nil
+}
+
 // insertFullAssetGen inserts a new asset genesis and optional asset group
-// into the database. A place holder for the asset meta inserted as well.
+// into the database. A placeholder for the asset meta inserted as well.
 func insertFullAssetGen(ctx context.Context,
 	gen *asset.Genesis, group *asset.GroupKey) func(AddrBook) error {
 
@@ -1031,46 +1209,61 @@ func (t *TapAddressBook) FetchScriptKey(ctx context.Context,
 	tweakedScriptKey *btcec.PublicKey) (*asset.TweakedScriptKey, error) {
 
 	var (
-		readOpts  = NewAddrBookReadTx()
 		scriptKey *asset.TweakedScriptKey
+		err       error
+	)
+
+	readOpts := NewAddrBookReadTx()
+	dbErr := t.db.ExecTx(ctx, &readOpts, func(db AddrBook) error {
+		scriptKey, err = fetchScriptKey(ctx, db, tweakedScriptKey)
+		return err
+	})
+
+	switch {
+	case errors.Is(dbErr, sql.ErrNoRows):
+		return nil, address.ErrScriptKeyNotFound
+
+	case dbErr != nil:
+		return nil, err
+	}
+
+	return scriptKey, nil
+}
+
+// FetchInternalKeyLocator attempts to fetch the key locator information for the
+// given raw internal key. If the key cannot be found, then
+// ErrInternalKeyNotFound is returned.
+func (t *TapAddressBook) FetchInternalKeyLocator(ctx context.Context,
+	rawKey *btcec.PublicKey) (keychain.KeyLocator, error) {
+
+	var (
+		readOpts = NewAddrBookReadTx()
+		keyLoc   keychain.KeyLocator
 	)
 	err := t.db.ExecTx(ctx, &readOpts, func(db AddrBook) error {
-		dbKey, err := db.FetchScriptKeyByTweakedKey(
-			ctx, tweakedScriptKey.SerializeCompressed(),
+		dbKey, err := db.FetchInternalKeyLocator(
+			ctx, rawKey.SerializeCompressed(),
 		)
 		if err != nil {
 			return err
 		}
 
-		rawKey, err := btcec.ParsePubKey(dbKey.RawKey)
-		if err != nil {
-			return fmt.Errorf("unable to parse raw key: %w", err)
-		}
-
-		scriptKey = &asset.TweakedScriptKey{
-			Tweak: dbKey.Tweak,
-			RawKey: keychain.KeyDescriptor{
-				PubKey: rawKey,
-				KeyLocator: keychain.KeyLocator{
-					Family: keychain.KeyFamily(
-						dbKey.KeyFamily,
-					),
-					Index: uint32(dbKey.KeyIndex),
-				},
-			},
+		keyLoc = keychain.KeyLocator{
+			Family: keychain.KeyFamily(dbKey.KeyFamily),
+			Index:  uint32(dbKey.KeyIndex),
 		}
 
 		return nil
 	})
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
-		return nil, address.ErrScriptKeyNotFound
+		return keyLoc, address.ErrInternalKeyNotFound
 
 	case err != nil:
-		return nil, err
+		return keyLoc, err
 	}
 
-	return scriptKey, nil
+	return keyLoc, nil
 }
 
 // A set of compile-time assertions to ensure that TapAddressBook meets the

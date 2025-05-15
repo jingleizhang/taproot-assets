@@ -13,6 +13,8 @@ import (
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/wire"
+	"github.com/davecgh/go-spew/spew"
+	"github.com/lightninglabs/neutrino/cache/lru"
 	"github.com/lightninglabs/taproot-assets/asset"
 	"github.com/lightninglabs/taproot-assets/commitment"
 	"github.com/lightninglabs/taproot-assets/fn"
@@ -41,9 +43,16 @@ type (
 	// script key.
 	AssetProof = sqlc.FetchAssetProofsRow
 
+	// AssetProofSize is the asset proof size for a given asset, identified
+	// by its script key.
+	AssetProofSize = sqlc.FetchAssetProofsSizesRow
+
 	// AssetProofI is identical to AssetProof but is used for the case
 	// where the proofs for a specific asset are fetched.
 	AssetProofI = sqlc.FetchAssetProofRow
+
+	// FetchAssetProof are the query parameters for fetching an asset proof.
+	FetchAssetProof = sqlc.FetchAssetProofParams
 
 	// AssetProofByIDRow is the asset proof for a given asset, identified by
 	// its asset ID.
@@ -51,7 +60,7 @@ type (
 
 	// PrevInput stores the full input information including the prev out,
 	// and also the witness information itself.
-	PrevInput = sqlc.InsertAssetWitnessParams
+	PrevInput = sqlc.UpsertAssetWitnessParams
 
 	// AssetWitness is the full prev input for an asset that also couples
 	// along the asset ID that the witness belong to.
@@ -65,6 +74,16 @@ type (
 	// set filters. This is useful to get the balance of a set of assets,
 	// or for things like coin selection.
 	QueryAssetFilters = sqlc.QueryAssetsParams
+
+	// QueryAssetBalancesByGroupFilters lets us query the asset balances for
+	// asset groups or alternatively for a selected one that matches the
+	// passed filter.
+	QueryAssetBalancesByGroupFilters = sqlc.QueryAssetBalancesByGroupParams
+
+	// QueryAssetBalancesByAssetFilters lets us query the asset balances for
+	// assets or alternatively for a selected one that matches the passed
+	// filter.
+	QueryAssetBalancesByAssetFilters = sqlc.QueryAssetBalancesByAssetParams
 
 	// UtxoQuery lets us query a managed UTXO by either the transaction it
 	// references, or the outpoint.
@@ -121,6 +140,12 @@ type (
 	// output.
 	NewTransferOutput = sqlc.InsertAssetTransferOutputParams
 
+	// OutputProofDeliveryStatus wraps the params needed to set the delivery
+	// status of a given output proof.
+	//
+	// nolint: lll
+	OutputProofDeliveryStatus = sqlc.SetTransferOutputProofDeliveryStatusParams
+
 	// NewPassiveAsset wraps the params needed to insert a new passive
 	// asset.
 	NewPassiveAsset = sqlc.InsertPassiveAssetParams
@@ -138,6 +163,24 @@ type (
 	// QueryProofTransAttemptsParams is a type alias for the params needed
 	// to query the proof transfer attempts log.
 	QueryProofTransAttemptsParams = sqlc.QueryProofTransferAttemptsParams
+
+	// TapscriptTreeRootHash is a type alias for the params needed to insert
+	// a tapscript tree root hash.
+	TapscriptTreeRootHash = sqlc.UpsertTapscriptTreeRootHashParams
+
+	// TapscriptTreeEdge is a type alias for the params needed to insert an
+	// edge that links a tapscript tree node to a root hash, and records
+	// the order of the node in the tapscript tree.
+	TapscriptTreeEdge = sqlc.UpsertTapscriptTreeEdgeParams
+
+	// TapscriptTreeNode is a type alias for a tapscript tree node returned
+	// when fetching a tapscript tree, which includes the serialized node
+	// and the node index in the tree.
+	TapscriptTreeNode = sqlc.FetchTapscriptTreeRow
+
+	// QueryBurnsFilters is a set of filters that is applied on the set of
+	// the returned burns.
+	QueryBurnsFilters = sqlc.QueryBurnsParams
 )
 
 // ActiveAssetsStore is a sub-set of the main sqlc.Querier interface that
@@ -154,14 +197,15 @@ type ActiveAssetsStore interface {
 	// QueryAssetBalancesByAsset queries the balances for assets or
 	// alternatively for a selected one that matches the passed asset ID
 	// filter.
-	QueryAssetBalancesByAsset(context.Context, []byte) ([]RawAssetBalance,
-		error)
+	QueryAssetBalancesByAsset(context.Context,
+		QueryAssetBalancesByAssetFilters) ([]RawAssetBalance, error)
 
 	// QueryAssetBalancesByGroup queries the asset balances for asset
 	// groups or alternatively for a selected one that matches the passed
 	// filter.
 	QueryAssetBalancesByGroup(context.Context,
-		[]byte) ([]RawAssetGroupBalance, error)
+		QueryAssetBalancesByGroupFilters) ([]RawAssetGroupBalance,
+		error)
 
 	// FetchGroupedAssets fetches all assets with non-nil group keys.
 	FetchGroupedAssets(context.Context) ([]RawGroupedAsset, error)
@@ -170,10 +214,14 @@ type ActiveAssetsStore interface {
 	// disk.
 	FetchAssetProofs(ctx context.Context) ([]AssetProof, error)
 
+	// FetchAssetProofsSizes fetches all the asset proofs lengths that are
+	// stored on disk.
+	FetchAssetProofsSizes(ctx context.Context) ([]AssetProofSize, error)
+
 	// FetchAssetProof fetches the asset proof for a given asset identified
 	// by its script key.
 	FetchAssetProof(ctx context.Context,
-		scriptKey []byte) (AssetProofI, error)
+		arg FetchAssetProof) ([]AssetProofI, error)
 
 	// HasAssetProof returns true if we have proof for a given asset
 	// identified by its script key.
@@ -196,14 +244,18 @@ type ActiveAssetsStore interface {
 	UpsertManagedUTXO(ctx context.Context, arg RawManagedUTXO) (int64,
 		error)
 
-	// UpsertAssetProof inserts a new or updates an existing asset proof on
-	// disk.
-	UpsertAssetProof(ctx context.Context,
-		arg sqlc.UpsertAssetProofParams) error
+	// FetchAssetID fetches the `asset_id` (primary key) from the assets
+	// table for a given asset identified by `Outpoint` and
+	// `TweakedScriptKey`.
+	FetchAssetID(ctx context.Context, arg FetchAssetID) ([]int64, error)
 
-	// InsertAssetWitness inserts a new prev input for an asset into the
+	// UpsertAssetProofByID inserts a new or updates an existing asset
+	// proof on disk.
+	UpsertAssetProofByID(ctx context.Context, arg ProofUpdateByID) error
+
+	// UpsertAssetWitness upserts a new prev input for an asset into the
 	// database.
-	InsertAssetWitness(context.Context, PrevInput) error
+	UpsertAssetWitness(context.Context, PrevInput) error
 
 	// FetchAssetWitnesses attempts to fetch either all the asset witnesses
 	// on disk (NULL param), or the witness for a given asset ID.
@@ -255,6 +307,11 @@ type ActiveAssetsStore interface {
 	InsertAssetTransferOutput(ctx context.Context,
 		arg NewTransferOutput) error
 
+	// SetTransferOutputProofDeliveryStatus sets the delivery status of a
+	// given transfer output proof.
+	SetTransferOutputProofDeliveryStatus(ctx context.Context,
+		arg OutputProofDeliveryStatus) error
+
 	// FetchTransferInputs fetches the inputs to a given asset transfer.
 	FetchTransferInputs(ctx context.Context,
 		transferID int64) ([]TransferInputRow, error)
@@ -294,22 +351,32 @@ type ActiveAssetsStore interface {
 	// the passed params.
 	ReAnchorPassiveAssets(ctx context.Context, arg ReAnchorParams) error
 
-	// FetchAssetMetaByHash fetches the asset meta for a given meta hash.
-	//
-	// TODO(roasbeef): split into MetaStore?
-	FetchAssetMetaByHash(ctx context.Context,
-		metaDataHash []byte) (sqlc.FetchAssetMetaByHashRow, error)
+	// InsertBurn inserts a new row to the asset burns table which
+	// includes all important data related to the burn.
+	InsertBurn(ctx context.Context, arg sqlc.InsertBurnParams) (int64,
+		error)
 
-	// FetchAssetMetaForAsset fetches the asset meta for a given asset.
-	FetchAssetMetaForAsset(ctx context.Context,
-		assetID []byte) (sqlc.FetchAssetMetaForAssetRow, error)
+	// QueryBurns returns all burn entries that match the passed filters.
+	QueryBurns(ctx context.Context,
+		arg sqlc.QueryBurnsParams) ([]sqlc.QueryBurnsRow, error)
+}
+
+// MetaStore is a sub-set of the main sqlc.Querier interface that contains
+// methods related to metadata of the daemon.
+type MetaStore interface {
+	// AssetsDBSizeSqlite returns the total size of the taproot assets
+	// sqlite database.
+	AssetsDBSizeSqlite(ctx context.Context) (int32, error)
+
+	// AssetsDBSizePostgres returns the total size of the taproot assets
+	// postgres database.
+	AssetsDBSizePostgres(ctx context.Context) (int64, error)
 }
 
 // AssetBalance holds a balance query result for a particular asset or all
 // assets tracked by this daemon.
 type AssetBalance struct {
 	ID           asset.ID
-	Version      int32
 	Balance      uint64
 	Tag          string
 	MetaHash     [asset.MetaHashLen]byte
@@ -325,6 +392,17 @@ type AssetGroupBalance struct {
 	Balance  uint64
 }
 
+// cacheableTimestamp is a wrapper around an int32 that can be used as a
+// value in an LRU cache.
+type cacheableBlockHeight uint32
+
+// Size returns the size of the cacheable block height. Since we scale the cache
+// by the number of items and not the total memory size, we can simply return 1
+// here to count each timestamp as 1 item.
+func (c cacheableBlockHeight) Size() (uint64, error) {
+	return 1, nil
+}
+
 // BatchedAssetStore combines the AssetStore interface with the BatchedTx
 // interface, allowing for multiple queries to be executed in a single SQL
 // transaction.
@@ -334,75 +412,47 @@ type BatchedAssetStore interface {
 	BatchedTx[ActiveAssetsStore]
 }
 
+// BatchedMetaStore combines the MetaStore interface with the BatchedTx
+// interface, allowing for multiple queries to be executed in a single SQL
+// transaction.
+type BatchedMetaStore interface {
+	MetaStore
+
+	BatchedTx[MetaStore]
+}
+
 // AssetStore is used to query for the set of pending and confirmed assets.
 type AssetStore struct {
 	db BatchedAssetStore
+
+	metaDb BatchedMetaStore
 
 	// eventDistributor is an event distributor that will be used to notify
 	// subscribers about new proofs that are added to the archiver.
 	eventDistributor *fn.EventDistributor[proof.Blob]
 
 	clock clock.Clock
+
+	txHeights *lru.Cache[chainhash.Hash, cacheableBlockHeight]
+
+	dbType sqlc.BackendType
 }
 
 // NewAssetStore creates a new AssetStore from the specified BatchedAssetStore
 // interface.
-func NewAssetStore(db BatchedAssetStore, clock clock.Clock) *AssetStore {
+func NewAssetStore(db BatchedAssetStore, metaDB BatchedMetaStore,
+	clock clock.Clock, dbType sqlc.BackendType) *AssetStore {
+
 	return &AssetStore{
 		db:               db,
+		metaDb:           metaDB,
 		eventDistributor: fn.NewEventDistributor[proof.Blob](),
 		clock:            clock,
+		txHeights: lru.NewCache[chainhash.Hash, cacheableBlockHeight](
+			10_000,
+		),
+		dbType: dbType,
 	}
-}
-
-// ChainAsset is a wrapper around the base asset struct that includes
-// information detailing where in the chain the asset is currently anchored.
-type ChainAsset struct {
-	*asset.Asset
-
-	// IsSpent indicates whether the above asset was previously spent.
-	IsSpent bool
-
-	// AnchorTx is the transaction that anchors this chain asset.
-	AnchorTx *wire.MsgTx
-
-	// AnchorBlockHash is the blockhash that mined the anchor tx.
-	AnchorBlockHash chainhash.Hash
-
-	// AnchorBlockHeight is the height of the block that mined the anchor
-	// tx.
-	AnchorBlockHeight uint32
-
-	// AnchorOutpoint is the outpoint that commits to the asset.
-	AnchorOutpoint wire.OutPoint
-
-	// AnchorInternalKey is the raw internal key that was used to create the
-	// anchor Taproot output key.
-	AnchorInternalKey *btcec.PublicKey
-
-	// AnchorMerkleRoot is the Taproot merkle root hash of the anchor output
-	// the asset was committed to. If there is no Tapscript sibling, this is
-	// equal to the Taproot Asset root commitment hash.
-	AnchorMerkleRoot []byte
-
-	// AnchorTapscriptSibling is the serialized preimage of a Tapscript
-	// sibling, if there was one. If this is empty, then the
-	// AnchorTapscriptSibling hash is equal to the Taproot root hash of the
-	// anchor output.
-	AnchorTapscriptSibling []byte
-
-	// AnchorLeaseOwner is the identity of the application that currently
-	// has a lease on this UTXO. If empty/nil, then the UTXO is not
-	// currently leased. A lease means that the UTXO is being
-	// reserved/locked to be spent in an upcoming transaction and that it
-	// should not be available for coin selection through any of the wallet
-	// RPCs.
-	AnchorLeaseOwner [32]byte
-
-	// AnchorLeaseExpiry is the expiry of the lease. If the expiry is nil or
-	// the time is in the past, then the lease is not valid and the UTXO is
-	// available for coin selection.
-	AnchorLeaseExpiry *time.Time
 }
 
 // ManagedUTXO holds information about a given UTXO we manage.
@@ -429,6 +479,14 @@ type ManagedUTXO struct {
 	// TapscriptSibling is the serialized tapscript sibling preimage of
 	// this asset. This will usually be blank.
 	TapscriptSibling []byte
+
+	// LeaseOwner is the identifier of the lease owner of this UTXO. If
+	// blank, this UTXO isn't leased.
+	LeaseOwner []byte
+
+	// LeaseExpiry is the expiry time of the lease on this UTXO. If the
+	// zero, then this UTXO isn't leased.
+	LeaseExpiry time.Time
 }
 
 // AssetHumanReadable is a subset of the base asset struct that only includes
@@ -564,25 +622,21 @@ func parseAssetWitness(input AssetWitness) (asset.Witness, error) {
 // dbAssetsToChainAssets maps a set of confirmed assets in the database, and
 // the witnesses of those assets to a set of normal ChainAsset structs needed
 // by a higher level application.
-func (a *AssetStore) dbAssetsToChainAssets(dbAssets []ConfirmedAsset,
-	witnesses assetWitnesses) ([]*ChainAsset, error) {
+func dbAssetsToChainAssets(dbAssets []ConfirmedAsset, witnesses assetWitnesses,
+	dbClock clock.Clock) ([]*asset.ChainAsset, error) {
 
-	chainAssets := make([]*ChainAsset, len(dbAssets))
+	chainAssets := make([]*asset.ChainAsset, len(dbAssets))
 	for i := range dbAssets {
 		sprout := dbAssets[i]
 
 		// First, we'll decode the script key which every asset must
 		// specify, and populate the key locator information.
-		rawScriptKeyPub, err := btcec.ParsePubKey(sprout.ScriptKeyRaw)
+		scriptKey, err := parseScriptKey(
+			sprout.InternalKey, sprout.ScriptKey,
+		)
 		if err != nil {
-			return nil, err
-		}
-		rawScriptKeyDesc := keychain.KeyDescriptor{
-			PubKey: rawScriptKeyPub,
-			KeyLocator: keychain.KeyLocator{
-				Index:  uint32(sprout.ScriptKeyIndex),
-				Family: keychain.KeyFamily(sprout.ScriptKeyFam),
-			},
+			return nil, fmt.Errorf("unable to decode script key: "+
+				"%w", err)
 		}
 
 		// Not all assets have a key group, so we only need to
@@ -607,6 +661,11 @@ func (a *AssetStore) dbAssetsToChainAssets(dbAssets []ConfirmedAsset,
 				return nil, err
 			}
 
+			var tapscriptRoot []byte
+			if len(sprout.TapscriptRoot) != 0 {
+				tapscriptRoot = sprout.TapscriptRoot
+			}
+
 			groupKey = &asset.GroupKey{
 				RawKey: keychain.KeyDescriptor{
 					PubKey: rawGroupKey,
@@ -619,8 +678,9 @@ func (a *AssetStore) dbAssetsToChainAssets(dbAssets []ConfirmedAsset,
 						),
 					},
 				},
-				GroupPubKey: *tweakedGroupKey,
-				Witness:     groupWitness,
+				GroupPubKey:   *tweakedGroupKey,
+				Witness:       groupWitness,
+				TapscriptRoot: tapscriptRoot,
 			}
 		}
 
@@ -660,18 +720,6 @@ func (a *AssetStore) dbAssetsToChainAssets(dbAssets []ConfirmedAsset,
 			amount = 1
 		}
 
-		scriptKeyPub, err := btcec.ParsePubKey(sprout.TweakedScriptKey)
-		if err != nil {
-			return nil, err
-		}
-		scriptKey := asset.ScriptKey{
-			PubKey: scriptKeyPub,
-			TweakedScriptKey: &asset.TweakedScriptKey{
-				RawKey: rawScriptKeyDesc,
-				Tweak:  sprout.ScriptKeyTweak,
-			},
-		}
-
 		assetSprout, err := asset.New(
 			assetGenesis, amount, lockTime, relativeLocktime,
 			scriptKey, groupKey,
@@ -679,13 +727,15 @@ func (a *AssetStore) dbAssetsToChainAssets(dbAssets []ConfirmedAsset,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("unable to create new sprout: "+
-				"%v", err)
+				"%w", err)
 		}
 
 		// We cannot use 0 as the amount when creating a new asset with
 		// the New function above. But if this is a tombstone asset, we
 		// actually have to set the amount to 0.
-		if scriptKeyPub.IsEqual(asset.NUMSPubKey) && sprout.Amount == 0 {
+		if scriptKey.PubKey.IsEqual(asset.NUMSPubKey) &&
+			sprout.Amount == 0 {
+
 			assetSprout.Amount = 0
 		}
 
@@ -758,12 +808,15 @@ func (a *AssetStore) dbAssetsToChainAssets(dbAssets []ConfirmedAsset,
 				"internal key: %w", err)
 		}
 
-		chainAssets[i] = &ChainAsset{
-			Asset:                  assetSprout,
-			IsSpent:                sprout.Spent,
-			AnchorTx:               anchorTx,
-			AnchorBlockHash:        anchorBlockHash,
-			AnchorOutpoint:         anchorOutpoint,
+		chainAssets[i] = &asset.ChainAsset{
+			Asset:           assetSprout,
+			IsSpent:         sprout.Spent,
+			AnchorTx:        anchorTx,
+			AnchorBlockHash: anchorBlockHash,
+			AnchorOutpoint:  anchorOutpoint,
+			AnchorBlockHeight: uint32(
+				sprout.AnchorBlockHeight.Int32,
+			),
 			AnchorInternalKey:      anchorInternalKey,
 			AnchorMerkleRoot:       sprout.AnchorMerkleRoot,
 			AnchorTapscriptSibling: sprout.AnchorTapscriptSibling,
@@ -774,7 +827,7 @@ func (a *AssetStore) dbAssetsToChainAssets(dbAssets []ConfirmedAsset,
 		owner := sprout.AnchorLeaseOwner
 		expiry := sprout.AnchorLeaseExpiry
 		if len(owner) > 0 && expiry.Valid &&
-			expiry.Time.UTC().After(a.clock.Now().UTC()) {
+			expiry.Time.UTC().After(dbClock.Now().UTC()) {
 
 			copy(chainAssets[i].AnchorLeaseOwner[:], owner)
 			chainAssets[i].AnchorLeaseExpiry = &expiry.Time
@@ -787,7 +840,7 @@ func (a *AssetStore) dbAssetsToChainAssets(dbAssets []ConfirmedAsset,
 // constraintsToDbFilter maps application level constraints to the set of
 // filters we use in the SQL queries.
 func (a *AssetStore) constraintsToDbFilter(
-	query *AssetQueryFilters) QueryAssetFilters {
+	query *AssetQueryFilters) (QueryAssetFilters, error) {
 
 	assetFilter := QueryAssetFilters{
 		Now: sql.NullTime{
@@ -797,29 +850,59 @@ func (a *AssetStore) constraintsToDbFilter(
 	}
 	if query != nil {
 		if query.MinAmt != 0 {
-			assetFilter.MinAmt = sql.NullInt64{
-				Int64: int64(query.MinAmt),
-				Valid: true,
-			}
+			assetFilter.MinAmt = sqlInt64(query.MinAmt)
 		}
+
+		if query.MaxAmt != 0 {
+			assetFilter.MaxAmt = sqlInt64(query.MaxAmt)
+		}
+
 		if query.MinAnchorHeight != 0 {
 			assetFilter.MinAnchorHeight = sqlInt32(
 				query.MinAnchorHeight,
 			)
 		}
-		if query.AssetID != nil {
-			assetID := query.AssetID[:]
-			assetFilter.AssetIDFilter = assetID
+
+		if query.ScriptKey != nil {
+			key := query.ScriptKey.PubKey
+			assetFilter.TweakedScriptKey = key.SerializeCompressed()
 		}
-		if query.GroupKey != nil {
-			groupKey := query.GroupKey.SerializeCompressed()
-			assetFilter.KeyGroupFilter = groupKey
+
+		if query.AnchorPoint != nil {
+			anchorPointBytes, err := encodeOutpoint(
+				*query.AnchorPoint,
+			)
+			if err != nil {
+				return QueryAssetFilters{}, fmt.Errorf(
+					"unable to encode outpoint: %w", err)
+			}
+
+			assetFilter.AnchorPoint = anchorPointBytes
 		}
-		// TODO(roasbeef): only want to allow asset ID or other and not
-		// both?
+
+		// Add asset ID bytes and group key bytes to the filter. These
+		// byte arrays are empty if the asset ID or group key is not
+		// specified in the query.
+		assetIDBytes, groupKeyBytes := query.AssetSpecifier.AsBytes()
+		assetFilter.AssetIDFilter = assetIDBytes
+		assetFilter.KeyGroupFilter = groupKeyBytes
+
+		// If we query by group key, we don't also include the asset ID,
+		// otherwise we'd only get assets from that specific tranche.
+		if query.DistinctSpecifier &&
+			len(assetFilter.KeyGroupFilter) > 0 {
+
+			assetFilter.AssetIDFilter = nil
+		}
+
+		// The fn.None option means we don't restrict on script key type
+		// at all.
+		query.ScriptKeyType.WhenSome(func(t asset.ScriptKeyType) {
+			assetFilter.ScriptKeyType = sqlInt16(t)
+		})
 	}
 
-	return assetFilter
+	return assetFilter, nil
 }
 
 // specificAssetFilter maps the given asset parameters to the set of filters
@@ -891,23 +974,67 @@ type AssetQueryFilters struct {
 	// MinAnchorHeight is the minimum block height the asset's anchor tx
 	// must have been confirmed at.
 	MinAnchorHeight int32
+
+	// ScriptKey allows filtering by asset script key.
+	ScriptKey *asset.ScriptKey
+
+	// AnchorPoint allows filtering by the outpoint the asset is anchored
+	// to.
+	AnchorPoint *wire.OutPoint
 }
 
 // QueryBalancesByAsset queries the balances for assets or alternatively
 // for a selected one that matches the passed asset ID filter.
 func (a *AssetStore) QueryBalancesByAsset(ctx context.Context,
-	assetID *asset.ID) (map[asset.ID]AssetBalance, error) {
+	assetID *asset.ID, includeLeased bool,
+	skt fn.Option[asset.ScriptKeyType]) (map[asset.ID]AssetBalance, error) {
 
-	var assetFilter []byte
+	// We'll now map the application level filtering to the type of
+	// filtering our database query understands.
+	assetBalancesFilter := QueryAssetBalancesByAssetFilters{
+		Now: sql.NullTime{
+			Time:  a.clock.Now().UTC(),
+			Valid: true,
+		},
+	}
+
+	// We exclude the assets that are specifically used for funding custom
+	// channels. The balance of those assets is reported through lnd channel
+	// balance. Those assets are identified by the specific script key type
+	// for channel keys. We exclude them unless explicitly queried for.
+	assetBalancesFilter.ExcludeScriptKeyType = sqlInt16(
+		asset.ScriptKeyScriptPathChannel,
+	)
+
+	// The fn.None option means we don't restrict on script key type at all.
+	skt.WhenSome(func(t asset.ScriptKeyType) {
+		assetBalancesFilter.ScriptKeyType = sqlInt16(t)
+
+		// If the user explicitly wants to see the channel related asset
+		// balances, we need to set the exclude type to NULL.
+		if t == asset.ScriptKeyScriptPathChannel {
+			nullValue := sql.NullInt16{}
+			assetBalancesFilter.ExcludeScriptKeyType = nullValue
+		}
+	})
+
+	// By default, we only show assets that are not leased.
+	if !includeLeased {
+		assetBalancesFilter.Leased = sqlBool(false)
+	}
+
+	// Only show assets that match the filter that has been passed
 	if assetID != nil {
-		assetFilter = assetID[:]
+		assetBalancesFilter.AssetIDFilter = assetID[:]
 	}
 
 	balances := make(map[asset.ID]AssetBalance)
 
 	readOpts := NewAssetStoreReadTx()
 	dbErr := a.db.ExecTx(ctx, &readOpts, func(q ActiveAssetsStore) error {
-		dbBalances, err := q.QueryAssetBalancesByAsset(ctx, assetFilter)
+		dbBalances, err := q.QueryAssetBalancesByAsset(
+			ctx, assetBalancesFilter,
+		)
 		if err != nil {
 			return fmt.Errorf("unable to query asset "+
 				"balances by asset: %w", err)
@@ -918,7 +1045,6 @@ func (a *AssetStore) QueryBalancesByAsset(ctx context.Context,
 			copy(assetID[:], assetBalance.AssetID[:])
 
 			assetIDBalance := AssetBalance{
-				Version:     assetBalance.Version,
 				Balance:     uint64(assetBalance.Balance),
 				Tag:         assetBalance.AssetTag,
 				Type:        asset.Type(assetBalance.AssetType),
@@ -951,20 +1077,57 @@ func (a *AssetStore) QueryBalancesByAsset(ctx context.Context,
 // QueryAssetBalancesByGroup queries the asset balances for asset groups or
 // alternatively for a selected one that matches the passed filter.
 func (a *AssetStore) QueryAssetBalancesByGroup(ctx context.Context,
-	groupKey *btcec.PublicKey) (map[asset.SerializedKey]AssetGroupBalance,
-	error) {
+	groupKey *btcec.PublicKey, includeLeased bool,
+	skt fn.Option[asset.ScriptKeyType]) (
+	map[asset.SerializedKey]AssetGroupBalance, error) {
 
-	var groupFilter []byte
+	// We'll now map the application level filtering to the type of
+	// filtering our database query understands.
+	assetBalancesFilter := QueryAssetBalancesByGroupFilters{
+		Now: sql.NullTime{
+			Time:  a.clock.Now().UTC(),
+			Valid: true,
+		},
+	}
+
+	// We exclude the assets that are specifically used for funding custom
+	// channels. The balance of those assets is reported through lnd channel
+	// balance. Those assets are identified by the specific script key type
+	// for channel keys. We exclude them unless explicitly queried for.
+	assetBalancesFilter.ExcludeScriptKeyType = sqlInt16(
+		asset.ScriptKeyScriptPathChannel,
+	)
+
+	// The fn.None option means we don't restrict on script key type at all.
+	skt.WhenSome(func(t asset.ScriptKeyType) {
+		assetBalancesFilter.ScriptKeyType = sqlInt16(t)
+
+		// If the user explicitly wants to see the channel related asset
+		// balances, we need to set the exclude type to NULL.
+		if t == asset.ScriptKeyScriptPathChannel {
+			nullValue := sql.NullInt16{}
+			assetBalancesFilter.ExcludeScriptKeyType = nullValue
+		}
+	})
+
+	// By default, we only show assets that are not leased.
+	if !includeLeased {
+		assetBalancesFilter.Leased = sqlBool(false)
+	}
+
+	// Only show specific group if a groupKey has been passed.
 	if groupKey != nil {
 		groupKeySerialized := groupKey.SerializeCompressed()
-		groupFilter = groupKeySerialized[:]
+		assetBalancesFilter.KeyGroupFilter = groupKeySerialized[:]
 	}
 
 	balances := make(map[asset.SerializedKey]AssetGroupBalance)
 
 	readOpts := NewAssetStoreReadTx()
 	dbErr := a.db.ExecTx(ctx, &readOpts, func(q ActiveAssetsStore) error {
-		dbBalances, err := q.QueryAssetBalancesByGroup(ctx, groupFilter)
+		dbBalances, err := q.QueryAssetBalancesByGroup(
+			ctx, assetBalancesFilter,
+		)
 		if err != nil {
 			return fmt.Errorf("unable to query asset "+
 				"balances by asset: %w", err)
@@ -1048,7 +1211,8 @@ func (a *AssetStore) FetchGroupedAssets(ctx context.Context) (
 
 // FetchAllAssets fetches the set of confirmed assets stored on disk.
 func (a *AssetStore) FetchAllAssets(ctx context.Context, includeSpent,
-	includeLeased bool, query *AssetQueryFilters) ([]*ChainAsset, error) {
+	includeLeased bool, query *AssetQueryFilters) ([]*asset.ChainAsset,
+	error) {
 
 	var (
 		dbAssets       []ConfirmedAsset
@@ -1058,7 +1222,10 @@ func (a *AssetStore) FetchAllAssets(ctx context.Context, includeSpent,
 
 	// We'll now map the application level filtering to the type of
 	// filtering our database query understands.
-	assetFilter := a.constraintsToDbFilter(query)
+	assetFilter, err := a.constraintsToDbFilter(query)
+	if err != nil {
+		return nil, err
+	}
 
 	// By default, the spent boolean is null, which means we'll fetch all
 	// assets. Only if we should exclude spent assets, we'll set the spent
@@ -1086,7 +1253,7 @@ func (a *AssetStore) FetchAllAssets(ctx context.Context, includeSpent,
 		return nil, dbErr
 	}
 
-	return a.dbAssetsToChainAssets(dbAssets, assetWitnesses)
+	return dbAssetsToChainAssets(dbAssets, assetWitnesses, a.clock)
 }
 
 // FetchManagedUTXOs fetches all UTXOs we manage.
@@ -1122,7 +1289,7 @@ func (a *AssetStore) FetchManagedUTXOs(ctx context.Context) (
 			return nil, err
 		}
 
-		managedUtxos[i] = &ManagedUTXO{
+		utxo := &ManagedUTXO{
 			OutPoint:    anchorPoint,
 			OutputValue: btcutil.Amount(u.AmtSats),
 			InternalKey: keychain.KeyDescriptor{
@@ -1137,10 +1304,48 @@ func (a *AssetStore) FetchManagedUTXOs(ctx context.Context) (
 			TaprootAssetRoot: u.TaprootAssetRoot,
 			MerkleRoot:       u.MerkleRoot,
 			TapscriptSibling: u.TapscriptSibling,
+			LeaseOwner:       u.LeaseOwner,
 		}
+		if u.LeaseExpiry.Valid {
+			utxo.LeaseExpiry = u.LeaseExpiry.Time
+		}
+
+		managedUtxos[i] = utxo
 	}
 
 	return managedUtxos, nil
+}
+
+// FetchAssetProofsSizes fetches the sizes of the proofs in the db.
+func (a *AssetStore) FetchAssetProofsSizes(
+	ctx context.Context) ([]AssetProofSize, error) {
+
+	var pSizes []AssetProofSize
+
+	readOpts := NewAssetStoreReadTx()
+	dbErr := a.db.ExecTx(ctx, &readOpts, func(q ActiveAssetsStore) error {
+		proofSizes, err := q.FetchAssetProofsSizes(ctx)
+		if err != nil {
+			return err
+		}
+
+		for _, v := range proofSizes {
+			pSizes = append(
+				pSizes, AssetProofSize{
+					ScriptKey:       v.ScriptKey,
+					ProofFileLength: v.ProofFileLength,
+				},
+			)
+		}
+
+		return nil
+	})
+
+	if dbErr != nil {
+		return nil, dbErr
+	}
+
+	return pSizes, nil
 }
 
 // FetchAssetProofs returns the latest proof file for either the set of target
@@ -1149,7 +1354,7 @@ func (a *AssetStore) FetchManagedUTXOs(ctx context.Context) (
 // TODO(roasbeef): potentially have a version that writes thru a reader
 // instead?
 func (a *AssetStore) FetchAssetProofs(ctx context.Context,
-	targetAssets ...*btcec.PublicKey) (proof.AssetBlobs, error) {
+	targetAssets ...proof.Locator) (proof.AssetBlobs, error) {
 
 	proofs := make(proof.AssetBlobs)
 
@@ -1182,19 +1387,33 @@ func (a *AssetStore) FetchAssetProofs(ctx context.Context,
 		// TODO(roasbeef): can modify the query to use IN somewhere
 		// instead? then would take input params and insert into
 		// virtual rows to use
-		for _, scriptKey := range targetAssets {
-			scriptKey := scriptKey
-			serializedKey := asset.ToSerialized(scriptKey)
+		for ind := range targetAssets {
+			locator := targetAssets[ind]
+			args, err := locatorToProofQuery(locator)
+			if err != nil {
+				return err
+			}
 
-			assetProof, err := q.FetchAssetProof(
-				ctx, serializedKey[:],
-			)
+			assetProofs, err := q.FetchAssetProof(ctx, args)
 			if err != nil {
 				return fmt.Errorf("unable to fetch asset "+
 					"proof: %w", err)
 			}
 
-			proofs[serializedKey] = assetProof.ProofFile
+			switch {
+			// We have no proof for this script key.
+			case len(assetProofs) == 0:
+				return proof.ErrProofNotFound
+
+			// Something went wrong, presumably because the outpoint
+			// was not specified in the locator, and we got multiple
+			// proofs.
+			case len(assetProofs) > 1:
+				return proof.ErrMultipleProofs
+			}
+
+			serializedKey := asset.ToSerialized(&locator.ScriptKey)
+			proofs[serializedKey] = assetProofs[0].ProofFile
 		}
 		return nil
 	})
@@ -1208,29 +1427,27 @@ func (a *AssetStore) FetchAssetProofs(ctx context.Context,
 // FetchProof fetches a proof for an asset uniquely identified by the passed
 // ProofIdentifier.
 //
+// If a proof cannot be found, then ErrProofNotFound should be returned. If
+// multiple proofs exist for the given fields of the locator then
+// ErrMultipleProofs is returned to indicate more specific fields need to be set
+// in the Locator (e.g. the OutPoint).
+//
 // NOTE: This implements the proof.Archiver interface.
 func (a *AssetStore) FetchProof(ctx context.Context,
 	locator proof.Locator) (proof.Blob, error) {
 
-	// We don't need anything else but the script key since we have an
-	// on-disk index for all proofs we store.
-	scriptKey := locator.ScriptKey
+	args, err := locatorToProofQuery(locator)
+	if err != nil {
+		return nil, err
+	}
 
 	var diskProof proof.Blob
 
 	readOpts := NewAssetStoreReadTx()
 	dbErr := a.db.ExecTx(ctx, &readOpts, func(q ActiveAssetsStore) error {
-		assetProof, err := q.FetchAssetProof(
-			ctx, scriptKey.SerializeCompressed(),
-		)
-		if err != nil {
-			return fmt.Errorf("unable to fetch asset "+
-				"proof: %w", err)
-		}
-
-		diskProof = assetProof.ProofFile
-
-		return nil
+		var err error
+		diskProof, err = fetchProof(ctx, q, args)
+		return err
 	})
 	switch {
 	case errors.Is(dbErr, sql.ErrNoRows):
@@ -1240,6 +1457,74 @@ func (a *AssetStore) FetchProof(ctx context.Context,
 	}
 
 	return diskProof, nil
+}
+
+// fetchProof is a wrapper around the FetchAssetProof query that enforces that
+// a proof is only returned if exactly one matching proof was found.
+func fetchProof(ctx context.Context, q ActiveAssetsStore,
+	args sqlc.FetchAssetProofParams) (proof.Blob, error) {
+
+	assetProofs, err := q.FetchAssetProof(ctx, args)
+	if err != nil {
+		return nil, fmt.Errorf("unable to fetch asset proof: %w", err)
+	}
+
+	switch {
+	// We have no proof for this script key.
+	case len(assetProofs) == 0:
+		return nil, proof.ErrProofNotFound
+
+	// If the query without the outpoint returns exactly one proof
+	// then we're fine. If there actually are multiple proofs, we
+	// require the user to specify the outpoint as well.
+	case len(assetProofs) == 1:
+		return assetProofs[0].ProofFile, nil
+
+	// User needs to specify the outpoint as well, since we have
+	// multiple proofs for this script key.
+	default:
+		return nil, proof.ErrMultipleProofs
+	}
+}
+
+// locatorToProofQuery turns a proof locator into a FetchAssetProof query
+// struct.
+func locatorToProofQuery(locator proof.Locator) (FetchAssetProof, error) {
+	// We have an on-disk index for all proofs we store, so we can use the
+	// script key as the primary identifier.
+	args := FetchAssetProof{
+		TweakedScriptKey: locator.ScriptKey.SerializeCompressed(),
+	}
+
+	// But script keys aren't unique, so if the locator explicitly specifies
+	// an outpoint, we'll use that as well.
+	if locator.OutPoint != nil {
+		outpoint, err := encodeOutpoint(*locator.OutPoint)
+		if err != nil {
+			return args, fmt.Errorf("unable to encode outpoint: %w",
+				err)
+		}
+
+		args.Outpoint = outpoint
+	}
+
+	if locator.AssetID != nil {
+		args.AssetID = locator.AssetID[:]
+	}
+
+	return args, nil
+}
+
+// FetchIssuanceProof fetches the issuance proof for an asset, given the
+// anchor point of the issuance (NOT the genesis point for the asset). For the
+// AssetStore, we leave this unimplemented as we will only use this feature from
+// the FileArchiver.
+//
+// NOTE: This implements the proof.Archiver interface.
+func (a *AssetStore) FetchIssuanceProof(_ context.Context, _ asset.ID,
+	_ wire.OutPoint) (proof.Blob, error) {
+
+	return nil, proof.ErrProofNotFound
 }
 
 // HasProof returns true if the proof for the given locator exists. This is
@@ -1304,10 +1589,26 @@ func (a *AssetStore) FetchProofs(ctx context.Context,
 						"script key: %w", err)
 				}
 
+				f := proof.File{}
+				err = f.Decode(bytes.NewReader(dbRow.ProofFile))
+				if err != nil {
+					return nil, fmt.Errorf("error "+
+						"decoding proof file: %w", err)
+				}
+
+				lastProof, err := f.LastProof()
+				if err != nil {
+					return nil, fmt.Errorf("error "+
+						"decoding last proof: %w", err)
+				}
+
 				return &proof.AnnotatedProof{
 					Locator: proof.Locator{
 						AssetID:   &id,
 						ScriptKey: *scriptKey,
+						OutPoint: fn.Ptr(
+							lastProof.OutPoint(),
+						),
 					},
 					Blob: dbRow.ProofFile,
 				}, nil
@@ -1331,8 +1632,6 @@ func (a *AssetStore) FetchProofs(ctx context.Context,
 
 // insertAssetWitnesses attempts to insert the set of asset witnesses in to the
 // database, referencing the passed asset primary key.
-//
-// TODO(ffranr): Change insert function into an upsert.
 func (a *AssetStore) insertAssetWitnesses(ctx context.Context,
 	db ActiveAssetsStore, assetID int64, inputs []asset.Witness) error {
 
@@ -1375,16 +1674,17 @@ func (a *AssetStore) insertAssetWitnesses(ctx context.Context,
 			copy(splitCommitmentProof, b.Bytes())
 		}
 
-		err = db.InsertAssetWitness(ctx, PrevInput{
+		err = db.UpsertAssetWitness(ctx, PrevInput{
 			AssetID:              assetID,
 			PrevOutPoint:         prevOutpoint,
 			PrevAssetID:          prevID.ID[:],
 			PrevScriptKey:        prevID.ScriptKey.CopyBytes(),
 			WitnessStack:         witnessStack,
 			SplitCommitmentProof: splitCommitmentProof,
+			WitnessIndex:         int32(idx),
 		})
 		if err != nil {
-			return fmt.Errorf("unable to insert witness: %v", err)
+			return fmt.Errorf("unable to insert witness: %w", err)
 		}
 	}
 
@@ -1457,6 +1757,7 @@ func (a *AssetStore) importAssetFromProof(ctx context.Context,
 		Outpoint:         anchorPoint,
 		AmtSats:          anchorOutput.Value,
 		TaprootAssetRoot: taprootAssetRoot[:],
+		RootVersion:      sqlInt16(uint8(proof.ScriptRoot.Version)),
 		MerkleRoot:       merkleRoot[:],
 		TapscriptSibling: siblingBytes,
 		TxnID:            chainTXID,
@@ -1495,12 +1796,11 @@ func (a *AssetStore) importAssetFromProof(ctx context.Context,
 		return fmt.Errorf("unable to insert asset witness: %w", err)
 	}
 
-	// As a final step, we'll insert the proof file we used to generate all
-	// the above information.
-	scriptKeyBytes := newAsset.ScriptKey.PubKey.SerializeCompressed()
-	return db.UpsertAssetProof(ctx, ProofUpdate{
-		TweakedScriptKey: scriptKeyBytes,
-		ProofFile:        proof.Blob,
+	// Upload proof by the dbAssetId, which is the _primary key_ of the
+	// asset in table assets, not the BIPS concept of `asset_id`.
+	return db.UpsertAssetProofByID(ctx, ProofUpdateByID{
+		AssetID:   assetIDs[0],
+		ProofFile: proof.Blob,
 	})
 }
 
@@ -1532,12 +1832,41 @@ func (a *AssetStore) upsertAssetProof(ctx context.Context,
 		return fmt.Errorf("unable to insert chain tx: %w", err)
 	}
 
+	outpointBytes, err := encodeOutpoint(wire.OutPoint{
+		Hash:  anchorTXID,
+		Index: proof.OutputIndex,
+	})
+	if err != nil {
+		return err
+	}
+
 	// As a final step, we'll insert the proof file we used to generate all
 	// the above information.
 	scriptKeyBytes := proof.Asset.ScriptKey.PubKey.SerializeCompressed()
-	return db.UpsertAssetProof(ctx, ProofUpdate{
+
+	// We need to fetch the table primary key `asset_id` first, as we need
+	// it to update the proof. We could do this in one query, this gave
+	// issues with a postgresql backend. See:
+	// https://github.com/lightninglabs/taproot-assets/issues/951
+	dbAssetIds, err := db.FetchAssetID(ctx, FetchAssetID{
 		TweakedScriptKey: scriptKeyBytes,
-		ProofFile:        proof.Blob,
+		Outpoint:         outpointBytes,
+	})
+	if err != nil {
+		return err
+	}
+
+	// We should not have more than one `asset_id`.
+	if len(dbAssetIds) > 1 {
+		return fmt.Errorf("expected 1 asset id, found %d with asset "+
+			"ids %v", len(dbAssetIds), dbAssetIds)
+	}
+
+	// Upload proof by the dbAssetId, which is the _primary key_ of the
+	// asset in table assets, not the BIPS concept of `asset_id`.
+	return db.UpsertAssetProofByID(ctx, ProofUpdateByID{
+		AssetID:   dbAssetIds[0],
+		ProofFile: proof.Blob,
 	})
 }
 
@@ -1546,11 +1875,11 @@ func (a *AssetStore) upsertAssetProof(ctx context.Context,
 // The final resting place of the asset will be used as the script key itself.
 //
 // NOTE: This implements the proof.ArchiveBackend interface.
-func (a *AssetStore) ImportProofs(ctx context.Context,
-	headerVerifier proof.HeaderVerifier, groupVerifier proof.GroupVerifier,
+func (a *AssetStore) ImportProofs(ctx context.Context, _ proof.VerifierCtx,
 	replace bool, proofs ...*proof.AnnotatedProof) error {
 
 	var writeTxOpts AssetStoreTxOptions
+
 	err := a.db.ExecTx(ctx, &writeTxOpts, func(q ActiveAssetsStore) error {
 		for _, p := range proofs {
 			if replace {
@@ -1628,7 +1957,7 @@ func (a *AssetStore) RemoveSubscriber(
 // queryChainAssets queries the database for assets matching the passed filter.
 // The returned assets have all anchor and witness information populated.
 func (a *AssetStore) queryChainAssets(ctx context.Context, q ActiveAssetsStore,
-	filter QueryAssetFilters) ([]*ChainAsset, error) {
+	filter QueryAssetFilters) ([]*asset.ChainAsset, error) {
 
 	dbAssets, assetWitnesses, err := fetchAssetsWithWitness(
 		ctx, q, filter,
@@ -1636,7 +1965,9 @@ func (a *AssetStore) queryChainAssets(ctx context.Context, q ActiveAssetsStore,
 	if err != nil {
 		return nil, err
 	}
-	matchingAssets, err := a.dbAssetsToChainAssets(dbAssets, assetWitnesses)
+	matchingAssets, err := dbAssetsToChainAssets(
+		dbAssets, assetWitnesses, a.clock,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -1697,15 +2028,64 @@ func (a *AssetStore) ListEligibleCoins(ctx context.Context,
 
 	// First, we'll map the commitment constraints to our database query
 	// filters.
-	assetFilter := a.constraintsToDbFilter(&AssetQueryFilters{
+	assetFilter, err := a.constraintsToDbFilter(&AssetQueryFilters{
 		CommitmentConstraints: constraints,
 	})
+	if err != nil {
+		return nil, err
+	}
 
 	// We only want to select unspent and non-leased commitments.
 	assetFilter.Spent = sqlBool(false)
 	assetFilter.Leased = sqlBool(false)
 
-	return a.queryCommitments(ctx, assetFilter)
+	// We also only want to select confirmed commitments (freshly minted
+	// unconfirmed assets would otherwise be included). Unconfirmed assets
+	// have a block height of 0, so we set the minimum block height to 1.
+	assetFilter.MinAnchorHeight = sqlInt32(1)
+
+	selectedCommitments, err := a.queryCommitments(ctx, assetFilter)
+	if err != nil {
+		return nil, fmt.Errorf("unable to query commitments: %w", err)
+	}
+
+	// If we want to restrict on specific inputs, we do the filtering now.
+	if len(constraints.PrevIDs) > 0 {
+		selectedCommitments = filterCommitmentsByPrevIDs(
+			selectedCommitments, constraints.PrevIDs,
+		)
+
+		// If this results in an empty list, we return the same error we
+		// would if there were no coins found without the filter.
+		if len(selectedCommitments) == 0 {
+			return nil, tapfreighter.ErrMatchingAssetsNotFound
+		}
+	}
+
+	return selectedCommitments, nil
+}
+
+// filterCommitmentsByPrevIDs filters the given commitments by the previous IDs
+// given.
+func filterCommitmentsByPrevIDs(commitments []*tapfreighter.AnchoredCommitment,
+	prevIDs []asset.PrevID) []*tapfreighter.AnchoredCommitment {
+
+	prevIDMatches := func(p asset.PrevID,
+		c *tapfreighter.AnchoredCommitment) bool {
+
+		return p.OutPoint == c.AnchorPoint && p.ID == c.Asset.ID() &&
+			p.ScriptKey == asset.ToSerialized(
+				c.Asset.ScriptKey.PubKey,
+			)
+	}
+
+	commitmentInList := func(c *tapfreighter.AnchoredCommitment) bool {
+		return fn.Any(prevIDs, func(p asset.PrevID) bool {
+			return prevIDMatches(p, c)
+		})
+	}
+
+	return fn.Filter(commitments, commitmentInList)
 }
 
 // LeaseCoins leases/locks/reserves coins for the given lease owner until the
@@ -1791,9 +2171,15 @@ func (a *AssetStore) queryCommitments(ctx context.Context,
 	error) {
 
 	var (
-		matchingAssets      []*ChainAsset
-		chainAnchorToAssets = make(map[wire.OutPoint][]*ChainAsset)
-		anchorPoints        = make(map[wire.OutPoint]AnchorPoint)
+		matchingAssets      []*asset.ChainAsset
+		chainAnchorToAssets = make(
+			map[wire.OutPoint][]*asset.ChainAsset,
+		)
+		anchorPoints    = make(map[wire.OutPoint]AnchorPoint)
+		anchorAltLeaves = make(
+			map[wire.OutPoint][]asset.AltLeaf[asset.Asset],
+		)
+		matchingAssetProofs = make(map[wire.OutPoint]proof.Blob)
 		err                 error
 	)
 
@@ -1854,12 +2240,48 @@ func (a *AssetStore) queryCommitments(ctx context.Context,
 			}
 
 			anchorPoints[anchorPoint] = anchorUTXO
+
+			// TODO(jhb): replace full proof fetch with
+			// outpoint -> alt leaf table / index
+			// We also need to fetch the input proof here, in order
+			// to fetch any committed alt leaves.
+			assetLoc := proof.Locator{
+				AssetID:   fn.Ptr(matchingAsset.ID()),
+				ScriptKey: *matchingAsset.ScriptKey.PubKey,
+				OutPoint:  &matchingAsset.AnchorOutpoint,
+			}
+			proofArgs, err := locatorToProofQuery(assetLoc)
+			if err != nil {
+				return err
+			}
+
+			var assetProof proof.Blob
+			assetProof, err = fetchProof(ctx, q, proofArgs)
+			switch {
+			case errors.Is(err, sql.ErrNoRows):
+				return proof.ErrProofNotFound
+			case err != nil:
+				return err
+			}
+
+			matchingAssetProofs[anchorPoint] = assetProof
 		}
 
 		return nil
 	})
 	if dbErr != nil {
 		return nil, dbErr
+	}
+
+	for anchorPoint, rawProof := range matchingAssetProofs {
+		lastProof, err := rawProof.AsSingleProof()
+		if err != nil {
+			return nil, err
+		}
+
+		anchorAltLeaves[anchorPoint] = append(
+			anchorAltLeaves[anchorPoint], lastProof.AltLeaves...,
+		)
 	}
 
 	// Our final query wants the complete Taproot Asset commitment for each
@@ -1870,19 +2292,58 @@ func (a *AssetStore) queryCommitments(ctx context.Context,
 		map[wire.OutPoint]*commitment.TapCommitment,
 	)
 	for anchorPoint := range chainAnchorToAssets {
-		anchorPoint := anchorPoint
+		anchorUTXO := anchorPoints[anchorPoint]
 		anchoredAssets := chainAnchorToAssets[anchorPoint]
+		anchoredAltLeaves := anchorAltLeaves[anchorPoint]
 
 		// Fetch the asset leaves from each chain asset, and then
 		// build a Taproot Asset commitment from this set of assets.
-		fetchAsset := func(cAsset *ChainAsset) *asset.Asset {
+		fetchAsset := func(cAsset *asset.ChainAsset) *asset.Asset {
 			return cAsset.Asset
 		}
 
+		// Fetch the tap commitment version used for the anchor.
+		var commitmentVersion *commitment.TapCommitmentVersion
+		if anchorUTXO.RootVersion.Valid {
+			dbVersion := extractSqlInt16[uint8](
+				anchorUTXO.RootVersion,
+			)
+			commitmentVersion = fn.Ptr(
+				commitment.TapCommitmentVersion(dbVersion),
+			)
+		}
+
 		assets := fn.Map(anchoredAssets, fetchAsset)
-		tapCommitment, err := commitment.FromAssets(assets...)
+		tapCommitment, err := commitment.FromAssets(
+			commitmentVersion, assets...,
+		)
 		if err != nil {
 			return nil, err
+		}
+
+		// The reconstructed commitment must be trimmed to match the
+		// on-chain commitment root in the case of a split send.
+		tapCommitment, err = commitment.TrimSplitWitnesses(
+			commitmentVersion, tapCommitment,
+		)
+		if err != nil {
+			return nil, err
+		}
+
+		// The reconstructed commitment must also include any alt leaves
+		// included in the original commitment.
+		err = tapCommitment.MergeAltLeaves(anchoredAltLeaves)
+		if err != nil {
+			return nil, err
+		}
+
+		// Verify that the constructed Taproot Asset commitment matches
+		// the commitment root stored in the managed UTXO.
+		commitmentRoot := tapCommitment.TapscriptRoot(nil)
+		anchorCommitmentRoot := anchorUTXO.TaprootAssetRoot
+		if !bytes.Equal(anchorCommitmentRoot, commitmentRoot[:]) {
+			return nil, fmt.Errorf("mismatch of managed utxo and " +
+				"constructed tap commitment root")
 		}
 
 		anchorPointToCommitment[anchorPoint] = tapCommitment
@@ -1906,11 +2367,21 @@ func (a *AssetStore) queryCommitments(ctx context.Context,
 			return nil, err
 		}
 
-		tapscriptSibling, _, err := commitment.MaybeDecodeTapscriptPreimage(
-			anchorUTXO.TapscriptSibling,
-		)
+		tapscriptSibling, siblingHash, err := commitment.
+			MaybeDecodeTapscriptPreimage(
+				anchorUTXO.TapscriptSibling,
+			)
 		if err != nil {
 			return nil, err
+		}
+
+		// Verify that the tapscript sibling and commitment root match
+		// the merkle root in the managed UTXO.
+		tapCommitment := anchorPointToCommitment[anchorPoint]
+		merkleRoot := tapCommitment.TapscriptRoot(siblingHash)
+		if !bytes.Equal(anchorUTXO.MerkleRoot, merkleRoot[:]) {
+			return nil, fmt.Errorf("mismatch of managed utxo and " +
+				"constructed merkle root")
 		}
 
 		selectedAssets[i] = &tapfreighter.AnchoredCommitment{
@@ -1974,6 +2445,7 @@ func (a *AssetStore) LogPendingParcel(ctx context.Context,
 			HeightHint:       int32(spend.AnchorTxHeightHint),
 			AnchorTxid:       newAnchorTXID[:],
 			TransferTimeUnix: spend.TransferTime,
+			Label:            sqlStr(spend.Label),
 		})
 		if err != nil {
 			return fmt.Errorf("unable to insert asset transfer: "+
@@ -1992,11 +2464,27 @@ func (a *AssetStore) LogPendingParcel(ctx context.Context,
 			}
 		}
 
+		// Then the passive assets.
+		if len(spend.PassiveAssets) > 0 {
+			if spend.PassiveAssetsAnchor == nil {
+				return fmt.Errorf("passive assets anchor is " +
+					"required")
+			}
+
+			err = insertPassiveAssets(
+				ctx, q, transferID, txnID,
+				spend.PassiveAssetsAnchor, spend.PassiveAssets,
+			)
+			if err != nil {
+				return fmt.Errorf("unable to insert passive "+
+					"assets: %w", err)
+			}
+		}
+
 		// And then finally the outputs.
 		for idx := range spend.Outputs {
 			err = insertAssetTransferOutput(
 				ctx, q, transferID, txnID, spend.Outputs[idx],
-				spend.PassiveAssets,
 			)
 			if err != nil {
 				return fmt.Errorf("unable to insert asset "+
@@ -2081,11 +2569,71 @@ func fetchAssetTransferInputs(ctx context.Context, q ActiveAssetsStore,
 	return inputs, nil
 }
 
+// insertPassiveAssets creates the database entries for the passive assets. The
+// main difference between an active and passive asset on the database level is
+// that we do not create a new asset entry for the passive assets. Instead, we
+// simply re-anchor the existing asset entry to the new anchor point.
+func insertPassiveAssets(ctx context.Context, q ActiveAssetsStore,
+	transferID, txnID int64, anchor *tapfreighter.Anchor,
+	passiveAssets []*tappsbt.VPacket) error {
+
+	anchorPointBytes, err := encodeOutpoint(anchor.OutPoint)
+	if err != nil {
+		return err
+	}
+
+	internalKeyBytes := anchor.InternalKey.PubKey.SerializeCompressed()
+
+	// First, we'll insert the new internal on disk, so we can reference it
+	// later when we go to apply the new transfer.
+	_, err = q.UpsertInternalKey(ctx, InternalKey{
+		RawKey:    internalKeyBytes,
+		KeyFamily: int32(anchor.InternalKey.Family),
+		KeyIndex:  int32(anchor.InternalKey.Index),
+	})
+	if err != nil {
+		return fmt.Errorf("unable to upsert internal key: %w", err)
+	}
+
+	rootVersion := sql.NullInt16{}
+	if anchor.CommitmentVersion != nil {
+		rootVersion = sqlInt16(*anchor.CommitmentVersion)
+	}
+
+	// Now that the chain transaction has been inserted, we can now insert
+	// a _new_ managed UTXO which houses the information related to the new
+	// anchor point of the transaction.
+	newUtxoID, err := q.UpsertManagedUTXO(ctx, RawManagedUTXO{
+		RawKey:           internalKeyBytes,
+		Outpoint:         anchorPointBytes,
+		AmtSats:          int64(anchor.Value),
+		TaprootAssetRoot: anchor.TaprootAssetRoot,
+		RootVersion:      rootVersion,
+		MerkleRoot:       anchor.MerkleRoot,
+		TapscriptSibling: anchor.TapscriptSibling,
+		TxnID:            txnID,
+	})
+	if err != nil {
+		return fmt.Errorf("unable to insert new managed utxo: %w", err)
+	}
+
+	// And now that we know the ID of that new anchor TX, we can
+	// store the passive assets, referencing that new UTXO.
+	err = logPendingPassiveAssets(
+		ctx, q, transferID, newUtxoID, passiveAssets,
+	)
+	if err != nil {
+		return fmt.Errorf("unable to log passive assets: %w",
+			err)
+	}
+
+	return nil
+}
+
 // insertAssetTransferOutput inserts a new asset transfer output into the DB
 // and returns its ID.
 func insertAssetTransferOutput(ctx context.Context, q ActiveAssetsStore,
-	transferID, txnID int64, output tapfreighter.TransferOutput,
-	passiveAssets []*tapfreighter.PassiveAssetReAnchor) error {
+	transferID, txnID int64, output tapfreighter.TransferOutput) error {
 
 	anchor := output.Anchor
 	anchorPointBytes, err := encodeOutpoint(anchor.OutPoint)
@@ -2106,6 +2654,11 @@ func insertAssetTransferOutput(ctx context.Context, q ActiveAssetsStore,
 		return fmt.Errorf("unable to upsert internal key: %w", err)
 	}
 
+	rootVersion := sql.NullInt16{}
+	if anchor.CommitmentVersion != nil {
+		rootVersion = sqlInt16(*anchor.CommitmentVersion)
+	}
+
 	// Now that the chain transaction has been inserted, we can now insert
 	// a _new_ managed UTXO which houses the information related to the new
 	// anchor point of the transaction.
@@ -2114,25 +2667,13 @@ func insertAssetTransferOutput(ctx context.Context, q ActiveAssetsStore,
 		Outpoint:         anchorPointBytes,
 		AmtSats:          int64(anchor.Value),
 		TaprootAssetRoot: anchor.TaprootAssetRoot,
+		RootVersion:      rootVersion,
 		MerkleRoot:       anchor.MerkleRoot,
 		TapscriptSibling: anchor.TapscriptSibling,
 		TxnID:            txnID,
 	})
 	if err != nil {
 		return fmt.Errorf("unable to insert new managed utxo: %w", err)
-	}
-
-	// Is this the output that will be used to re-anchor the passive asset?
-	if output.Anchor.NumPassiveAssets > 0 {
-		// And now that we know the ID of that new anchor TX, we can
-		// store the passive assets, referencing that new UTXO.
-		err = logPendingPassiveAssets(
-			ctx, q, transferID, newUtxoID, passiveAssets,
-		)
-		if err != nil {
-			return fmt.Errorf("unable to log passive assets: %w",
-				err)
-		}
 	}
 
 	var (
@@ -2150,10 +2691,14 @@ func insertAssetTransferOutput(ctx context.Context, q ActiveAssetsStore,
 	scriptInternalKey := keychain.KeyDescriptor{
 		PubKey: output.ScriptKey.PubKey,
 	}
-	var tweak []byte
+	var (
+		tweak         []byte
+		scriptKeyType sql.NullInt16
+	)
 	if output.ScriptKey.TweakedScriptKey != nil {
 		scriptInternalKey = output.ScriptKey.RawKey
 		tweak = output.ScriptKey.Tweak
+		scriptKeyType = sqlInt16(output.ScriptKey.Type)
 	}
 	scriptInternalKeyID, err := q.UpsertInternalKey(ctx, InternalKey{
 		RawKey:    scriptInternalKey.PubKey.SerializeCompressed(),
@@ -2168,23 +2713,45 @@ func insertAssetTransferOutput(ctx context.Context, q ActiveAssetsStore,
 		InternalKeyID:    scriptInternalKeyID,
 		TweakedScriptKey: output.ScriptKey.PubKey.SerializeCompressed(),
 		Tweak:            tweak,
+		KeyType:          scriptKeyType,
 	})
 	if err != nil {
 		return fmt.Errorf("unable to insert script key: %w", err)
 	}
 
+	// Marshal the proof delivery complete field to a nullable boolean.
+	var proofDeliveryComplete sql.NullBool
+	output.ProofDeliveryComplete.WhenSome(func(deliveryComplete bool) {
+		proofDeliveryComplete = sql.NullBool{
+			Bool:  deliveryComplete,
+			Valid: true,
+		}
+	})
+
+	// Check if position value can be stored in a 32-bit integer. Type cast
+	// if possible, otherwise return an error.
+	if output.Position > math.MaxInt32 {
+		return fmt.Errorf("position value %d is too large for db "+
+			"storage", output.Position)
+	}
+	position := int32(output.Position)
+
 	dbOutput := NewTransferOutput{
-		TransferID:          transferID,
-		AnchorUtxo:          newUtxoID,
-		ScriptKey:           scriptKeyID,
-		ScriptKeyLocal:      output.ScriptKeyLocal,
-		Amount:              int64(output.Amount),
-		AssetVersion:        int32(output.AssetVersion),
-		SerializedWitnesses: witnessBuf.Bytes(),
-		ProofSuffix:         output.ProofSuffix,
-		NumPassiveAssets:    int32(output.Anchor.NumPassiveAssets),
-		OutputType:          int16(output.Type),
-		ProofCourierAddr:    output.ProofCourierAddr,
+		TransferID:            transferID,
+		AnchorUtxo:            newUtxoID,
+		ScriptKey:             scriptKeyID,
+		ScriptKeyLocal:        output.ScriptKeyLocal,
+		Amount:                int64(output.Amount),
+		LockTime:              sqlInt32(output.LockTime),
+		RelativeLockTime:      sqlInt32(output.RelativeLockTime),
+		AssetVersion:          int32(output.AssetVersion),
+		SerializedWitnesses:   witnessBuf.Bytes(),
+		ProofSuffix:           output.ProofSuffix,
+		NumPassiveAssets:      int32(output.Anchor.NumPassiveAssets),
+		OutputType:            int16(output.Type),
+		ProofCourierAddr:      output.ProofCourierAddr,
+		ProofDeliveryComplete: proofDeliveryComplete,
+		Position:              position,
 	}
 
 	// There might not have been a split, so we can't rely on the split root
@@ -2229,27 +2796,12 @@ func fetchAssetTransferOutputs(ctx context.Context, q ActiveAssetsStore,
 				"key: %w", err)
 		}
 
-		scriptKey, err := btcec.ParsePubKey(dbOut.ScriptKeyBytes)
+		scriptKey, err := parseScriptKey(
+			dbOut.InternalKey, dbOut.ScriptKey,
+		)
 		if err != nil {
 			return nil, fmt.Errorf("unable to decode script key: "+
 				"%w", err)
-		}
-
-		rawScriptKey, err := btcec.ParsePubKey(
-			dbOut.ScriptKeyRawKeyBytes,
-		)
-		if err != nil {
-			return nil, fmt.Errorf("unable to decode raw script "+
-				"key: %w", err)
-		}
-
-		scriptKeyLocator := keychain.KeyLocator{
-			Family: keychain.KeyFamily(
-				dbOut.ScriptKeyFamily,
-			),
-			Index: uint32(
-				dbOut.ScriptKeyIndex,
-			),
 		}
 
 		var splitRootHash mssmt.NodeHash
@@ -2266,50 +2818,69 @@ func fetchAssetTransferOutputs(ctx context.Context, q ActiveAssetsStore,
 				err)
 		}
 
+		outputAnchor := tapfreighter.Anchor{
+			Value: btcutil.Amount(
+				dbOut.AnchorValue,
+			),
+			InternalKey: keychain.KeyDescriptor{
+				PubKey: internalKey,
+				KeyLocator: keychain.KeyLocator{
+					Family: keychain.KeyFamily(
+						dbOut.InternalKeyFamily,
+					),
+					Index: uint32(
+						dbOut.InternalKeyIndex,
+					),
+				},
+			},
+			TaprootAssetRoot: dbOut.AnchorTaprootAssetRoot,
+			MerkleRoot:       dbOut.AnchorMerkleRoot,
+			TapscriptSibling: dbOut.AnchorTapscriptSibling,
+			NumPassiveAssets: uint32(
+				dbOut.NumPassiveAssets,
+			),
+		}
+		if dbOut.AnchorCommitmentVersion.Valid {
+			dbRootVersion := extractSqlInt16[uint8](
+				dbOut.AnchorCommitmentVersion,
+			)
+			outputAnchor.CommitmentVersion = fn.Ptr(dbRootVersion)
+		}
+
+		// Parse the proof deliver complete flag from the database.
+		var proofDeliveryComplete fn.Option[bool]
+		if dbOut.ProofDeliveryComplete.Valid {
+			proofDeliveryComplete = fn.Some(
+				dbOut.ProofDeliveryComplete.Bool,
+			)
+		}
+
+		vOutputType := tappsbt.VOutputType(dbOut.OutputType)
+
+		// Ensure the position value is valid.
+		if dbOut.Position < 0 {
+			return nil, fmt.Errorf("invalid position value in "+
+				"db: %d", dbOut.Position)
+		}
+
 		outputs[idx] = tapfreighter.TransferOutput{
-			Anchor: tapfreighter.Anchor{
-				Value: btcutil.Amount(
-					dbOut.AnchorValue,
-				),
-				InternalKey: keychain.KeyDescriptor{
-					PubKey: internalKey,
-					KeyLocator: keychain.KeyLocator{
-						Family: keychain.KeyFamily(
-							dbOut.InternalKeyFamily,
-						),
-						Index: uint32(
-							dbOut.InternalKeyIndex,
-						),
-					},
-				},
-				TaprootAssetRoot: dbOut.AnchorTaprootAssetRoot,
-				MerkleRoot:       dbOut.AnchorMerkleRoot,
-				TapscriptSibling: dbOut.AnchorTapscriptSibling,
-				NumPassiveAssets: uint32(
-					dbOut.NumPassiveAssets,
-				),
-			},
-			Amount:       uint64(dbOut.Amount),
-			AssetVersion: asset.Version(dbOut.AssetVersion),
-			ScriptKey: asset.ScriptKey{
-				PubKey: scriptKey,
-				TweakedScriptKey: &asset.TweakedScriptKey{
-					RawKey: keychain.KeyDescriptor{
-						PubKey:     rawScriptKey,
-						KeyLocator: scriptKeyLocator,
-					},
-					Tweak: dbOut.ScriptKeyTweak,
-				},
-			},
-			ScriptKeyLocal: dbOut.ScriptKeyLocal,
-			WitnessData:    witnessData,
+			Anchor:           outputAnchor,
+			Amount:           uint64(dbOut.Amount),
+			LockTime:         uint64(dbOut.LockTime.Int32),
+			RelativeLockTime: uint64(dbOut.RelativeLockTime.Int32),
+			AssetVersion:     asset.Version(dbOut.AssetVersion),
+			ScriptKey:        scriptKey,
+			ScriptKeyLocal:   dbOut.ScriptKeyLocal,
+			WitnessData:      witnessData,
 			SplitCommitmentRoot: mssmt.NewComputedNode(
 				splitRootHash,
 				uint64(dbOut.SplitCommitmentRootValue.Int64),
 			),
-			ProofSuffix:      dbOut.ProofSuffix,
-			Type:             tappsbt.VOutputType(dbOut.OutputType),
-			ProofCourierAddr: dbOut.ProofCourierAddr,
+			ProofSuffix:           dbOut.ProofSuffix,
+			Type:                  vOutputType,
+			ProofCourierAddr:      dbOut.ProofCourierAddr,
+			ProofDeliveryComplete: proofDeliveryComplete,
+			Position:              uint64(dbOut.Position),
 		}
 
 		err = readOutPoint(
@@ -2328,17 +2899,25 @@ func fetchAssetTransferOutputs(ctx context.Context, q ActiveAssetsStore,
 // logPendingPassiveAssets logs passive assets re-anchoring data to disk.
 func logPendingPassiveAssets(ctx context.Context,
 	q ActiveAssetsStore, transferID, newUtxoID int64,
-	passiveAssets []*tapfreighter.PassiveAssetReAnchor) error {
+	passiveAssets []*tappsbt.VPacket) error {
 
 	for idx := range passiveAssets {
+		passiveAsset := passiveAssets[idx]
+		passiveIn := passiveAsset.Inputs[0]
+		passiveOut := passiveAsset.Outputs[0]
+		witnesses, err := passiveOut.PrevWitnesses()
+		if err != nil {
+			return fmt.Errorf("unable to extract prev witnesses: "+
+				"%w", err)
+		}
+
 		// Encode new witness data.
 		var (
-			passiveAsset  = passiveAssets[idx]
 			newWitnessBuf bytes.Buffer
 			buf           [8]byte
 		)
-		err := asset.WitnessEncoder(
-			&newWitnessBuf, &passiveAsset.NewWitnessData, &buf,
+		err = asset.WitnessEncoder(
+			&newWitnessBuf, &witnesses, &buf,
 		)
 		if err != nil {
 			return fmt.Errorf("unable to encode witness: "+
@@ -2346,8 +2925,7 @@ func logPendingPassiveAssets(ctx context.Context,
 		}
 
 		// Encode new proof.
-		var newProofBuf bytes.Buffer
-		err = passiveAsset.NewProof.Encode(&newProofBuf)
+		proofSuffixBytes, err := passiveOut.ProofSuffix.Bytes()
 		if err != nil {
 			return fmt.Errorf("unable to encode new passive "+
 				"asset proof: %w", err)
@@ -2355,7 +2933,7 @@ func logPendingPassiveAssets(ctx context.Context,
 
 		// Encode previous anchor outpoint.
 		prevOutpointBytes, err := encodeOutpoint(
-			passiveAsset.PrevAnchorPoint,
+			passiveIn.PrevID.OutPoint,
 		)
 		if err != nil {
 			return fmt.Errorf("unable to encode prev outpoint: "+
@@ -2363,7 +2941,7 @@ func logPendingPassiveAssets(ctx context.Context,
 		}
 
 		// Encode script key.
-		scriptKey := passiveAsset.ScriptKey
+		scriptKey := passiveOut.ScriptKey
 		scriptKeyBytes := scriptKey.PubKey.SerializeCompressed()
 
 		err = q.InsertPassiveAsset(
@@ -2371,11 +2949,11 @@ func logPendingPassiveAssets(ctx context.Context,
 				TransferID:      transferID,
 				NewAnchorUtxo:   newUtxoID,
 				NewWitnessStack: newWitnessBuf.Bytes(),
-				NewProof:        newProofBuf.Bytes(),
+				NewProof:        proofSuffixBytes,
 				PrevOutpoint:    prevOutpointBytes,
 				ScriptKey:       scriptKeyBytes,
-				AssetGenesisID:  passiveAsset.GenesisID[:],
-				AssetVersion:    int32(passiveAsset.AssetVersion),
+				AssetGenesisID:  passiveIn.PrevID.ID[:],
+				AssetVersion:    int32(passiveOut.AssetVersion),
 			},
 		)
 		if err != nil {
@@ -2452,15 +3030,55 @@ func (a *AssetStore) QueryProofTransferLog(ctx context.Context,
 	return timestamps, err
 }
 
-// ConfirmParcelDelivery marks a spend event on disk as confirmed. This updates
-// the on-chain reference information on disk to point to this new spend.
-func (a *AssetStore) ConfirmParcelDelivery(ctx context.Context,
-	conf *tapfreighter.AssetConfirmEvent) error {
+// ConfirmProofDelivery marks a transfer output proof as successfully
+// delivered to counterparty.
+func (a *AssetStore) ConfirmProofDelivery(ctx context.Context,
+	anchorOutpoint wire.OutPoint, outputPosition uint64) error {
+
+	// Serialize the anchor outpoint to bytes.
+	anchorOutpointBytes, err := encodeOutpoint(anchorOutpoint)
+	if err != nil {
+		return fmt.Errorf("unable to encode anchor outpoint: %w", err)
+	}
+
+	// Ensure that the position value can be stored in a 32-bit integer.
+	// Type cast if possible, otherwise return an error.
+	if outputPosition > math.MaxInt32 {
+		return fmt.Errorf("position value is too large for db: %d",
+			outputPosition)
+	}
+	outPosition := int32(outputPosition)
+
+	var writeTxOpts AssetStoreTxOptions
+
+	err = a.db.ExecTx(ctx, &writeTxOpts, func(q ActiveAssetsStore) error {
+		params := OutputProofDeliveryStatus{
+			DeliveryComplete:         sqlBool(true),
+			SerializedAnchorOutpoint: anchorOutpointBytes,
+			Position:                 outPosition,
+		}
+		return q.SetTransferOutputProofDeliveryStatus(ctx, params)
+	})
+	if err != nil {
+		return fmt.Errorf("failed to confirm transfer output proof "+
+			"delivery status in db: %w", err)
+	}
+
+	return nil
+}
+
+// LogAnchorTxConfirm updates the send package state on disk to reflect the
+// confirmation of the anchor transaction, ensuring the on-chain reference
+// information is up to date.
+func (a *AssetStore) LogAnchorTxConfirm(ctx context.Context,
+	conf *tapfreighter.AssetConfirmEvent,
+	burns []*tapfreighter.AssetBurn) error {
 
 	var (
 		writeTxOpts    AssetStoreTxOptions
-		localProofKeys []asset.SerializedKey
+		localProofKeys []tapfreighter.OutputIdentifier
 	)
+
 	err := a.db.ExecTx(ctx, &writeTxOpts, func(q ActiveAssetsStore) error {
 		// First, we'll fetch the asset transfer based on its outpoint
 		// bytes, so we can apply the delta it describes.
@@ -2483,18 +3101,29 @@ func (a *AssetStore) ConfirmParcelDelivery(ctx context.Context,
 
 		// We'll keep around the IDs of the assets that we set to being
 		// spent. We'll need one of them as our template to create the
-		// new assets.
-		spentAssetIDs := make([]int64, len(inputs))
+		// new assets from. We only require one per asset ID, to make
+		// sure the group key and asset genesis references are correct.
+		// But if we spend multiple inputs from the same asset ID, it
+		// doesn't matter if they collide here, as we just need any of
+		// them as the copy template.
+		copyTemplateIDs := make(map[asset.ID]int64, len(inputs))
 		for idx := range inputs {
-			spentAssetIDs[idx], err = q.SetAssetSpent(
+			var assetID asset.ID
+			copy(assetID[:], inputs[idx].AssetID)
+			copyTemplateIDs[assetID], err = q.SetAssetSpent(
 				ctx, SetAssetSpentParams{
-					ScriptKey:  inputs[idx].ScriptKey,
-					GenAssetID: inputs[idx].AssetID,
+					ScriptKey:   inputs[idx].ScriptKey,
+					GenAssetID:  inputs[idx].AssetID,
+					AnchorPoint: inputs[idx].AnchorPoint,
 				},
 			)
 			if err != nil {
 				return fmt.Errorf("unable to set asset spent: "+
-					"%w", err)
+					"%w, script_key=%v, asset_id=%v, "+
+					"anchor_point=%v", err,
+					spew.Sdump(inputs[idx].ScriptKey),
+					spew.Sdump(inputs[idx].AssetID),
+					spew.Sdump(inputs[idx].AnchorPoint))
 			}
 		}
 
@@ -2521,22 +3150,33 @@ func (a *AssetStore) ConfirmParcelDelivery(ctx context.Context,
 					"witness: %w", err)
 			}
 
-			scriptPubKey, err := btcec.ParsePubKey(
-				out.ScriptKeyBytes,
+			fullScriptKey, err := parseScriptKey(
+				out.InternalKey, out.ScriptKey,
 			)
 			if err != nil {
 				return fmt.Errorf("unable to decode script "+
 					"key: %w", err)
 			}
+			scriptPubKey := fullScriptKey.PubKey
 
 			isNumsKey := scriptPubKey.IsEqual(asset.NUMSPubKey)
 			isTombstone := isNumsKey &&
 				out.Amount == 0 &&
-				out.OutputType != int16(
-					tappsbt.TypePassiveAssetsOnly,
-				)
+				out.OutputType == int16(tappsbt.TypeSplitRoot)
 			isBurn := !isNumsKey && len(witnessData) > 0 &&
 				asset.IsBurnKey(scriptPubKey, witnessData[0])
+			isKnown := fullScriptKey.Type != asset.ScriptKeyUnknown
+			skipAssetCreation := !isTombstone && !isBurn &&
+				!out.ScriptKeyLocal && !isKnown
+
+			log.Tracef("Skip asset creation for "+
+				"output %d?: %v,  position=%v, scriptKey=%x, "+
+				"isTombstone=%v, isBurn=%v, "+
+				"scriptKeyLocal=%v, scriptKeyKnown=%v",
+				idx, skipAssetCreation, out.Position,
+				scriptPubKey.SerializeCompressed(),
+				isTombstone, isBurn, out.ScriptKeyLocal,
+				isKnown)
 
 			// If this is an outbound transfer (meaning that our
 			// node doesn't control the script key, and it isn't a
@@ -2545,26 +3185,48 @@ func (a *AssetStore) ConfirmParcelDelivery(ctx context.Context,
 			// leaving the node. The same goes for outputs that are
 			// only used to anchor passive assets, which are handled
 			// separately.
-			if !isTombstone && !isBurn && !out.ScriptKeyLocal {
+			if skipAssetCreation {
 				continue
 			}
 
-			// Since we define that a transfer can only move assets
-			// within the same asset ID, we can take any of the
-			// inputs as a template for the new asset, since the
-			// genesis and group key will be the same. We'll
-			// overwrite all other fields.
-			//
-			// TODO(guggero): This will need an update once we want
-			// to support full lock_time and relative_lock_time
-			// support.
-			templateID := spentAssetIDs[0]
+			// If we create the asset, we'll also import the proof.
+			// We need to find out the asset ID this output is for,
+			// since a transfer can host multiple virtual
+			// transactions, with potentially different asset IDs.
+			var (
+				outProofAsset  asset.Asset
+				inclusionProof proof.TaprootProof
+			)
+			err = proof.SparseDecode(
+				bytes.NewReader(out.ProofSuffix),
+				proof.AssetLeafRecord(&outProofAsset),
+				proof.InclusionProofRecord(&inclusionProof),
+			)
+			if err != nil {
+				return fmt.Errorf("unable to sparse decode "+
+					"proof: %w", err)
+			}
+
+			// We can take any of the inputs for a certain asset ID
+			// as a template for the new asset, since the genesis
+			// and group key will be the same. We'll overwrite all
+			// other fields.
+			templateID, ok := copyTemplateIDs[outProofAsset.ID()]
+			if !ok {
+				return fmt.Errorf("no spent asset found for "+
+					"output with asset ID %v",
+					outProofAsset.ID())
+			}
+
 			params := ApplyPendingOutput{
-				ScriptKeyID: out.ScriptKeyID,
+				ScriptKeyID: out.ScriptKey.ScriptKeyID,
 				AnchorUtxoID: sqlInt64(
 					out.AnchorUtxoID,
 				),
-				Amount:                   out.Amount,
+				Amount:           out.Amount,
+				LockTime:         out.LockTime,
+				RelativeLockTime: out.RelativeLockTime,
+				//nolint:lll
 				SplitCommitmentRootHash:  out.SplitCommitmentRootHash,
 				SplitCommitmentRootValue: out.SplitCommitmentRootValue,
 				SpentAssetID:             templateID,
@@ -2590,22 +3252,27 @@ func (a *AssetStore) ConfirmParcelDelivery(ctx context.Context,
 					"witnesses: %w", err)
 			}
 
-			var scriptKey asset.SerializedKey
-			copy(scriptKey[:], out.ScriptKeyBytes)
-			receiverProof, ok := conf.FinalProofs[scriptKey]
+			outKey := tapfreighter.NewOutputIdentifier(
+				outProofAsset.ID(), inclusionProof.OutputIndex,
+				*scriptPubKey,
+			)
+
+			receiverProof, ok := conf.FinalProofs[outKey]
 			if !ok {
 				return fmt.Errorf("no proof found for output "+
 					"with script key %x",
-					out.ScriptKeyBytes)
+					scriptPubKey.SerializeCompressed())
 			}
-			localProofKeys = append(localProofKeys, scriptKey)
+			localProofKeys = append(localProofKeys, outKey)
 
-			// Now we can update the asset proof for the sender for
-			// this given delta.
-			err = q.UpsertAssetProof(ctx, ProofUpdate{
-				TweakedScriptKey: out.ScriptKeyBytes,
-				ProofFile:        receiverProof.Blob,
+			// Upload proof by the dbAssetId, which is the _primary
+			// key_ of the asset in table assets, not the BIPS
+			// concept of `asset_id`.
+			err = q.UpsertAssetProofByID(ctx, ProofUpdateByID{
+				AssetID:   newAssetID,
+				ProofFile: receiverProof.Blob,
 			})
+
 			if err != nil {
 				return err
 			}
@@ -2641,6 +3308,25 @@ func (a *AssetStore) ConfirmParcelDelivery(ctx context.Context,
 		// longer an unspent output, however we'll keep it in order to
 		// be able to reconstruct transfer history.
 
+		// We now insert in the DB any burns that may have been present
+		// in the transfer.
+		for _, b := range burns {
+			_, err = q.InsertBurn(ctx, sqlc.InsertBurnParams{
+				TransferID: int32(assetTransfer.ID),
+				Note: sql.NullString{
+					String: b.Note,
+					Valid:  b.Note != "",
+				},
+				AssetID:  b.AssetID,
+				GroupKey: b.GroupKey,
+				Amount:   int64(b.Amount),
+			})
+			if err != nil {
+				return fmt.Errorf("failed to insert burn in "+
+					"db: %v", err)
+			}
+		}
+
 		return nil
 	})
 	if err != nil {
@@ -2655,9 +3341,12 @@ func (a *AssetStore) ConfirmParcelDelivery(ctx context.Context,
 		finalProof := conf.FinalProofs[localKey]
 		a.eventDistributor.NotifySubscribers(finalProof.Blob)
 	}
-	for idx := range conf.PassiveAssetProofFiles {
-		passiveProof := conf.PassiveAssetProofFiles[idx]
-		a.eventDistributor.NotifySubscribers(passiveProof)
+	for assetID := range conf.PassiveAssetProofFiles {
+		passiveProofs := conf.PassiveAssetProofFiles[assetID]
+		for idx := range passiveProofs {
+			passiveProof := passiveProofs[idx]
+			a.eventDistributor.NotifySubscribers(passiveProof.Blob)
+		}
 	}
 
 	return nil
@@ -2667,7 +3356,7 @@ func (a *AssetStore) ConfirmParcelDelivery(ctx context.Context,
 // the given transfer output.
 func (a *AssetStore) reAnchorPassiveAssets(ctx context.Context,
 	q ActiveAssetsStore, transferID int64,
-	proofFiles map[[32]byte]proof.Blob) error {
+	proofFiles map[asset.ID][]*proof.AnnotatedProof) error {
 
 	passiveAssets, err := q.QueryPassiveAssets(ctx, transferID)
 	if err != nil {
@@ -2686,18 +3375,20 @@ func (a *AssetStore) reAnchorPassiveAssets(ctx context.Context,
 			return fmt.Errorf("failed to parse script key: %w", err)
 		}
 
-		// Fetch the proof file for this asset.
-		locator := proof.Locator{
-			AssetID:   &assetID,
-			ScriptKey: *scriptKey,
-		}
-		locatorHash, err := locator.Hash()
-		if err != nil {
-			return fmt.Errorf("failed to hash locator: %w", err)
+		var proofFile proof.Blob
+		for _, f := range proofFiles[assetID] {
+			// Check if this proof is for the script key of the
+			// passive asset.
+			if f.Locator.ScriptKey == *scriptKey {
+				proofFile = f.Blob
+
+				break
+			}
 		}
 
-		proofFile := proofFiles[locatorHash]
-		if proofFile == nil {
+		// Something wasn't mapped correctly, we should've found a proof
+		// for each passive asset.
+		if len(proofFile) == 0 {
 			return fmt.Errorf("failed to find proof file for " +
 				"passive asset")
 		}
@@ -2728,8 +3419,8 @@ func (a *AssetStore) reAnchorPassiveAssets(ctx context.Context,
 		}
 
 		// Update the asset proof.
-		err = q.UpsertAssetProof(ctx, ProofUpdate{
-			AssetID:   sqlInt64(passiveAsset.AssetID),
+		err = q.UpsertAssetProofByID(ctx, ProofUpdateByID{
+			AssetID:   passiveAsset.AssetID,
 			ProofFile: proofFile,
 		})
 		if err != nil {
@@ -2751,9 +3442,13 @@ func (a *AssetStore) reAnchorPassiveAssets(ctx context.Context,
 	return nil
 }
 
-// PendingParcels returns the set of parcels that haven't yet been finalized.
-// This can be used to query the set of unconfirmed
-// transactions for re-broadcast.
+// PendingParcels returns the set of parcels that have not yet been finalized.
+// A parcel is considered finalized once the on-chain anchor transaction is
+// included in a block, and all pending transfer output proofs have been
+// delivered to their target peers.
+//
+// NOTE: This can be used to query the set of unconfirmed transactions for
+// re-broadcast and for the set of undelivered proofs.
 func (a *AssetStore) PendingParcels(
 	ctx context.Context) ([]*tapfreighter.OutboundParcel, error) {
 
@@ -2763,24 +3458,28 @@ func (a *AssetStore) PendingParcels(
 // QueryParcels returns the set of confirmed or unconfirmed parcels.
 func (a *AssetStore) QueryParcels(ctx context.Context,
 	anchorTxHash *chainhash.Hash,
-	pending bool) ([]*tapfreighter.OutboundParcel, error) {
+	pendingTransfersOnly bool) ([]*tapfreighter.OutboundParcel, error) {
 
-	var transfers []*tapfreighter.OutboundParcel
+	var (
+		outboundParcels []*tapfreighter.OutboundParcel
+		readOpts        = NewAssetStoreReadTx()
+	)
 
-	readOpts := NewAssetStoreReadTx()
 	dbErr := a.db.ExecTx(ctx, &readOpts, func(q ActiveAssetsStore) error {
 		// Construct transfer query.
-		transferQuery := TransferQuery{
-			UnconfOnly: pending,
-		}
-
-		// Include anchor tx hash if specified.
+		//
+		// Serialise anchor tx hash as bytes if specified.
+		var anchorTxHashBytes []byte
 		if anchorTxHash != nil {
-			transferQuery.AnchorTxHash = anchorTxHash[:]
+			anchorTxHashBytes = anchorTxHash[:]
 		}
 
-		// If we want every unconfirmed transfer, then we only pass in
-		// the UnconfOnly field.
+		transferQuery := TransferQuery{
+			AnchorTxHash:         anchorTxHashBytes,
+			PendingTransfersOnly: sqlBool(pendingTransfersOnly),
+		}
+
+		// Query for asset transfers.
 		dbTransfers, err := q.QueryAssetTransfers(ctx, transferQuery)
 		if err != nil {
 			return err
@@ -2789,6 +3488,7 @@ func (a *AssetStore) QueryParcels(ctx context.Context,
 		for idx := range dbTransfers {
 			dbT := dbTransfers[idx]
 
+			// Fetch the inputs and outputs for the transfer.
 			inputs, err := fetchAssetTransferInputs(ctx, q, dbT.ID)
 			if err != nil {
 				return fmt.Errorf("unable to fetch transfer "+
@@ -2804,7 +3504,8 @@ func (a *AssetStore) QueryParcels(ctx context.Context,
 			}
 
 			// We know that the anchor transaction is the same for
-			// each output, we can just fetch the first.
+			// each output. Therefore, we use the first output to
+			// fetch the transfer's anchor transaction.
 			if len(outputs) == 0 {
 				return fmt.Errorf("no outputs for transfer")
 			}
@@ -2825,15 +3526,44 @@ func (a *AssetStore) QueryParcels(ctx context.Context,
 					"anchor tx: %w", err)
 			}
 
-			transfer := &tapfreighter.OutboundParcel{
+			// Fill in the anchor transaction's output pkScripts.
+			for i, out := range outputs {
+				outIdx := out.Anchor.OutPoint.Index
+				pkScript := anchorTx.TxOut[outIdx].PkScript
+				outputs[i].Anchor.PkScript = pkScript
+			}
+
+			// Marshal anchor tx block hash from the database to a
+			// Hash type.
+			var anchorTxBlockHash fn.Option[chainhash.Hash]
+			if len(dbT.AnchorTxBlockHash) > 0 {
+				var blockHash chainhash.Hash
+				copy(blockHash[:], dbT.AnchorTxBlockHash)
+
+				anchorTxBlockHash = fn.Some[chainhash.Hash](
+					blockHash,
+				)
+			}
+
+			parcel := &tapfreighter.OutboundParcel{
 				AnchorTx:           anchorTx,
 				AnchorTxHeightHint: uint32(dbT.HeightHint),
+				AnchorTxBlockHash:  anchorTxBlockHash,
 				TransferTime:       dbT.TransferTimeUnix.UTC(),
 				ChainFees:          dbAnchorTx.ChainFees,
 				Inputs:             inputs,
 				Outputs:            outputs,
+				Label:              dbT.Label.String,
 			}
-			transfers = append(transfers, transfer)
+
+			// Set the block height if the anchor is marked as
+			// confirmed in the database.
+			if dbAnchorTx.BlockHeight.Valid {
+				parcel.AnchorTxBlockHeight = uint32(
+					dbAnchorTx.BlockHeight.Int32,
+				)
+			}
+			outboundParcels = append(outboundParcels, parcel)
 		}
 
 		return nil
@@ -2842,71 +3572,128 @@ func (a *AssetStore) QueryParcels(ctx context.Context,
 		return nil, dbErr
 	}
 
-	return transfers, nil
+	return outboundParcels, nil
 }
 
-// ErrAssetMetaNotFound is returned when an asset meta is not found in the
-// database.
-var ErrAssetMetaNotFound = fmt.Errorf("asset meta not found")
-
-// FetchAssetMetaForAsset attempts to fetch an asset meta based on an asset ID.
-func (a *AssetStore) FetchAssetMetaForAsset(ctx context.Context,
-	assetID asset.ID) (*proof.MetaReveal, error) {
-
-	var assetMeta *proof.MetaReveal
+// AssetsDBSize returns the total size of the taproot assets database.
+func (a *AssetStore) AssetsDBSize(ctx context.Context) (int64, error) {
+	var totalSize int64
 
 	readOpts := NewAssetStoreReadTx()
-	dbErr := a.db.ExecTx(ctx, &readOpts, func(q ActiveAssetsStore) error {
-		dbMeta, err := q.FetchAssetMetaForAsset(ctx, assetID[:])
+	dbErr := a.metaDb.ExecTx(ctx, &readOpts, func(q MetaStore) error {
+		var (
+			size int64
+			err  error
+		)
+		switch a.dbType {
+		case sqlc.BackendTypePostgres:
+			size, err = q.AssetsDBSizePostgres(ctx)
+
+		case sqlc.BackendTypeSqlite:
+			var res int32
+			res, err = q.AssetsDBSizeSqlite(ctx)
+			size = int64(res)
+
+		default:
+			return fmt.Errorf("unsupported db backend type")
+		}
+
 		if err != nil {
 			return err
 		}
 
-		assetMeta = &proof.MetaReveal{
-			Data: dbMeta.MetaDataBlob,
-			Type: proof.MetaType(dbMeta.MetaDataType.Int16),
-		}
+		totalSize = size
 
 		return nil
 	})
-	switch {
-	case errors.Is(dbErr, sql.ErrNoRows):
-		return nil, ErrAssetMetaNotFound
-	case dbErr != nil:
-		return nil, dbErr
+
+	if dbErr != nil {
+		return 0, dbErr
 	}
 
-	return assetMeta, nil
+	return totalSize, nil
 }
 
-// FetchAssetMetaByHash attempts to fetch an asset meta based on an asset hash.
-func (a *AssetStore) FetchAssetMetaByHash(ctx context.Context,
-	metaHash [asset.MetaHashLen]byte) (*proof.MetaReveal, error) {
+// TxHeight returns the block height of a given transaction. This will only
+// return the height if the transaction is known to the store, which is only
+// the case for assets relevant to this node.
+func (a *AssetStore) TxHeight(ctx context.Context, txid chainhash.Hash) (uint32,
+	error) {
 
-	var assetMeta *proof.MetaReveal
+	blockHeight, err := a.txHeights.Get(txid)
+	if err == nil {
+		return uint32(blockHeight), nil
+	}
 
+	var dbBlockHeight int32
 	readOpts := NewAssetStoreReadTx()
 	dbErr := a.db.ExecTx(ctx, &readOpts, func(q ActiveAssetsStore) error {
-		dbMeta, err := q.FetchAssetMetaByHash(ctx, metaHash[:])
+		dbTx, err := q.FetchChainTx(ctx, txid[:])
 		if err != nil {
 			return err
 		}
 
-		assetMeta = &proof.MetaReveal{
-			Data: dbMeta.MetaDataBlob,
-			Type: proof.MetaType(dbMeta.MetaDataType.Int16),
+		dbBlockHeight = dbTx.BlockHeight.Int32
+
+		return nil
+	})
+	if dbErr != nil {
+		return 0, dbErr
+	}
+
+	if dbBlockHeight == 0 {
+		return 0, fmt.Errorf("tx height not found")
+	}
+
+	_, err = a.txHeights.Put(txid, cacheableBlockHeight(dbBlockHeight))
+	if err != nil {
+		return 0, fmt.Errorf("unable to cache asset height: %w", err)
+	}
+
+	return uint32(dbBlockHeight), nil
+}
+
+// QueryBurns queries burnt assets based on the passed filters.
+func (a *AssetStore) QueryBurns(ctx context.Context,
+	filters QueryBurnsFilters) ([]*tapfreighter.AssetBurn, error) {
+
+	var res []*tapfreighter.AssetBurn
+
+	readOpts := NewAssetStoreReadTx()
+	dbErr := a.db.ExecTx(ctx, &readOpts, func(q ActiveAssetsStore) error {
+		burns, err := q.QueryBurns(ctx, sqlc.QueryBurnsParams{
+			AssetID:    filters.AssetID,
+			GroupKey:   filters.GroupKey,
+			AnchorTxid: filters.AnchorTxid,
+		})
+		if err != nil {
+			return err
+		}
+
+		for _, b := range burns {
+			burn := marshalAssetBurnTransfer(b)
+
+			res = append(res, burn)
 		}
 
 		return nil
 	})
-	switch {
-	case errors.Is(dbErr, sql.ErrNoRows):
-		return nil, ErrAssetMetaNotFound
-	case dbErr != nil:
+	if dbErr != nil {
 		return nil, dbErr
 	}
 
-	return assetMeta, nil
+	return res, nil
+}
+
+// marshalAssetBurnTransfer converts the db row of a burn to a tapdb.AssetBurn.
+func marshalAssetBurnTransfer(row sqlc.QueryBurnsRow) *tapfreighter.AssetBurn {
+	return &tapfreighter.AssetBurn{
+		Note:       row.Note.String,
+		AssetID:    row.AssetID,
+		GroupKey:   row.GroupKey,
+		Amount:     uint64(row.Amount),
+		AnchorTxid: chainhash.Hash(row.AnchorTxid),
+	}
 }
 
 // A compile-time constraint to ensure that AssetStore meets the

@@ -2,6 +2,7 @@ package tapgarden
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/btcsuite/btcd/btcec/v2"
@@ -12,12 +13,26 @@ import (
 	"github.com/lightninglabs/lndclient"
 	"github.com/lightninglabs/taproot-assets/asset"
 	"github.com/lightninglabs/taproot-assets/commitment"
+	"github.com/lightninglabs/taproot-assets/fn"
 	"github.com/lightninglabs/taproot-assets/proof"
+	"github.com/lightninglabs/taproot-assets/tapsend"
 	"github.com/lightningnetwork/lnd/chainntnfs"
 	"github.com/lightningnetwork/lnd/keychain"
 	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/lnwallet/chainfee"
 )
+
+const (
+	// IssuanceTxLabel defines the label assigned to an on-chain transaction
+	// that represents a tapd asset issuance.
+	IssuanceTxLabel = "tapd-asset-issuance"
+)
+
+// FundBatchResp is the response returned from the FundBatch method.
+type FundBatchResp struct {
+	// Batch is the batch that was funded.
+	Batch *VerboseBatch
+}
 
 // Planter is responsible for batching a set of seedlings into a minting batch
 // that will eventually be confirmed on chain.
@@ -28,13 +43,9 @@ type Planter interface {
 	// error is returned no issuance operation was possible.
 	QueueNewSeedling(req *Seedling) (SeedlingUpdates, error)
 
-	// TODO(roasbeef): list seeds, their pending state, etc, etc
-
-	// TODO(roasbeef): notification methods also?
-
 	// ListBatches lists the set of batches submitted for minting, or the
 	// details of a specific batch.
-	ListBatches(batchKey *btcec.PublicKey) ([]*MintingBatch, error)
+	ListBatches(params ListBatchesParams) ([]*VerboseBatch, error)
 
 	// CancelSeedling attempts to cancel the creation of a new asset
 	// identified by its name. If the seedling has already progressed to a
@@ -42,9 +53,17 @@ type Planter interface {
 	// returned.
 	CancelSeedling() error
 
+	// FundBatch attempts to provide a genesis point for the current batch,
+	// or create a new funded batch.
+	FundBatch(params FundParams) (*FundBatchResp, error)
+
+	// SealBatch attempts to seal the current batch, by providing or
+	// deriving all witnesses necessary to create the final genesis TX.
+	SealBatch(params SealParams) (*MintingBatch, error)
+
 	// FinalizeBatch signals that the asset minter should finalize
 	// the current batch, if one exists.
-	FinalizeBatch(feeRate *chainfee.SatPerKWeight) (*MintingBatch, error)
+	FinalizeBatch(params FinalizeParams) (*MintingBatch, error)
 
 	// CancelBatch signals that the asset minter should cancel the
 	// current batch, if one exists.
@@ -56,6 +75,10 @@ type Planter interface {
 	// Stop signals that the asset minter should attempt a graceful
 	// shutdown.
 	Stop() error
+
+	// EventPublisher is a subscription interface that allows callers to
+	// subscribe to events that are relevant to the Planter.
+	fn.EventPublisher[fn.Event, bool]
 }
 
 // BatchState an enum that represents the various stages of a minting batch.
@@ -169,6 +192,8 @@ func NewBatchState(state uint8) (BatchState, error) {
 // the process of seeding, planting, and finally maturing taproot assets that are
 // a part of the batch.
 type MintingStore interface {
+	asset.TapscriptTreeManager
+
 	// CommitMintingBatch commits a new minting batch to disk, identified
 	// by its batch key.
 	CommitMintingBatch(ctx context.Context, newBatch *MintingBatch) error
@@ -197,6 +222,17 @@ type MintingStore interface {
 	FetchMintingBatch(ctx context.Context,
 		batchKey *btcec.PublicKey) (*MintingBatch, error)
 
+	// AddSeedlingGroups stores the asset groups for seedlings associated
+	// with a batch.
+	AddSeedlingGroups(ctx context.Context, genesisOutpoint wire.OutPoint,
+		assetGroups []*asset.AssetGroup) error
+
+	// FetchSeedlingGroups is used to fetch the asset groups for seedlings
+	// associated with a funded batch.
+	FetchSeedlingGroups(ctx context.Context, genesisOutpoint wire.OutPoint,
+		anchorOutputIndex uint32,
+		seedlings []*Seedling) ([]*asset.AssetGroup, error)
+
 	// AddSproutsToBatch adds a new set of sprouts to the batch, along with
 	// a GenesisPacket, that once signed and broadcast with create the
 	// set of assets on chain.
@@ -204,7 +240,8 @@ type MintingStore interface {
 	// NOTE: The BatchState should transition to BatchStateCommitted upon a
 	// successful call.
 	AddSproutsToBatch(ctx context.Context, batchKey *btcec.PublicKey,
-		genesisPacket *FundedPsbt, assets *commitment.TapCommitment) error
+		genesisPacket *FundedMintAnchorPsbt,
+		assets *commitment.TapCommitment) error
 
 	// CommitSignedGenesisTx adds a fully signed genesis transaction to the
 	// batch, along with the Taproot Asset script root, which is the
@@ -214,8 +251,8 @@ type MintingStore interface {
 	// NOTE: The BatchState should transition to the BatchStateBroadcast
 	// state upon a successful call.
 	CommitSignedGenesisTx(ctx context.Context, batchKey *btcec.PublicKey,
-		genesisTx *FundedPsbt, anchorOutputIndex uint32,
-		tapRoot []byte) error
+		genesisTx *tapsend.FundedPsbt, anchorOutputIndex uint32,
+		merkleRoot, tapTreeRoot, tapSibling []byte) error
 
 	// MarkBatchConfirmed marks the batch as confirmed on chain. The passed
 	// block location information determines where exactly in the chain the
@@ -236,12 +273,36 @@ type MintingStore interface {
 	// key, including the genesis information used to create the group.
 	FetchGroupByGroupKey(ctx context.Context,
 		groupKey *btcec.PublicKey) (*asset.AssetGroup, error)
+
+	// FetchScriptKeyByTweakedKey fetches the populated script key given the
+	// tweaked script key.
+	FetchScriptKeyByTweakedKey(ctx context.Context,
+		tweakedKey *btcec.PublicKey) (*asset.TweakedScriptKey, error)
+
+	// FetchAssetMeta fetches the meta reveal for an asset genesis.
+	FetchAssetMeta(ctx context.Context, ID asset.ID) (*proof.MetaReveal,
+		error)
+
+	// CommitBatchTapSibling adds a tapscript sibling to the batch,
+	// specified by the sibling root hash.
+	//
+	// NOTE: The tapscript tree that defines the batch sibling must already
+	// be committed to disk.
+	CommitBatchTapSibling(ctx context.Context, batchKey *btcec.PublicKey,
+		rootHash *chainhash.Hash) error
+
+	// CommitBatchTx adds a funded transaction to the batch, which also sets
+	// the genesis point for the batch.
+	CommitBatchTx(ctx context.Context, batchKey *btcec.PublicKey,
+		genesisTx FundedMintAnchorPsbt) error
 }
 
 // ChainBridge is our bridge to the target chain. It's used to get confirmation
 // notifications, the current height, publish transactions, and also estimate
 // fees.
 type ChainBridge interface {
+	proof.ChainLookupGenerator
+
 	// RegisterConfirmationsNtfn registers an intent to be notified once
 	// txid reaches numConfs confirmations.
 	RegisterConfirmationsNtfn(ctx context.Context, txid *chainhash.Hash,
@@ -271,32 +332,17 @@ type ChainBridge interface {
 	// CurrentHeight return the current height of the main chain.
 	CurrentHeight(context.Context) (uint32, error)
 
+	// GetBlockTimestamp returns the timestamp of the block at the given
+	// height.
+	GetBlockTimestamp(context.Context, uint32) int64
+
 	// PublishTransaction attempts to publish a new transaction to the
 	// network.
-	PublishTransaction(context.Context, *wire.MsgTx) error
+	PublishTransaction(context.Context, *wire.MsgTx, string) error
 
 	// EstimateFee returns a fee estimate for the confirmation target.
 	EstimateFee(ctx context.Context,
 		confTarget uint32) (chainfee.SatPerKWeight, error)
-}
-
-// FundedPsbt represents a fully funded PSBT transaction.
-type FundedPsbt struct {
-	// Pkt is the PSBT packet itself.
-	Pkt *psbt.Packet
-
-	// ChangeOutputIndex denotes which output in the PSBT packet is the
-	// change output. We use this to figure out which output will store our
-	// Taproot Asset commitment (the non-change output).
-	ChangeOutputIndex int32
-
-	// ChainFees is the amount in sats paid in on-chain fees for this
-	// transaction.
-	ChainFees int64
-
-	// LockedUTXOs is the set of UTXOs that were locked to create the PSBT
-	// packet.
-	LockedUTXOs []wire.OutPoint
 }
 
 // WalletAnchor is the main wallet interface used to managed PSBT packets, and
@@ -305,7 +351,8 @@ type WalletAnchor interface {
 	// FundPsbt attaches enough inputs to the target PSBT packet for it to
 	// be valid.
 	FundPsbt(ctx context.Context, packet *psbt.Packet, minConfs uint32,
-		feeRate chainfee.SatPerKWeight) (FundedPsbt, error)
+		feeRate chainfee.SatPerKWeight,
+		changeIdx int32) (*tapsend.FundedPsbt, error)
 
 	// SignAndFinalizePsbt fully signs and finalizes the target PSBT
 	// packet.
@@ -313,11 +360,12 @@ type WalletAnchor interface {
 
 	// ImportTaprootOutput imports a new public key into the wallet, as a
 	// P2TR output.
-	ImportTaprootOutput(context.Context, *btcec.PublicKey) (btcutil.Address, error)
+	ImportTaprootOutput(context.Context, *btcec.PublicKey) (btcutil.Address,
+		error)
 
-	// UnlockInput unlocks the set of target inputs after a batch is
-	// abandoned.
-	UnlockInput(context.Context) error
+	// UnlockInput unlocks the set of target inputs after a batch or send
+	// transaction is abandoned.
+	UnlockInput(context.Context, wire.OutPoint) error
 
 	// ListUnspentImportScripts lists all UTXOs of the imported Taproot
 	// scripts.
@@ -336,6 +384,10 @@ type WalletAnchor interface {
 	// relevant to the wallet are sent over.
 	SubscribeTransactions(context.Context) (<-chan lndclient.Transaction,
 		<-chan error, error)
+
+	// MinRelayFee returns the current minimum relay fee based on
+	// our chain backend in sat/kw.
+	MinRelayFee(ctx context.Context) (chainfee.SatPerKWeight, error)
 }
 
 // KeyRing is a mirror of the keychain.KeyRing interface, with the addition of
@@ -347,14 +399,16 @@ type KeyRing interface {
 	DeriveNextKey(context.Context,
 		keychain.KeyFamily) (keychain.KeyDescriptor, error)
 
-	// DeriveKey attempts to derive an arbitrary key specified by the
-	// passed KeyLocator. This may be used in several recovery scenarios,
-	// or when manually rotating something like our current default node
-	// key.
-	DeriveKey(context.Context,
-		keychain.KeyLocator) (keychain.KeyDescriptor, error)
-
 	// IsLocalKey returns true if the key is under the control of the wallet
 	// and can be derived by it.
 	IsLocalKey(context.Context, keychain.KeyDescriptor) bool
 }
+
+var (
+	// ErrNoGenesis is returned when fetching an asset genesis fails.
+	ErrNoGenesis = errors.New("unable to fetch genesis asset")
+
+	// ErrBatchAlreadySealed is returned when a minting batch is already
+	// sealed.
+	ErrBatchAlreadySealed = errors.New("batch is already sealed")
+)

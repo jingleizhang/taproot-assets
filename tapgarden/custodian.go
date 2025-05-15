@@ -1,6 +1,7 @@
 package tapgarden
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strings"
@@ -17,9 +18,9 @@ import (
 	"github.com/lightningnetwork/lnd/lnrpc"
 )
 
-// AssetReceiveCompleteEvent is an event that is sent to a subscriber once the
+// AssetReceiveEvent is an event that is sent to a subscriber once the
 // asset receive process has finished for a given address and outpoint.
-type AssetReceiveCompleteEvent struct {
+type AssetReceiveEvent struct {
 	// timestamp is the time the event was created.
 	timestamp time.Time
 
@@ -29,21 +30,51 @@ type AssetReceiveCompleteEvent struct {
 	// OutPoint is the outpoint of the transaction that was used to receive
 	// the asset.
 	OutPoint wire.OutPoint
+
+	// Status is the status of the asset receive event. If Error below is
+	// set, this is the status that lead to the error.
+	Status address.Status
+
+	// ConfirmationHeight is the height of the block the asset receive
+	// transaction was mined in. This is only set if the status is
+	// StatusConfirmed or later.
+	ConfirmationHeight uint32
+
+	// Error is an optional error, indicating that something went wrong
+	// during the execution of the Status above.
+	Error error
 }
 
 // Timestamp returns the timestamp of the event.
-func (e *AssetReceiveCompleteEvent) Timestamp() time.Time {
+func (e *AssetReceiveEvent) Timestamp() time.Time {
 	return e.timestamp
 }
 
-// NewAssetRecvCompleteEvent creates a new AssetReceiveCompleteEvent.
-func NewAssetRecvCompleteEvent(addr address.Tap,
-	outpoint wire.OutPoint) *AssetReceiveCompleteEvent {
+// NewAssetReceiveEvent creates a new AssetReceiveEvent.
+func NewAssetReceiveEvent(addr address.Tap, outpoint wire.OutPoint,
+	confHeight uint32, status address.Status) *AssetReceiveEvent {
 
-	return &AssetReceiveCompleteEvent{
-		timestamp: time.Now().UTC(),
-		Address:   addr,
-		OutPoint:  outpoint,
+	return &AssetReceiveEvent{
+		timestamp:          time.Now().UTC(),
+		Address:            addr,
+		OutPoint:           outpoint,
+		Status:             status,
+		ConfirmationHeight: confHeight,
+	}
+}
+
+// NewAssetReceiveErrorEvent creates a new AssetReceiveEvent with an error.
+func NewAssetReceiveErrorEvent(err error, addr address.Tap,
+	outpoint wire.OutPoint, confHeight uint32,
+	status address.Status) *AssetReceiveEvent {
+
+	return &AssetReceiveEvent{
+		timestamp:          time.Now().UTC(),
+		Address:            addr,
+		OutPoint:           outpoint,
+		Status:             status,
+		ConfirmationHeight: confHeight,
+		Error:              err,
 	}
 }
 
@@ -208,12 +239,12 @@ func (c *Custodian) Stop() error {
 		}
 
 		// Remove all status event subscribers.
-		for _, sub := range c.statusEventsSubs {
-			err := c.RemoveSubscriber(sub)
-			if err != nil {
-				stopErr = err
-				break
-			}
+		c.statusEventsSubsMtx.Lock()
+		defer c.statusEventsSubsMtx.Unlock()
+
+		for _, subscriber := range c.statusEventsSubs {
+			subscriber.Stop()
+			delete(c.statusEventsSubs, subscriber.ID())
 		}
 	})
 
@@ -272,15 +303,27 @@ func (c *Custodian) watchInboundAssets() {
 		// starting up, let's check now.
 		available, err := c.checkProofAvailable(event)
 		if err != nil {
+			c.publishSubscriberStatusEvent(
+				NewAssetReceiveErrorEvent(
+					err, *event.Addr.Tap, event.Outpoint,
+					event.ConfirmationHeight, event.Status,
+				),
+			)
+
 			reportErr(err)
 			return
 		}
 
-		// If we did find a proof, we did import it now and can remove
-		// the event from our cache.
+		// If we did find a proof, we did import it now and are done.
 		if available {
-			delete(c.events, event.Outpoint)
+			continue
+		}
 
+		// If this event is not yet confirmed, we don't yet expect a
+		// proof to be delivered. We'll wait for the confirmation to
+		// come in, and then we'll launch a goroutine to use the
+		// ProofCourier to import the proof into our local DB.
+		if event.ConfirmationHeight == 0 {
 			continue
 		}
 
@@ -290,8 +333,20 @@ func (c *Custodian) watchInboundAssets() {
 		go func() {
 			defer c.Wg.Done()
 
-			recErr := c.receiveProof(event.Addr.Tap, event.Outpoint)
+			recErr := c.receiveProof(
+				event.Addr.Tap, event.Outpoint,
+				event.ConfirmationHeight,
+			)
 			if recErr != nil {
+				c.publishSubscriberStatusEvent(
+					NewAssetReceiveErrorEvent(
+						recErr, *event.Addr.Tap,
+						event.Outpoint,
+						event.ConfirmationHeight,
+						event.Status,
+					),
+				)
+
 				reportErr(recErr)
 			}
 		}()
@@ -413,8 +468,20 @@ func (c *Custodian) inspectWalletTx(walletTx *lndclient.Transaction) error {
 
 					recErr := c.receiveProof(
 						event.Addr.Tap, op,
+						event.ConfirmationHeight,
 					)
 					if recErr != nil {
+						c.publishSubscriberStatusEvent(
+							//nolint:lll
+							NewAssetReceiveErrorEvent(
+								recErr,
+								*event.Addr.Tap,
+								event.Outpoint,
+								event.ConfirmationHeight,
+								event.Status,
+							),
+						)
+
 						log.Errorf("Unable to receive "+
 							"proof: %v", recErr)
 					}
@@ -446,6 +513,9 @@ func (c *Custodian) inspectWalletTx(walletTx *lndclient.Transaction) error {
 			continue
 		}
 
+		// The event should now be available.
+		event = c.events[op]
+
 		// Now that we've seen this output confirm on chain, we'll
 		// launch a goroutine to use the ProofCourier to import the
 		// proof into our local DB.
@@ -453,8 +523,18 @@ func (c *Custodian) inspectWalletTx(walletTx *lndclient.Transaction) error {
 		go func() {
 			defer c.Wg.Done()
 
-			recErr := c.receiveProof(addr, op)
+			recErr := c.receiveProof(
+				addr, op, event.ConfirmationHeight,
+			)
 			if recErr != nil {
+				c.publishSubscriberStatusEvent(
+					NewAssetReceiveErrorEvent(
+						recErr, *addr, op,
+						event.ConfirmationHeight,
+						event.Status,
+					),
+				)
+
 				log.Errorf("Unable to receive proof: %v",
 					recErr)
 			}
@@ -466,7 +546,9 @@ func (c *Custodian) inspectWalletTx(walletTx *lndclient.Transaction) error {
 
 // receiveProof attempts to receive a proof for the given address and outpoint
 // via the proof courier service.
-func (c *Custodian) receiveProof(addr *address.Tap, op wire.OutPoint) error {
+func (c *Custodian) receiveProof(addr *address.Tap, op wire.OutPoint,
+	confHeight uint32) error {
+
 	ctx, cancel := c.WithCtxQuitNoTimeout()
 	defer cancel()
 
@@ -475,15 +557,14 @@ func (c *Custodian) receiveProof(addr *address.Tap, op wire.OutPoint) error {
 	scriptKeyBytes := addr.ScriptKey.SerializeCompressed()
 	log.Debugf("Waiting to receive proof for script key %x", scriptKeyBytes)
 
+	c.publishSubscriberStatusEvent(NewAssetReceiveEvent(
+		*addr, op, confHeight, address.StatusTransactionConfirmed,
+	))
+
 	// Initiate proof courier service handle from the proof courier address
 	// found in the Tap address.
-	recipient := proof.Recipient{
-		ScriptKey: &addr.ScriptKey,
-		AssetID:   assetID,
-		Amount:    addr.Amount,
-	}
 	courier, err := c.cfg.ProofCourierDispatcher.NewCourier(
-		&addr.ProofCourierAddr, recipient,
+		ctx, &addr.ProofCourierAddr, true,
 	)
 	if err != nil {
 		return fmt.Errorf("unable to initiate proof courier service "+
@@ -507,30 +588,35 @@ func (c *Custodian) receiveProof(addr *address.Tap, op wire.OutPoint) error {
 	}
 
 	// Attempt to receive proof via proof courier service.
+	recipient := proof.Recipient{
+		ScriptKey: &addr.ScriptKey,
+		AssetID:   assetID,
+		Amount:    addr.Amount,
+	}
 	loc := proof.Locator{
 		AssetID:   &assetID,
 		GroupKey:  addr.GroupKey,
 		ScriptKey: addr.ScriptKey,
 		OutPoint:  &op,
 	}
-	addrProof, err := courier.ReceiveProof(ctx, loc)
+	addrProof, err := courier.ReceiveProof(ctx, recipient, loc)
 	if err != nil {
 		return fmt.Errorf("unable to receive proof using courier: %w",
 			err)
 	}
 
-	log.Debugf("Received proof for: script_key=%x, asset_id=%x",
+	log.Debugf("Proof received (script_key=%x, asset_id=%x)",
 		scriptKeyBytes, assetID[:])
 
 	ctx, cancel = c.CtxBlocking()
 	defer cancel()
 
-	headerVerifier := GenHeaderVerifier(ctx, c.cfg.ChainBridge)
 	err = c.cfg.ProofArchive.ImportProofs(
-		ctx, headerVerifier, c.cfg.GroupVerifier, false, addrProof,
+		ctx, c.verifierCtx(ctx), false, addrProof,
 	)
 	if err != nil {
-		return fmt.Errorf("unable to import proofs: %w", err)
+		return fmt.Errorf("unable to import proofs script_key=%x, "+
+			"asset_id=%x: %w", scriptKeyBytes, assetID[:], err)
 	}
 
 	// The proof is now verified and in our local archive. We will now
@@ -569,7 +655,29 @@ func (c *Custodian) mapToTapAddr(walletTx *lndclient.Transaction,
 
 	addrStr, err := addr.EncodeAddress()
 	if err != nil {
-		return nil, fmt.Errorf("unable to encode address: %v", err)
+		return nil, fmt.Errorf("unable to encode address: %w", err)
+	}
+
+	// Skip already completed events.
+	ctxt, cancel = c.CtxBlocking()
+	existingEvent, err := c.cfg.AddrBook.QueryEvent(ctxt, addr, op)
+	cancel()
+	switch {
+	// Skip events that are already completed.
+	case err == nil && existingEvent.Status >= address.StatusCompleted:
+		log.Debugf("Skiping already completed inbound asset transfer "+
+			"(asset_id=%x) for Taproot Asset address %s in %s",
+			addr.AssetID[:], addrStr, op.String())
+
+		return nil, nil
+
+	// If we don't have an event yet, we'll create a new one further below.
+	case errors.Is(err, address.ErrNoEvent):
+		// Continue below.
+
+	// Something went wrong while querying for events.
+	case err != nil:
+		return nil, fmt.Errorf("error querying event: %w", err)
 	}
 
 	// Make sure we have an event registered for the transaction, since it
@@ -591,6 +699,11 @@ func (c *Custodian) mapToTapAddr(walletTx *lndclient.Transaction,
 	if err != nil {
 		return nil, fmt.Errorf("error creating event: %w", err)
 	}
+
+	c.publishSubscriberStatusEvent(NewAssetReceiveEvent(
+		*event.Addr.Tap, event.Outpoint, event.ConfirmationHeight,
+		status,
+	))
 
 	// Let's update our cache of ongoing events.
 	c.events[op] = event
@@ -642,17 +755,23 @@ func (c *Custodian) checkProofAvailable(event *address.Event) (bool, error) {
 	ctxt, cancel := c.WithCtxQuit()
 	defer cancel()
 
+	c.publishSubscriberStatusEvent(NewAssetReceiveEvent(
+		*event.Addr.Tap, event.Outpoint, event.ConfirmationHeight,
+		address.StatusTransactionConfirmed,
+	))
+
 	// We check if the local proof is already available. We check the same
 	// source that would notify us and not the proof archive (which might
 	// be a multi archiver that includes file based storage) to make sure
 	// the proof is available in the relational database. If the proof is
 	// not in the DB, we can't update the event.
-	blob, err := c.cfg.ProofNotifier.FetchProof(ctxt, proof.Locator{
+	locator := proof.Locator{
 		AssetID:   fn.Ptr(event.Addr.AssetID),
 		GroupKey:  event.Addr.GroupKey,
 		ScriptKey: event.Addr.ScriptKey,
 		OutPoint:  &event.Outpoint,
-	})
+	}
+	blob, err := c.cfg.ProofNotifier.FetchProof(ctxt, locator)
 	switch {
 	case errors.Is(err, proof.ErrProofNotFound):
 		return false, nil
@@ -669,6 +788,19 @@ func (c *Custodian) checkProofAvailable(event *address.Event) (bool, error) {
 	if !blob.IsFile() {
 		return false, fmt.Errorf("expected proof to be a full file, " +
 			"but got something else")
+	}
+
+	// In case we missed a notification from the local universe and didn't
+	// previously import the proof (for example because we were shutting
+	// down), we could be in a situation where the local database doesn't
+	// have the proof yet. So we make sure to import it now.
+	err = c.assertProofInLocalArchive(&proof.AnnotatedProof{
+		Locator: locator,
+		Blob:    blob,
+	})
+	if err != nil {
+		return false, fmt.Errorf("error asserting proof in local "+
+			"archive: %w", err)
 	}
 
 	file, err := blob.AsFile()
@@ -755,29 +887,13 @@ func (c *Custodian) mapProofToEvent(p proof.Blob) error {
 		// local universe instead of the local proof archive (which the
 		// couriers use). This is mainly an optimization to make sure we
 		// don't unnecessarily overwrite the proofs in our main archive.
-		haveProof, err := c.cfg.ProofArchive.HasProof(ctxt, loc)
+		err := c.assertProofInLocalArchive(&proof.AnnotatedProof{
+			Locator: loc,
+			Blob:    proofBlob,
+		})
 		if err != nil {
-			return fmt.Errorf("error checking if proof is "+
-				"available: %w", err)
-		}
-
-		// We don't have the proof yet, or not in all backends, so we
-		// need to import it now.
-		if !haveProof {
-			headerVerifier := GenHeaderVerifier(
-				ctxt, c.cfg.ChainBridge,
-			)
-			err = c.cfg.ProofArchive.ImportProofs(
-				ctxt, headerVerifier, c.cfg.GroupVerifier,
-				false, &proof.AnnotatedProof{
-					Locator: loc,
-					Blob:    proofBlob,
-				},
-			)
-			if err != nil {
-				return fmt.Errorf("error importing proof "+
-					"file into main archive: %w", err)
-			}
+			return fmt.Errorf("error asserting proof in local "+
+				"archive: %w", err)
 		}
 	}
 
@@ -811,17 +927,57 @@ func (c *Custodian) mapProofToEvent(p proof.Blob) error {
 	// Check if any of our in-flight events match the last proof's state.
 	for _, event := range c.events {
 		if EventMatchesProof(event, lastProof) {
+			c.publishSubscriberStatusEvent(NewAssetReceiveEvent(
+				*event.Addr.Tap, event.Outpoint,
+				event.ConfirmationHeight,
+				address.StatusProofReceived,
+			))
+
 			// Importing a proof already creates the asset in the
 			// database. Therefore, all we need to do is update the
 			// state of the address event to mark it as completed
 			// successfully.
 			err = c.setReceiveCompleted(event, lastProof, file)
 			if err != nil {
+				c.publishSubscriberStatusEvent(
+					NewAssetReceiveErrorEvent(
+						err, *event.Addr.Tap,
+						event.Outpoint,
+						event.ConfirmationHeight,
+						event.Status,
+					),
+				)
+
 				return fmt.Errorf("error updating event: %w",
 					err)
 			}
+		}
+	}
 
-			delete(c.events, event.Outpoint)
+	return nil
+}
+
+// assertProofInLocalArchive checks if the proof is already in the local proof
+// archive. If it isn't, it is imported now.
+func (c *Custodian) assertProofInLocalArchive(p *proof.AnnotatedProof) error {
+	ctxt, cancel := c.WithCtxQuit()
+	defer cancel()
+
+	haveProof, err := c.cfg.ProofArchive.HasProof(ctxt, p.Locator)
+	if err != nil {
+		return fmt.Errorf("error checking if proof is available: %w",
+			err)
+	}
+
+	// We don't have the proof yet, or not in all backends, so we
+	// need to import it now.
+	if !haveProof {
+		err = c.cfg.ProofArchive.ImportProofs(
+			ctxt, c.verifierCtx(ctxt), false, p,
+		)
+		if err != nil {
+			return fmt.Errorf("error importing proof file into "+
+				"main archive: %w", err)
 		}
 	}
 
@@ -833,23 +989,13 @@ func (c *Custodian) mapProofToEvent(p proof.Blob) error {
 func (c *Custodian) setReceiveCompleted(event *address.Event,
 	lastProof *proof.Proof, proofFile *proof.File) error {
 
-	// At this point the "receive" process is complete. We will now notify
-	// all status event subscribers.
-	receiveCompleteEvent := NewAssetRecvCompleteEvent(
-		*event.Addr.Tap, event.Outpoint,
-	)
-	err := c.publishSubscriberStatusEvent(receiveCompleteEvent)
-	if err != nil {
-		log.Errorf("Unable publish status event: %v", err)
-	}
-
 	// The proof is created after a single confirmation. To make sure we
 	// notice if the anchor transaction is re-organized out of the chain, we
 	// give all the not-yet-sufficiently-buried proofs in the received proof
 	// file to the re-org watcher and replace the updated proof in the local
 	// proof archive if a re-org happens. The sender will do the same, so no
 	// re-send of the proof is necessary.
-	err = c.cfg.ProofWatcher.MaybeWatch(
+	err := c.cfg.ProofWatcher.MaybeWatch(
 		proofFile, c.cfg.ProofWatcher.DefaultUpdateCallback(),
 	)
 	if err != nil {
@@ -865,29 +1011,65 @@ func (c *Custodian) setReceiveCompleted(event *address.Event,
 		Index: lastProof.InclusionProof.OutputIndex,
 	}
 
-	return c.cfg.AddrBook.CompleteEvent(
+	err = c.cfg.AddrBook.CompleteEvent(
 		ctxt, event, address.StatusCompleted, anchorPoint,
 	)
+	if err != nil {
+		return fmt.Errorf("error completing event: %w", err)
+	}
+
+	// The event has been fully processed, no need to keep it in the cache
+	// anymore.
+	delete(c.events, event.Outpoint)
+
+	// At this point the "receive" process is complete. We will now notify
+	// all status event subscribers.
+	// At this point the "receive" process is complete. We will now notify
+	// all status event subscribers.
+	c.publishSubscriberStatusEvent(NewAssetReceiveEvent(
+		*event.Addr.Tap, event.Outpoint, event.ConfirmationHeight,
+		address.StatusCompleted,
+	))
+
+	return nil
 }
 
 // RegisterSubscriber adds a new subscriber to the set of subscribers that will
 // be notified of any new status update events.
-//
-// TODO(ffranr): Add support for delivering existing events to new subscribers.
 func (c *Custodian) RegisterSubscriber(receiver *fn.EventReceiver[fn.Event],
-	deliverExisting bool, deliverFrom bool) error {
+	deliverExisting bool, deliverFrom time.Time) error {
 
 	c.statusEventsSubsMtx.Lock()
 	defer c.statusEventsSubsMtx.Unlock()
 
 	c.statusEventsSubs[receiver.ID()] = receiver
 
+	if deliverExisting {
+		ctx := context.Background()
+		events, err := c.cfg.AddrBook.QueryEvents(
+			ctx, address.EventQueryParams{
+				CreationTimeFrom: &deliverFrom,
+			},
+		)
+		if err != nil {
+			return fmt.Errorf("error querying events: %w", err)
+		}
+
+		for _, event := range events {
+			newItemChan := receiver.NewItemCreated.ChanIn()
+			newItemChan <- NewAssetReceiveEvent(
+				*event.Addr.Tap, event.Outpoint,
+				event.ConfirmationHeight, event.Status,
+			)
+		}
+	}
+
 	return nil
 }
 
 // publishSubscriberStatusEvent publishes an event to all status events
 // subscribers.
-func (c *Custodian) publishSubscriberStatusEvent(event fn.Event) error {
+func (c *Custodian) publishSubscriberStatusEvent(event fn.Event) {
 	// Lock the subscriber mutex to ensure that we don't modify the
 	// subscriber map while we're iterating over it.
 	c.statusEventsSubsMtx.Lock()
@@ -895,11 +1077,10 @@ func (c *Custodian) publishSubscriberStatusEvent(event fn.Event) error {
 
 	for _, sub := range c.statusEventsSubs {
 		if !fn.SendOrQuit(sub.NewItemCreated.ChanIn(), event, c.Quit) {
-			return fmt.Errorf("custodian shutting down")
+			log.Errorf("Unable publish status event, custodian " +
+				"shutting down")
 		}
 	}
-
-	return nil
 }
 
 // RemoveSubscriber removes a subscriber from the set of status event
@@ -969,4 +1150,17 @@ func AddrMatchesAsset(addr *address.AddrWithKeyInfo, a *asset.Asset) bool {
 func EventMatchesProof(event *address.Event, p *proof.Proof) bool {
 	return AddrMatchesAsset(event.Addr, &p.Asset) &&
 		event.Outpoint == p.OutPoint()
+}
+
+// verifierCtx returns a verifier context that can be used to verify proofs.
+func (c *Custodian) verifierCtx(ctx context.Context) proof.VerifierCtx {
+	headerVerifier := GenHeaderVerifier(ctx, c.cfg.ChainBridge)
+	merkleVerifier := proof.DefaultMerkleVerifier
+
+	return proof.VerifierCtx{
+		HeaderVerifier: headerVerifier,
+		MerkleVerifier: merkleVerifier,
+		GroupVerifier:  c.cfg.GroupVerifier,
+		ChainLookupGen: c.cfg.ChainBridge,
+	}
 }

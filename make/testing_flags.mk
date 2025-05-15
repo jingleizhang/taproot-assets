@@ -4,10 +4,13 @@ RPC_TAGS = autopilotrpc chainrpc invoicesrpc peersrpc routerrpc signrpc verrpc w
 LOG_TAGS =
 TEST_FLAGS =
 ITEST_FLAGS = -logoutput
-COVER_PKG = $$(go list -deps -tags="$(DEV_TAGS)" ./... | grep '$(PKG)' | grep -v lnrpc)
-RACE_PKG = go list -deps -tags="$(DEV_TAGS)" ./... | grep '$(PKG)'
+ITEST_COVERAGE =
+COVER_PKG = $$(go list -deps -tags="$(DEV_TAGS)" ./... | grep '$(PKG)' | grep -v taprpc)
 COVER_HTML = go tool cover -html=coverage.txt -o coverage.html
 POSTGRES_START_DELAY = 5
+
+GOLIST := go list -tags="$(DEV_TAGS)" -deps $(PKG)/... | grep '$(PKG)'| grep -v '/vendor/'
+GOLISTCOVER := $(shell go list -tags="$(DEV_TAGS)" -deps -f '{{.ImportPath}}' ./... | grep '$(PKG)' | sed -e 's/^$(ESCPKG)/./')
 
 # If rpc option is set also add all extra RPC tags to DEV_TAGS
 ifneq ($(with-rpc),)
@@ -18,9 +21,9 @@ endif
 # subpackage.
 ifneq ($(pkg),)
 UNITPKG := $(PKG)/$(pkg)
+COVER_PKG := $(PKG)/$(pkg)
 UNIT_TARGETED = yes
-COVER_PKG = $(PKG)/$(pkg)
-RACE_PKG = $(PKG)/$(pkg)
+GOLIST = echo '$(PKG)/$(pkg)'
 endif
 
 # If a specific unit test case is being target, construct test.run filter.
@@ -53,8 +56,18 @@ ifeq ($(dbbackend),postgres)
 DEV_TAGS += test_db_postgres
 endif
 
+# Run universe tests with increased scale for performance testing.
+ifneq ($(long-tests),)
+DEV_TAGS += longtests
+endif
+
 ifneq ($(tags),)
 DEV_TAGS += ${tags}
+endif
+
+# Enable integration test coverage (requires Go >= 1.20.0).
+ifneq ($(cover),)
+ITEST_COVERAGE = -coverprofile=itest/coverage.txt -coverpkg=./...
 endif
 
 # Define the log tags that will be applied only when running unit tests. If none
@@ -80,11 +93,8 @@ TEST_FLAGS += -test.timeout=$(timeout)
 else ifneq ($(optional),)
 TEST_FLAGS += -test.timeout=240m
 else
-TEST_FLAGS += -test.timeout=20m
+TEST_FLAGS += -test.timeout=60m
 endif
-
-GOLIST := go list -tags="$(DEV_TAGS)" -deps $(PKG)/... | grep '$(PKG)'| grep -v '/vendor/'
-GOLISTCOVER := $(shell go list -tags="$(DEV_TAGS)" -deps -f '{{.ImportPath}}' ./... | grep '$(PKG)' | sed -e 's/^$(ESCPKG)/./')
 
 # UNIT_TARGTED is undefined iff a specific package and/or unit test case is
 # not being targeted.
@@ -94,6 +104,7 @@ UNIT_TARGETED ?= no
 # targeted case. Otherwise, default to running all tests.
 ifeq ($(UNIT_TARGETED), yes)
 UNIT := $(GOTEST) -tags="$(DEV_TAGS) $(LOG_TAGS)" $(TEST_FLAGS) $(UNITPKG)
+UNIT_COVER := $(GOTEST) -coverprofile=coverage.txt -tags="$(DEV_TAGS) $(LOG_TAGS)" $(TEST_FLAGS) $(UNITPKG)
 UNIT_DEBUG := $(GOTEST) -v -tags="$(DEV_TAGS) $(LOG_TAGS)" $(TEST_FLAGS) $(UNITPKG)
 UNIT_TRACE := $(GOTEST) -v -tags="$(DEV_TAGS) stdout trace" $(TEST_FLAGS) $(UNITPKG)
 UNIT_RACE := $(GOTEST) -tags="$(DEV_TAGS) $(LOG_TAGS) lowscrypt" $(TEST_FLAGS) -race $(UNITPKG)
@@ -101,6 +112,7 @@ endif
 
 ifeq ($(UNIT_TARGETED), no)
 UNIT := $(GOLIST) | $(XARGS) env $(GOTEST) -tags="$(DEV_TAGS) $(LOG_TAGS)" $(TEST_FLAGS)
+UNIT_COVER := $(GOTEST) -coverprofile=coverage.txt -tags="$(DEV_TAGS) $(LOG_TAGS)" $(TEST_FLAGS) ./...
 UNIT_DEBUG := $(GOLIST) | $(XARGS) env $(GOTEST) -v -tags="$(DEV_TAGS) $(LOG_TAGS)" $(TEST_FLAGS)
 UNIT_TRACE := $(GOLIST) | $(XARGS) env $(GOTEST) -v -tags="$(DEV_TAGS) stdout trace" $(TEST_FLAGS)
 UNIT_RACE := $(UNIT) -race

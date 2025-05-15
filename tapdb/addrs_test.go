@@ -11,9 +11,11 @@ import (
 	"github.com/btcsuite/btcd/wire"
 	"github.com/lightninglabs/lndclient"
 	"github.com/lightninglabs/taproot-assets/address"
+	"github.com/lightninglabs/taproot-assets/asset"
 	"github.com/lightninglabs/taproot-assets/internal/test"
 	"github.com/lightninglabs/taproot-assets/tapdb/sqlc"
 	"github.com/lightningnetwork/lnd/clock"
+	"github.com/lightningnetwork/lnd/keychain"
 	"github.com/lightningnetwork/lnd/lnrpc"
 	"github.com/stretchr/testify/require"
 )
@@ -194,6 +196,17 @@ func TestAddressInsertion(t *testing.T) {
 		require.NoError(t, err)
 		require.NotNil(t, scriptKey.RawKey.PubKey)
 		require.False(t, scriptKey.RawKey.IsEmpty())
+		require.Equal(t, addr.ScriptKeyTweak.RawKey, scriptKey.RawKey)
+
+		// And the internal key as well.
+		internalKeyLoc, err := addrBook.FetchInternalKeyLocator(
+			ctx, &addr.InternalKey,
+		)
+		require.NoError(t, err)
+		require.False(t, internalKeyLoc.IsEmpty())
+		require.Equal(
+			t, addr.InternalKeyDesc.KeyLocator, internalKeyLoc,
+		)
 	}
 
 	// All addresses should be unmanaged at this point.
@@ -335,19 +348,19 @@ func TestAddressQuery(t *testing.T) {
 			numAddrs:      numAddrs,
 		},
 	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
 			dbAddrs, err := addrBook.QueryAddrs(
 				ctx, address.QueryParams{
-					CreatedAfter:  test.createdAfter,
-					CreatedBefore: test.createdBefore,
-					Offset:        test.offset,
-					Limit:         test.limit,
-					UnmanagedOnly: test.unmanagedOnly,
+					CreatedAfter:  tc.createdAfter,
+					CreatedBefore: tc.createdBefore,
+					Offset:        tc.offset,
+					Limit:         tc.limit,
+					UnmanagedOnly: tc.unmanagedOnly,
 				},
 			)
 			require.NoError(t, err)
-			require.Len(t, dbAddrs, test.numAddrs)
+			require.Len(t, dbAddrs, tc.numAddrs)
 		})
 	}
 }
@@ -431,6 +444,10 @@ func TestAddrEventCreation(t *testing.T) {
 		require.NoError(t, err)
 
 		events[i] = event
+
+		// We need to advance the test clock a tiny bit to make our
+		// event timestamps unique.
+		testClock.SetTime(testClock.Now().Add(time.Millisecond))
 	}
 
 	// All 5 events should be returned when querying pending events.
@@ -439,6 +456,16 @@ func TestAddrEventCreation(t *testing.T) {
 	)
 	require.NoError(t, err)
 	assertEqualAddrEvents(t, events, pendingEvents)
+
+	// When querying by timestamp of the 3rd event, we should only get that
+	// event and all events that were created after it.
+	timedEvents, err := addrBook.QueryAddrEvents(
+		ctx, address.EventQueryParams{
+			CreationTimeFrom: &events[2].CreationTime,
+		},
+	)
+	require.NoError(t, err)
+	assertEqualAddrEvents(t, events[2:], timedEvents)
 
 	// If we try to create the same events again, we should just get the
 	// exact same event back.
@@ -580,24 +607,164 @@ func TestAddressEventQuery(t *testing.T) {
 			firstID:  5,
 		},
 	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			test := test
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			tc := tc
 			dbAddrs, err := addrBook.QueryAddrEvents(
 				ctx, address.EventQueryParams{
-					AddrTaprootOutputKey: test.addrTaprootKey,
-					StatusFrom:           test.stateFrom,
-					StatusTo:             test.stateTo,
+					AddrTaprootOutputKey: tc.addrTaprootKey,
+					StatusFrom:           tc.stateFrom,
+					StatusTo:             tc.stateTo,
 				},
 			)
 			require.NoError(t, err)
-			require.Len(t, dbAddrs, test.numAddrs)
+			require.Len(t, dbAddrs, tc.numAddrs)
 
-			if test.firstID > 0 {
+			if tc.firstID > 0 {
 				require.EqualValues(
-					t, dbAddrs[0].ID, test.firstID,
+					t, dbAddrs[0].ID, tc.firstID,
 				)
+			}
+
+			// Make sure we get the correct error if we're querying
+			// for an invalid status.
+			_, err = addrBook.QueryEvent(
+				ctx, &addrs[0], wire.OutPoint{},
+			)
+			require.ErrorIs(t, err, address.ErrNoEvent)
+
+			// If we did get any events returned in the first query,
+			// make sure we can also fetch them using the QueryEvent
+			// method.
+			for _, dbEvent := range dbAddrs {
+				event, err := addrBook.QueryEvent(
+					ctx, dbEvent.Addr, dbEvent.Outpoint,
+				)
+				require.NoError(t, err)
+				assertEqualAddrEvent(t, *dbEvent, *event)
 			}
 		})
 	}
+}
+
+// randScriptKey makes a random script key with a tweak.
+func randScriptKey(t *testing.T) asset.ScriptKey {
+	scriptKey := asset.RandScriptKey(t)
+	scriptKey.TweakedScriptKey = &asset.TweakedScriptKey{
+		RawKey: keychain.KeyDescriptor{
+			PubKey: asset.RandScriptKey(t).PubKey,
+		},
+	}
+
+	return scriptKey
+}
+
+func assertKeyKnowledge(t *testing.T, ctx context.Context,
+	addrBook *TapAddressBook, scriptKey asset.ScriptKey,
+	keyType asset.ScriptKeyType) {
+
+	dbScriptKey, err := addrBook.FetchScriptKey(ctx, scriptKey.PubKey)
+	require.NoError(t, err)
+	require.Equal(t, keyType, dbScriptKey.Type)
+}
+
+func assertTweak(t *testing.T, ctx context.Context, addrBook *TapAddressBook,
+	scriptKey asset.ScriptKey, tweak []byte) {
+
+	dbScriptKey, err := addrBook.FetchScriptKey(ctx, scriptKey.PubKey)
+	require.NoError(t, err)
+	require.Equal(t, tweak, dbScriptKey.Tweak)
+}
+
+// TestScriptKeyTweakUpsert tests that we can insert a script key, then insert
+// it again when we know the tweak for it.
+func TestScriptKeyTweakUpsert(t *testing.T) {
+	t.Parallel()
+
+	// First, make a new addr book instance we'll use in the test below.
+	testClock := clock.NewTestClock(time.Now())
+	addrBook, _ := newAddrBook(t, testClock)
+
+	ctx := context.Background()
+
+	// In this test, we insert the tweak as NULL, and make sure we overwrite
+	// it with an actual value again later.
+	t.Run("null_to_value", func(t *testing.T) {
+		scriptKey := randScriptKey(t)
+		scriptKey.Tweak = nil
+
+		// We'll insert a random script key into the database. We won't
+		// declare it as known though, and it doesn't have the tweak.
+		err := addrBook.InsertScriptKey(
+			ctx, scriptKey, asset.ScriptKeyUnknown,
+		)
+		require.NoError(t, err)
+
+		// We'll fetch the script key and confirm that it's not known.
+		assertKeyKnowledge(
+			t, ctx, addrBook, scriptKey, asset.ScriptKeyUnknown,
+		)
+		assertTweak(t, ctx, addrBook, scriptKey, nil)
+
+		randTweak := test.RandBytes(32)
+		scriptKey.Tweak = randTweak
+
+		// We'll now insert it again, but this time declare it as known
+		// and also know the tweak.
+		err = addrBook.InsertScriptKey(
+			ctx, scriptKey, asset.ScriptKeyScriptPathExternal,
+		)
+		require.NoError(t, err)
+
+		// We'll fetch the script key and confirm that it's known.
+		assertKeyKnowledge(
+			t, ctx, addrBook, scriptKey,
+			asset.ScriptKeyScriptPathExternal,
+		)
+		assertTweak(t, ctx, addrBook, scriptKey, randTweak)
+	})
+}
+
+// TestScriptKeyTypeUpsert tests that we can insert a script key, then insert
+// it again when we know the type for it.
+func TestScriptKeyTypeUpsert(t *testing.T) {
+	t.Parallel()
+
+	// First, make a new addr book instance we'll use in the test below.
+	testClock := clock.NewTestClock(time.Now())
+	addrBook, _ := newAddrBook(t, testClock)
+
+	ctx := context.Background()
+
+	// In this test, we insert the type as unknown, and make sure we
+	// overwrite it with an actual value again later.
+	t.Run("null_to_value", func(t *testing.T) {
+		scriptKey := randScriptKey(t)
+		scriptKey.Tweak = nil
+
+		// We'll insert a random script key into the database. It is
+		// declared as known, but doesn't have a known type.
+		err := addrBook.InsertScriptKey(
+			ctx, scriptKey, asset.ScriptKeyUnknown,
+		)
+		require.NoError(t, err)
+
+		// We'll fetch the script key and confirm that it's not known.
+		assertKeyKnowledge(
+			t, ctx, addrBook, scriptKey, asset.ScriptKeyUnknown,
+		)
+		assertTweak(t, ctx, addrBook, scriptKey, nil)
+
+		// We'll now insert it again, but this time declare it as known
+		// and also know the tweak.
+		err = addrBook.InsertScriptKey(
+			ctx, scriptKey, asset.ScriptKeyBip86,
+		)
+		require.NoError(t, err)
+
+		// We'll fetch the script key and confirm that it's known.
+		assertKeyKnowledge(
+			t, ctx, addrBook, scriptKey, asset.ScriptKeyBip86,
+		)
+	})
 }

@@ -1,7 +1,10 @@
 package tapfreighter
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
 	"fmt"
 	"time"
 
@@ -21,6 +24,12 @@ import (
 	"github.com/lightningnetwork/lnd/keychain"
 )
 
+const (
+	// TransferTxLabel defines the label assigned to an on-chain transaction
+	// that represents a tapd asset transfer.
+	TransferTxLabel = "tapd-asset-transfer"
+)
+
 // CommitmentConstraints conveys the constraints on the type of Taproot asset
 // commitments needed to satisfy a send request. Typically, for Bitcoin we just
 // care about the amount. In the case of Taproot Asset, we also need to worry
@@ -28,17 +37,55 @@ import (
 //
 // NOTE: Only the GroupKey or the AssetID should be set.
 type CommitmentConstraints struct {
-	// GroupKey is the required group key. This is an optional field, if
-	// set then the asset returned may have a distinct asset ID to the one
-	// specified below.
-	GroupKey *btcec.PublicKey
-
-	// AssetID is the asset ID that needs to be satisfied.
-	AssetID *asset.ID
+	// AssetSpecifier specifies the asset.
+	AssetSpecifier asset.Specifier
 
 	// MinAmt is the minimum amount that an asset commitment needs to hold
 	// to satisfy the constraints.
 	MinAmt uint64
+
+	// MaxAmt specifies the maximum amount that an asset commitment needs to
+	// hold to satisfy the constraints.
+	MaxAmt uint64
+
+	// PrevIDs are the set of inputs allowed to be used.
+	PrevIDs []asset.PrevID
+
+	// DistinctSpecifier indicates whether we _only_ look at either the
+	// group key _or_ the asset ID but not both. That means, if the group
+	// key is set, we ignore the asset ID and allow multiple inputs of the
+	// same group to be selected.
+	DistinctSpecifier bool
+
+	// ScriptKeyType is the type of script key the assets are expected to
+	// have. If this is fn.None, then any script key type is allowed.
+	ScriptKeyType fn.Option[asset.ScriptKeyType]
+}
+
+// AssetBurn holds data related to a burn of an asset.
+type AssetBurn struct {
+	// Note is a user provided description for the transfer.
+	Note string
+
+	// AssetID is the ID of the burnt asset.
+	AssetID []byte
+
+	// GroupKey is the group key of the group the burnt asset belongs to.
+	GroupKey []byte
+
+	// Amount is the amount of the asset that got burnt.
+	Amount uint64
+
+	// AnchorTxid is the txid of the transaction this burn is anchored to.
+	AnchorTxid chainhash.Hash
+}
+
+// String returns the string representation of the commitment constraints.
+func (c *CommitmentConstraints) String() string {
+	assetIDBytes, groupKeyBytes := c.AssetSpecifier.AsBytes()
+
+	return fmt.Sprintf("group_key=%x, asset_id=%x, min_amt=%d",
+		groupKeyBytes, assetIDBytes, c.MinAmt)
 }
 
 // AnchoredCommitment is the response to satisfying the set of
@@ -68,6 +115,15 @@ type AnchoredCommitment struct {
 	// Asset is the asset that ratifies the above constraints, and should
 	// be used as an input to a transaction.
 	Asset *asset.Asset
+}
+
+// PrevID returns the previous ID of the asset commitment.
+func (c *AnchoredCommitment) PrevID() asset.PrevID {
+	return asset.PrevID{
+		OutPoint:  c.AnchorPoint,
+		ID:        c.Asset.ID(),
+		ScriptKey: asset.ToSerialized(c.Asset.ScriptKey.PubKey),
+	}
 }
 
 var (
@@ -123,8 +179,9 @@ type CoinSelector interface {
 	// given constraints and strategy. The coins returned are leased for the
 	// default lease duration.
 	SelectCoins(ctx context.Context, constraints CommitmentConstraints,
-		strategy MultiCommitmentSelectStrategy) ([]*AnchoredCommitment,
-		error)
+		strategy MultiCommitmentSelectStrategy,
+		maxVersion commitment.TapCommitmentVersion,
+	) ([]*AnchoredCommitment, error)
 
 	// ReleaseCoins releases/unlocks coins that were previously leased and
 	// makes them available for coin selection again.
@@ -157,6 +214,10 @@ type Anchor struct {
 	// anchor output.
 	TaprootAssetRoot []byte
 
+	// CommitmentVersion is the version of the Taproot Asset commitment
+	// anchored in this output.
+	CommitmentVersion *uint8
+
 	// MerkleRoot is the root of the tap script merkle tree that also
 	// contains the Taproot Asset commitment of the anchor output. If there
 	// is no tapscript sibling, then this is equal to the TaprootAssetRoot.
@@ -169,6 +230,26 @@ type Anchor struct {
 	// NumPassiveAssets is the number of passive assets in the commitment
 	// for this anchor output.
 	NumPassiveAssets uint32
+
+	// PkScript is the pkScript of the anchor output.
+	PkScript []byte
+}
+
+// OutputIdentifier is a key that can be used to uniquely identify a transfer
+// output.
+type OutputIdentifier [32]byte
+
+// NewOutputIdentifier creates a new output identifier for the given asset ID,
+// output index and script key. This is used to uniquely identify the output
+// from the transfer entries in the database.
+func NewOutputIdentifier(id asset.ID, outputIndex uint32,
+	scriptKey btcec.PublicKey) OutputIdentifier {
+
+	keyData := make([]byte, 32+4+len(scriptKey.SerializeCompressed()))
+	copy(keyData[0:32], id[:])
+	binary.BigEndian.PutUint32(keyData[32:36], outputIndex)
+	copy(keyData[36:], scriptKey.SerializeCompressed())
+	return sha256.Sum256(keyData)
 }
 
 // TransferOutput represents the database level output to an asset transfer.
@@ -194,6 +275,17 @@ type TransferOutput struct {
 	// Amount is the new amount for the asset.
 	Amount uint64
 
+	// LockTime, if non-zero, restricts an asset from being moved prior to
+	// the represented block height in the chain. This value needs to be set
+	// on the asset that is spending from a script key with a CLTV script.
+	LockTime uint64
+
+	// RelativeLockTime, if non-zero, restricts an asset from being moved
+	// until a number of blocks after the confirmation height of the latest
+	// transaction for the asset is reached. This value needs to be set
+	// on the asset that is spending from a script key with a CSV script.
+	RelativeLockTime uint64
+
 	// AssetVersion is the new asset version for this output.
 	AssetVersion asset.Version
 
@@ -212,6 +304,97 @@ type TransferOutput struct {
 	// ProofCourierAddr is the bytes encoded proof courier service address
 	// associated with this output.
 	ProofCourierAddr []byte
+
+	// ProofDeliveryComplete is a flag that indicates whether the proof
+	// delivery for this output is complete.
+	//
+	// This field can take one of the following values:
+	// - None: A proof will not be delivered to a counterparty.
+	// - False: The proof has not yet been delivered successfully.
+	// - True: The proof has been delivered to the recipient.
+	ProofDeliveryComplete fn.Option[bool]
+
+	// Position is the position of the output in the transfer output list.
+	Position uint64
+}
+
+// ShouldDeliverProof returns true if a proof corresponding to the subject
+// transfer output should be delivered to a peer.
+func (out *TransferOutput) ShouldDeliverProof() (bool, error) {
+	// If any proof delivery is already complete (some true), no further
+	// delivery is needed. However, if the proof delivery status is
+	// unset (none), we won't use that status in determining whether proof
+	// delivery is necessary. The field may not be set yet.
+	if out.ProofDeliveryComplete.UnwrapOr(false) {
+		return false, nil
+	}
+
+	// If the proof courier address is unspecified, we don't need to deliver
+	// a proof.
+	if len(out.ProofCourierAddr) == 0 {
+		return false, nil
+	}
+
+	// The proof courier address may have been specified in error, in which
+	// case we will conduct further checks to determine if a proof should be
+	// delivered.
+	//
+	// If the script key is un-spendable, we don't need to deliver a proof.
+	unSpendable, err := out.ScriptKey.IsUnSpendable()
+	if err != nil {
+		return false, fmt.Errorf("error checking if script key is "+
+			"unspendable: %w", err)
+	}
+
+	if unSpendable {
+		return false, nil
+	}
+
+	// If this is an output that is going to our own node/wallet, we don't
+	// need to deliver a proof.
+	if out.ScriptKey.TweakedScriptKey != nil && out.ScriptKeyLocal {
+		return false, nil
+	}
+
+	// If the script key is a burn key, we don't need to deliver a proof.
+	if len(out.WitnessData) > 0 && asset.IsBurnKey(
+		out.ScriptKey.PubKey, out.WitnessData[0],
+	) {
+
+		return false, nil
+	}
+
+	// At this point, we should deliver a proof.
+	return true, nil
+}
+
+// UniqueKey returns a unique key that can be used to identify the output.
+// Because this requires the output proof to be set to extract the asset ID, an
+// error is returned if it is not.
+func (out *TransferOutput) UniqueKey() (OutputIdentifier, error) {
+	var zero [32]byte
+	if len(out.ProofSuffix) == 0 {
+		return zero, fmt.Errorf("proof suffix not set")
+	}
+
+	var (
+		outProofAsset  asset.Asset
+		inclusionProof proof.TaprootProof
+	)
+	err := proof.SparseDecode(
+		bytes.NewReader(out.ProofSuffix),
+		proof.AssetLeafRecord(&outProofAsset),
+		proof.InclusionProofRecord(&inclusionProof),
+	)
+	if err != nil {
+		return zero, fmt.Errorf("unable to sparse decode proof: %w",
+			err)
+	}
+
+	return NewOutputIdentifier(
+		outProofAsset.ID(), inclusionProof.OutputIndex,
+		*out.ScriptKey.PubKey,
+	), nil
 }
 
 // OutboundParcel represents the database level delta of an outbound Taproot
@@ -229,6 +412,16 @@ type OutboundParcel struct {
 	// confirmations.
 	AnchorTxHeightHint uint32
 
+	// AnchorTxBlockHash is the block hash of the block that contains the
+	// anchor transaction. This is set once the anchor transaction is
+	// confirmed.
+	AnchorTxBlockHash fn.Option[chainhash.Hash]
+
+	// AnchorTxBlockHeight is the block height of the block that contains
+	// the anchor transaction. This is set once the anchor transaction is
+	// confirmed.
+	AnchorTxBlockHeight uint32
+
 	// TransferTime holds the timestamp of the outbound spend.
 	TransferTime time.Time
 
@@ -238,7 +431,12 @@ type OutboundParcel struct {
 
 	// PassiveAssets is the set of passive assets that are re-anchored
 	// during the parcel confirmation process.
-	PassiveAssets []*PassiveAssetReAnchor
+	PassiveAssets []*tappsbt.VPacket
+
+	// PassiveAssetsAnchor is the anchor point for the passive assets. This
+	// might be a distinct anchor from any active transfer in case the
+	// active transfers don't create any change going back to us.
+	PassiveAssetsAnchor *Anchor
 
 	// Inputs represents the list of previous assets that were spent with
 	// this transfer.
@@ -247,6 +445,41 @@ type OutboundParcel struct {
 	// Outputs represents the list of new assets that were created with this
 	// transfer.
 	Outputs []TransferOutput
+
+	// Label is a user provided label for the transfer.
+	Label string
+}
+
+// Copy creates a deep copy of the OutboundParcel.
+func (o *OutboundParcel) Copy() *OutboundParcel {
+	newParcel := &OutboundParcel{
+		AnchorTxHeightHint: o.AnchorTxHeightHint,
+		TransferTime:       o.TransferTime,
+		ChainFees:          o.ChainFees,
+		PassiveAssets:      fn.CopyAll(o.PassiveAssets),
+		Inputs:             fn.CopySlice(o.Inputs),
+		Outputs:            fn.CopySlice(o.Outputs),
+	}
+
+	if o.AnchorTx != nil {
+		newParcel.AnchorTx = o.AnchorTx.Copy()
+	}
+
+	if o.PassiveAssetsAnchor != nil {
+		oldAnchor := o.PassiveAssetsAnchor
+		newParcel.PassiveAssetsAnchor = &Anchor{
+			OutPoint:          oldAnchor.OutPoint,
+			Value:             oldAnchor.Value,
+			InternalKey:       oldAnchor.InternalKey,
+			TaprootAssetRoot:  oldAnchor.TaprootAssetRoot,
+			CommitmentVersion: oldAnchor.CommitmentVersion,
+			MerkleRoot:        oldAnchor.MerkleRoot,
+			TapscriptSibling:  oldAnchor.TapscriptSibling,
+			NumPassiveAssets:  oldAnchor.NumPassiveAssets,
+		}
+	}
+
+	return newParcel
 }
 
 // AssetConfirmEvent is used to mark a batched spend as confirmed on disk.
@@ -267,42 +500,11 @@ type AssetConfirmEvent struct {
 
 	// FinalProofs is the set of final full proof chain files that are going
 	// to be stored on disk, one for each output in the outbound parcel.
-	FinalProofs map[asset.SerializedKey]*proof.AnnotatedProof
+	FinalProofs map[OutputIdentifier]*proof.AnnotatedProof
 
 	// PassiveAssetProofFiles is the set of passive asset proof files that
 	// are re-anchored during the parcel confirmation process.
-	PassiveAssetProofFiles map[[32]byte]proof.Blob
-}
-
-// PassiveAssetReAnchor includes the information needed to re-anchor a passive
-// asset during asset send delivery confirmation.
-type PassiveAssetReAnchor struct {
-	// VPacket is a virtual packet which describes the virtual transaction
-	// which is used in re-anchoring the passive asset.
-	VPacket *tappsbt.VPacket
-
-	// GenesisID is the genesis ID of the passive asset.
-	GenesisID asset.ID
-
-	// PrevAnchorPoint is the previous anchor point of the passive asset
-	// before re-anchoring. This field is used to identify the correct asset
-	// to update.
-	PrevAnchorPoint wire.OutPoint
-
-	// ScriptKey is the previous script key of the passive asset before
-	// re-anchoring. This field is used to identify the correct asset to
-	// update.
-	ScriptKey asset.ScriptKey
-
-	// AssetVersion is the version of this passive asset. We make this
-	// explicit as the asset may have been upgraded during the re-anchor.
-	AssetVersion asset.Version
-
-	// NewProof is the proof set of the re-anchored passive asset.
-	NewProof *proof.Proof
-
-	// NewWitnessData is the new witness set for this asset.
-	NewWitnessData []asset.Witness
+	PassiveAssetProofFiles map[asset.ID][]*proof.AnnotatedProof
 }
 
 // ExportLog is used to track the state of outbound Taproot Asset parcels
@@ -321,10 +523,19 @@ type ExportLog interface {
 	// transactions for re-broadcast.
 	PendingParcels(context.Context) ([]*OutboundParcel, error)
 
-	// ConfirmParcelDelivery marks a spend event on disk as confirmed. This
-	// updates the on-chain reference information on disk to point to this
-	// new spend.
-	ConfirmParcelDelivery(context.Context, *AssetConfirmEvent) error
+	// ConfirmProofDelivery marks a transfer output proof as successfully
+	// transferred.
+	ConfirmProofDelivery(context.Context, wire.OutPoint, uint64) error
+
+	// LogAnchorTxConfirm updates the send package state on disk to reflect
+	// the confirmation of the anchor transaction, ensuring the on-chain
+	// reference information is up to date.
+	LogAnchorTxConfirm(context.Context, *AssetConfirmEvent,
+		[]*AssetBurn) error
+
+	// QueryParcels returns the set of confirmed or unconfirmed parcels.
+	QueryParcels(ctx context.Context, anchorTxHash *chainhash.Hash,
+		pending bool) ([]*OutboundParcel, error)
 }
 
 // ChainBridge aliases into the ChainBridge of the tapgarden package.
@@ -352,6 +563,13 @@ type Porter interface {
 	// through the chain porter. If successful, an initial response will be
 	// returned with the pending transfer information.
 	RequestShipment(req Parcel) (*OutboundParcel, error)
+
+	// QueryParcels returns the set of confirmed or unconfirmed parcels. If
+	// the anchor tx hash is Some, then a query for an parcel with the
+	// matching anchor hash will be made.
+	QueryParcels(ctx context.Context,
+		anchorTxHash fn.Option[chainhash.Hash], pending bool,
+	) ([]*OutboundParcel, error)
 
 	// Start signals that the asset minter should being operations.
 	Start() error

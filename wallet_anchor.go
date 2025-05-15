@@ -13,8 +13,10 @@ import (
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcwallet/waddrmgr"
 	"github.com/lightninglabs/lndclient"
+	"github.com/lightninglabs/taproot-assets/rfq"
 	"github.com/lightninglabs/taproot-assets/tapfreighter"
 	"github.com/lightninglabs/taproot-assets/tapgarden"
+	"github.com/lightninglabs/taproot-assets/tapsend"
 	"github.com/lightningnetwork/lnd/lnrpc/walletrpc"
 	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/lnwallet/chainfee"
@@ -43,37 +45,63 @@ const (
 // FundPsbt attaches enough inputs to the target PSBT packet for it to be
 // valid.
 func (l *LndRpcWalletAnchor) FundPsbt(ctx context.Context, packet *psbt.Packet,
-	minConfs uint32, feeRate chainfee.SatPerKWeight) (tapgarden.FundedPsbt,
-	error) {
+	minConfs uint32, feeRate chainfee.SatPerKWeight,
+	changeIdx int32) (*tapsend.FundedPsbt, error) {
 
 	var psbtBuf bytes.Buffer
 	if err := packet.Serialize(&psbtBuf); err != nil {
-		return tapgarden.FundedPsbt{}, fmt.Errorf("unable to encode "+
-			"psbt: %w", err)
+		return nil, fmt.Errorf("unable to encode psbt: %w", err)
 	}
+
+	var fundTemplate *walletrpc.FundPsbtRequest_CoinSelect
+
+	if changeIdx < 0 {
+		fundTemplate = &walletrpc.FundPsbtRequest_CoinSelect{
+			CoinSelect: &walletrpc.PsbtCoinSelect{
+				Psbt: psbtBuf.Bytes(),
+				ChangeOutput: &walletrpc.PsbtCoinSelect_Add{
+					Add: true,
+				},
+			},
+		}
+	} else {
+		change := &walletrpc.PsbtCoinSelect_ExistingOutputIndex{
+			ExistingOutputIndex: changeIdx,
+		}
+
+		fundTemplate = &walletrpc.FundPsbtRequest_CoinSelect{
+			CoinSelect: &walletrpc.PsbtCoinSelect{
+				Psbt:         psbtBuf.Bytes(),
+				ChangeOutput: change,
+			},
+		}
+	}
+
+	// We'll convert the fee rate to sat/vbyte as that's what the FundPsbt
+	// expects. We round up to the nearest whole unit to prevent issues
+	// where the fee doesn't meet the min_relay_fee because of rounding
+	// down.
+	satPerVByte := uint64(math.Ceil(float64(feeRate.FeePerKVByte()) / 1000))
 
 	pkt, changeIndex, leasedUtxos, err := l.lnd.WalletKit.FundPsbt(
 		ctx, &walletrpc.FundPsbtRequest{
-			Template: &walletrpc.FundPsbtRequest_Psbt{
-				Psbt: psbtBuf.Bytes(),
-			},
+			Template: fundTemplate,
 			Fees: &walletrpc.FundPsbtRequest_SatPerVbyte{
-				SatPerVbyte: uint64(feeRate.FeePerKVByte()) / 1000,
+				SatPerVbyte: satPerVByte,
 			},
 			MinConfs:   int32(minConfs),
 			ChangeType: defaultChangeType,
 		},
 	)
 	if err != nil {
-		return tapgarden.FundedPsbt{}, fmt.Errorf("unable to fund "+
-			"psbt: %w", err)
+		return nil, fmt.Errorf("unable to fund psbt: %w", err)
 	}
 
 	lockedUtxos := make([]wire.OutPoint, len(leasedUtxos))
 	for i, utxo := range leasedUtxos {
 		txid, err := chainhash.NewHash(utxo.Outpoint.TxidBytes)
 		if err != nil {
-			return tapgarden.FundedPsbt{}, err
+			return nil, err
 		}
 		lockedUtxos[i] = wire.OutPoint{
 			Hash:  *txid,
@@ -81,7 +109,7 @@ func (l *LndRpcWalletAnchor) FundPsbt(ctx context.Context, packet *psbt.Packet,
 		}
 	}
 
-	return tapgarden.FundedPsbt{
+	return &tapsend.FundedPsbt{
 		Pkt:               pkt,
 		ChangeOutputIndex: changeIndex,
 		LockedUTXOs:       lockedUtxos,
@@ -130,8 +158,28 @@ func (l *LndRpcWalletAnchor) ImportTaprootOutput(ctx context.Context,
 	return addr, nil
 }
 
-// UnlockInput unlocks the set of target inputs after a batch is abandoned.
-func (l *LndRpcWalletAnchor) UnlockInput(ctx context.Context) error {
+// UnlockInput unlocks the set of target inputs after a batch or send
+// transaction is abandoned.
+func (l *LndRpcWalletAnchor) UnlockInput(ctx context.Context,
+	op wire.OutPoint) error {
+
+	leases, err := l.lnd.WalletKit.ListLeases(ctx)
+	if err != nil {
+		return fmt.Errorf("error listing existing leases: %w", err)
+	}
+
+	for _, lease := range leases {
+		if lease.Outpoint == op {
+			err = l.lnd.WalletKit.ReleaseOutput(
+				ctx, lease.LockID, lease.Outpoint,
+			)
+			if err != nil {
+				return fmt.Errorf("error releasing lease: %w",
+					err)
+			}
+		}
+	}
+
 	return nil
 }
 
@@ -169,8 +217,24 @@ func (l *LndRpcWalletAnchor) ListTransactions(ctx context.Context, startHeight,
 	)
 }
 
+// ListChannels returns the list of active channels of the backing lnd node.
+func (l *LndRpcWalletAnchor) ListChannels(
+	ctx context.Context) ([]lndclient.ChannelInfo, error) {
+
+	return l.lnd.Client.ListChannels(ctx, true, false)
+}
+
+// MinRelayFee estimates the minimum fee rate required for a
+// transaction.
+func (l *LndRpcWalletAnchor) MinRelayFee(
+	ctx context.Context) (chainfee.SatPerKWeight, error) {
+
+	return l.lnd.WalletKit.MinRelayFee(ctx)
+}
+
 // A compile time assertion to ensure LndRpcWalletAnchor meets the
 // tapgarden.WalletAnchor interface.
 var _ tapgarden.WalletAnchor = (*LndRpcWalletAnchor)(nil)
 
 var _ tapfreighter.WalletAnchor = (*LndRpcWalletAnchor)(nil)
+var _ rfq.ChannelLister = (*LndRpcWalletAnchor)(nil)

@@ -58,7 +58,7 @@ type (
 
 	// FedUniSyncConfigs is the universe specific federation sync config
 	// returned from a query.
-	FedUniSyncConfigs = sqlc.FederationUniSyncConfig
+	FedUniSyncConfigs = sqlc.QueryFederationUniSyncConfigsRow
 
 	// QueryUniServersParams is used to query for universe servers.
 	QueryUniServersParams = sqlc.QueryUniverseServersParams
@@ -172,7 +172,7 @@ type BatchedUniverseServerStore interface {
 }
 
 // assetSyncCfgs is a map of asset ID to universe specific sync config.
-type assetSyncCfgs = lnutils.SyncMap[treeID, *universe.FedUniSyncConfig]
+type assetSyncCfgs = lnutils.SyncMap[universeIDKey, *universe.FedUniSyncConfig]
 
 // globalSyncCfgs is a map of proof type to global sync config.
 type globalSyncCfgs = lnutils.SyncMap[
@@ -279,7 +279,7 @@ func (u *UniverseFederationDB) RemoveServers(ctx context.Context,
 			// host string instead. This avoids bugs where a user
 			// doesn't set the ID value, and we try to delete the
 			// very first server.
-			uniID := int64(a.ID)
+			uniID := a.ID
 			if a.HostStr() != "" {
 				uniID = -1
 			}
@@ -319,7 +319,7 @@ func (u *UniverseFederationDB) UpsertFederationProofSyncLog(
 
 	// Encode the leaf key outpoint as bytes. We'll use this to look up the
 	// leaf ID in the DB.
-	leafKeyOutpointBytes, err := encodeOutpoint(leafKey.OutPoint)
+	leafKeyOutpointBytes, err := encodeOutpoint(leafKey.LeafOutPoint())
 	if err != nil {
 		return 0, err
 	}
@@ -327,7 +327,7 @@ func (u *UniverseFederationDB) UpsertFederationProofSyncLog(
 	// Encode the leaf script key pub key as bytes. We'll use this to look
 	// up the leaf ID in the DB.
 	scriptKeyPubKeyBytes := schnorr.SerializePubKey(
-		leafKey.ScriptKey.PubKey,
+		leafKey.LeafScriptKey().PubKey,
 	)
 
 	var (
@@ -369,7 +369,7 @@ func (u *UniverseFederationDB) QueryFederationProofSyncLog(
 
 	// Encode the leaf key outpoint as bytes. We'll use this to look up the
 	// leaf ID in the DB.
-	leafKeyOutpointBytes, err := encodeOutpoint(leafKey.OutPoint)
+	leafKeyOutpointBytes, err := encodeOutpoint(leafKey.LeafOutPoint())
 	if err != nil {
 		return nil, err
 	}
@@ -377,7 +377,7 @@ func (u *UniverseFederationDB) QueryFederationProofSyncLog(
 	// Encode the leaf script key pub key as bytes. We'll use this to look
 	// up the leaf ID in the DB.
 	scriptKeyPubKeyBytes := schnorr.SerializePubKey(
-		leafKey.ScriptKey.PubKey,
+		leafKey.LeafScriptKey().PubKey,
 	)
 
 	var (
@@ -531,7 +531,7 @@ func fetchProofSyncLogEntry(ctx context.Context, entry ProofSyncLogEntry,
 		return nil, err
 	}
 
-	leafKey := universe.LeafKey{
+	leafKey := universe.BaseLeafKey{
 		OutPoint:  outPoint,
 		ScriptKey: &scriptKey,
 	}
@@ -553,7 +553,7 @@ func fetchProofSyncLogEntry(ctx context.Context, entry ProofSyncLogEntry,
 
 	uniID, err := universe.NewUniIDFromRawArgs(
 		entry.UniAssetID, entry.UniGroupKey,
-		entry.UniProofType,
+		entry.UniProofType.String,
 	)
 	if err != nil {
 		return nil, err
@@ -648,10 +648,12 @@ func (u *UniverseFederationDB) UpsertFederationSyncConfig(
 
 			err := db.UpsertFederationUniSyncConfig(
 				ctx, UpsertFedUniSyncConfigParams{
-					Namespace:       uniID.String(),
-					AssetID:         assetIDBytes,
-					GroupKey:        groupPubKey,
-					ProofType:       uniID.ProofType.String(),
+					Namespace: uniID.String(),
+					AssetID:   assetIDBytes,
+					GroupKey:  groupPubKey,
+					ProofType: sqlStr(
+						uniID.ProofType.String(),
+					),
 					AllowSyncInsert: config.AllowSyncInsert,
 					AllowSyncExport: config.AllowSyncExport,
 				},
@@ -699,7 +701,7 @@ func (u *UniverseFederationDB) QueryFederationSyncConfigs(
 
 		return true
 	})
-	u.assetCfgs.Load().Range(func(treeID treeID,
+	u.assetCfgs.Load().Range(func(treeID universeIDKey,
 		cfg *universe.FedUniSyncConfig) bool {
 
 		uniConfigs = append(uniConfigs, cfg)
@@ -775,7 +777,7 @@ func (u *UniverseFederationDB) QueryFederationSyncConfigs(
 
 		for i, config := range uniDbConfigs {
 			proofType, err := universe.ParseStrProofType(
-				config.ProofType,
+				config.ProofType.String,
 			)
 			if err != nil {
 				return err
@@ -787,7 +789,7 @@ func (u *UniverseFederationDB) QueryFederationSyncConfigs(
 				pubKey, err = btcec.ParsePubKey(config.GroupKey)
 				if err != nil {
 					return fmt.Errorf("unable to parse "+
-						"group key: %v", err)
+						"group key: %w", err)
 				}
 			}
 
@@ -820,7 +822,7 @@ func (u *UniverseFederationDB) QueryFederationSyncConfigs(
 	}
 	assetCfgs := u.assetCfgs.Load()
 	for _, uniCfg := range uniConfigs {
-		assetCfgs.Store(treeID(uniCfg.UniverseID.String()), uniCfg)
+		assetCfgs.Store(uniCfg.UniverseID.String(), uniCfg)
 	}
 
 	return globalConfigs, uniConfigs, nil

@@ -2,13 +2,13 @@ package tapscript
 
 import (
 	"github.com/btcsuite/btcd/btcec/v2"
-	"github.com/btcsuite/btcd/btcec/v2/schnorr"
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcwallet/wallet/txsizes"
 	"github.com/lightninglabs/taproot-assets/commitment"
+	"github.com/lightningnetwork/lnd/lntypes"
 	"github.com/lightningnetwork/lnd/lnwallet/chainfee"
 )
 
@@ -25,15 +25,19 @@ func PayToAddrScript(internalKey btcec.PublicKey, sibling *chainhash.Hash,
 		&internalKey, tapscriptRoot[:],
 	)
 
-	return PayToTaprootScript(outputKey)
+	return txscript.PayToTaprootScript(outputKey)
 }
 
-// PayToTaprootScript creates a pk script for a pay-to-taproot output key.
-func PayToTaprootScript(taprootKey *btcec.PublicKey) ([]byte, error) {
-	return txscript.NewScriptBuilder().
-		AddOp(txscript.OP_1).
-		AddData(schnorr.SerializePubKey(taprootKey)).
-		Script()
+// FlipParity turns the given public key from even to odd parity or vice versa.
+func FlipParity(pubKey *btcec.PublicKey) *btcec.PublicKey {
+	keyCompressed := pubKey.SerializeCompressed()
+	keyCompressed[0] ^= 1
+
+	// We already know the given key is a valid point on the curve, so we
+	// don't need to check the error here as the flipped key will also be
+	// valid.
+	flippedKey, _ := btcec.ParsePubKey(keyCompressed)
+	return flippedKey
 }
 
 // EstimateFee provides a worst-case fee and vsize estimate for a transaction
@@ -67,7 +71,7 @@ func EstimateFee(inputScripts [][]byte, outputs []*wire.TxOut,
 		p2pkh, p2tr, p2wpkh, nested, outputs, 0,
 	)
 	maxRequiredFee := feeRate.FeePerKVByte().FeeForVSize(
-		int64(maxSignedSize),
+		lntypes.VByte(maxSignedSize),
 	)
 
 	return maxSignedSize, maxRequiredFee

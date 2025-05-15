@@ -1,6 +1,7 @@
 package itest
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
 
@@ -18,7 +19,7 @@ import (
 // testBurnAssets tests that we're able to mint assets and then burn assets
 // again.
 func testBurnAssets(t *harnessTest) {
-	minerClient := t.lndHarness.Miner.Client
+	minerClient := t.lndHarness.Miner().Client
 	rpcAssets := MintAssetsConfirmBatch(
 		t.t, minerClient, t.tapd, []*mintrpc.MintAssetRequest{
 			simpleAssets[0], simpleAssets[1], issuableAssets[0],
@@ -48,10 +49,10 @@ func testBurnAssets(t *harnessTest) {
 	// Preparation: We derive a couple of keys, so we can spread out our
 	// assets over several outputs, which we are going to use for the first
 	// couple of test cases.
-	scriptKey1, anchorInternalKeyDesc1 := deriveKeys(t.t, t.tapd)
-	scriptKey2, anchorInternalKeyDesc2 := deriveKeys(t.t, t.tapd)
-	scriptKey3, anchorInternalKeyDesc3 := deriveKeys(t.t, t.tapd)
-	scriptKey4, _ := deriveKeys(t.t, t.tapd)
+	scriptKey1, anchorInternalKeyDesc1 := DeriveKeys(t.t, t.tapd)
+	scriptKey2, anchorInternalKeyDesc2 := DeriveKeys(t.t, t.tapd)
+	scriptKey3, anchorInternalKeyDesc3 := DeriveKeys(t.t, t.tapd)
+	scriptKey4, _ := DeriveKeys(t.t, t.tapd)
 
 	// We create the following outputs:
 	// 	anchor index 0 (anchor internal key 1):
@@ -63,21 +64,21 @@ func testBurnAssets(t *harnessTest) {
 	// 		- 800 units to scriptKey4
 	// 	anchor index 3 (automatic change output):
 	// 		- 300 units to new script key
-	outputAmounts := []uint64{1100, 1200, 1600, 800, 300}
+	outputAmounts := []uint64{300, 1100, 1200, 1600, 800}
 	vPkt := tappsbt.ForInteractiveSend(
-		simpleAssetID, outputAmounts[0], scriptKey1, 0,
+		simpleAssetID, outputAmounts[1], scriptKey1, 0, 0, 0,
 		anchorInternalKeyDesc1, asset.V0, chainParams,
 	)
 	tappsbt.AddOutput(
-		vPkt, outputAmounts[1], scriptKey2, 0, anchorInternalKeyDesc1,
+		vPkt, outputAmounts[2], scriptKey2, 0, anchorInternalKeyDesc1,
 		asset.V0,
 	)
 	tappsbt.AddOutput(
-		vPkt, outputAmounts[2], scriptKey3, 1, anchorInternalKeyDesc2,
+		vPkt, outputAmounts[3], scriptKey3, 1, anchorInternalKeyDesc2,
 		asset.V0,
 	)
 	tappsbt.AddOutput(
-		vPkt, outputAmounts[3], scriptKey4, 2, anchorInternalKeyDesc3,
+		vPkt, outputAmounts[4], scriptKey4, 2, anchorInternalKeyDesc3,
 		asset.V0,
 	)
 
@@ -119,7 +120,7 @@ func testBurnAssets(t *harnessTest) {
 		Asset: &taprpc.BurnAssetRequest_AssetId{
 			AssetId: simpleAssetID[:],
 		},
-		AmountToBurn:     outputAmounts[2],
+		AmountToBurn:     outputAmounts[3],
 		ConfirmationText: taprootassets.AssetBurnConfirmationText,
 	})
 	require.ErrorContains(
@@ -129,12 +130,17 @@ func testBurnAssets(t *harnessTest) {
 	// Test case 2: We'll now try to burn a small amount of assets, which
 	// should select the largest output, which is located alone in an anchor
 	// output.
-	const burnAmt = 100
+	const (
+		burnAmt  = 100
+		burnNote = "blazeit"
+	)
+
 	burnResp, err := t.tapd.BurnAsset(ctxt, &taprpc.BurnAssetRequest{
 		Asset: &taprpc.BurnAssetRequest_AssetId{
 			AssetId: simpleAssetID[:],
 		},
 		AmountToBurn:     burnAmt,
+		Note:             burnNote,
 		ConfirmationText: taprootassets.AssetBurnConfirmationText,
 	})
 	require.NoError(t.t, err)
@@ -146,14 +152,15 @@ func testBurnAssets(t *harnessTest) {
 	AssertAssetOutboundTransferWithOutputs(
 		t.t, minerClient, t.tapd, burnResp.BurnTransfer,
 		simpleAssetGen.AssetId,
-		[]uint64{outputAmounts[2] - burnAmt, burnAmt}, 1, 2, 2, true,
+		[]uint64{outputAmounts[3] - burnAmt, burnAmt}, 1, 2, 2, true,
 	)
 
 	// We'll now assert that the burned asset has the correct state.
 	burnedAsset := burnResp.BurnProof.Asset
-	allAssets, err := t.tapd.ListAssets(
-		ctxt, &taprpc.ListAssetRequest{IncludeSpent: true},
-	)
+	allAssets, err := t.tapd.ListAssets(ctxt, &taprpc.ListAssetRequest{
+		IncludeSpent:  true,
+		ScriptKeyType: allScriptKeysQuery,
+	})
 	require.NoError(t.t, err)
 	AssertAssetStateByScriptKey(
 		t.t, allAssets.Assets, burnedAsset.ScriptKey,
@@ -162,6 +169,10 @@ func testBurnAssets(t *harnessTest) {
 		AssetScriptKeyIsLocalCheck(false),
 		AssetScriptKeyIsBurnCheck(true),
 	)
+	AssertBalances(
+		t.t, t.tapd, burnAmt, WithNumUtxos(1), WithNumAnchorUtxos(1),
+		WithScriptKeyType(asset.ScriptKeyBurn),
+	)
 
 	// And now our asset balance should have been decreased by the burned
 	// amount.
@@ -169,23 +180,33 @@ func testBurnAssets(t *harnessTest) {
 		t.t, t.tapd, simpleAssetGen.AssetId, simpleAsset.Amount-burnAmt,
 	)
 
+	burns := AssertNumBurns(t.t, t.tapd, 1, nil)
+	burn := burns[0]
+	require.Equal(t.t, uint64(burnAmt), burn.Amount)
+	require.Equal(t.t, burnResp.BurnTransfer.AnchorTxHash, burn.AnchorTxid)
+	require.Equal(t.t, burn.AssetId, simpleAssetID[:])
+	require.Equal(t.t, burn.Note, burnNote)
+
 	// The burned asset should be pruned from the tree when we next spend
 	// the anchor output it was in (together with the change). So let's test
 	// that we can successfully spend the change output.
-	secondSendAmt := outputAmounts[2] - burnAmt
-	fullSendAddr, err := t.tapd.NewAddr(ctxt, &taprpc.NewAddrRequest{
-		AssetId: simpleAssetGen.AssetId,
-		Amt:     secondSendAmt,
-	})
+	secondSendAmt := outputAmounts[3] - burnAmt
+	fullSendAddr, stream := NewAddrWithEventStream(
+		t.t, t.tapd, &taprpc.NewAddrRequest{
+			AssetId: simpleAssetGen.AssetId,
+			Amt:     secondSendAmt,
+		},
+	)
 	require.NoError(t.t, err)
 
 	AssertAddrCreated(t.t, t.tapd, simpleAsset, fullSendAddr)
-	sendResp = sendAssetsToAddr(t, t.tapd, fullSendAddr)
+	sendResp, sendEvents := sendAssetsToAddr(t, t.tapd, fullSendAddr)
 	ConfirmAndAssertOutboundTransfer(
 		t.t, minerClient, t.tapd, sendResp, simpleAssetGen.AssetId,
 		[]uint64{0, secondSendAmt}, 2, 3,
 	)
 	AssertNonInteractiveRecvComplete(t.t, t.tapd, 1)
+	AssertReceiveEvents(t.t, fullSendAddr, stream)
 
 	// Test case 3: Burn all assets of one asset ID (in this case a single
 	// collectible from the original mint TX), while there are other,
@@ -207,12 +228,19 @@ func testBurnAssets(t *harnessTest) {
 		t.t, minerClient, t.tapd, burnResp.BurnTransfer,
 		simpleCollectibleGen.AssetId, []uint64{1}, 3, 4, 1, true,
 	)
+	AssertSendEventsComplete(t.t, fullSendAddr.ScriptKey, sendEvents)
+
+	AssertBalances(
+		t.t, t.tapd, burnAmt+simpleCollectible.Amount,
+		WithNumUtxos(2), WithNumAnchorUtxos(2),
+		WithScriptKeyType(asset.ScriptKeyBurn),
+	)
 
 	// Test case 4: Burn assets from multiple inputs. This will select the
 	// two largest inputs we have, the one over 1500 we sent above and the
 	// 1200 from the initial fan out transfer.
 	const changeAmt = 300
-	multiBurnAmt := outputAmounts[1] + secondSendAmt - changeAmt
+	multiBurnAmt := outputAmounts[2] + secondSendAmt - changeAmt
 	burnResp, err = t.tapd.BurnAsset(ctxt, &taprpc.BurnAssetRequest{
 		Asset: &taprpc.BurnAssetRequest_AssetId{
 			AssetId: simpleAssetGen.AssetId,
@@ -238,6 +266,12 @@ func testBurnAssets(t *harnessTest) {
 	AssertBalanceByID(
 		t.t, t.tapd, simpleAssetGen.AssetId,
 		simpleAsset.Amount-burnAmt-multiBurnAmt,
+	)
+
+	AssertBalances(
+		t.t, t.tapd, burnAmt+simpleCollectible.Amount+multiBurnAmt,
+		WithNumUtxos(3), WithNumAnchorUtxos(3),
+		WithScriptKeyType(asset.ScriptKeyBurn),
 	)
 
 	resp, err := t.tapd.ListAssets(ctxt, &taprpc.ListAssetRequest{
@@ -276,6 +310,39 @@ func testBurnAssets(t *harnessTest) {
 		t.t, t.tapd, simpleGroupGen.AssetId, simpleGroup.Amount-burnAmt,
 	)
 
+	AssertBalances(
+		t.t, t.tapd,
+		burnAmt+simpleCollectible.Amount+multiBurnAmt+burnAmt,
+		WithNumUtxos(4), WithNumAnchorUtxos(4),
+		WithScriptKeyType(asset.ScriptKeyBurn),
+	)
+
+	burns = AssertNumBurns(t.t, t.tapd, 4, nil)
+	var groupBurn *taprpc.AssetBurn
+	for _, b := range burns {
+		if bytes.Equal(b.AssetId, simpleGroupGen.AssetId) {
+			groupBurn = b
+		}
+	}
+
+	// Keep track of the txhash of the anchor transaction that completed
+	// this transfer. This will be used later to query burns with a txhash
+	// filter.
+	groupBurnTxHash := burnResp.BurnTransfer.AnchorTxHash
+
+	require.Equal(t.t, uint64(burnAmt), groupBurn.Amount)
+	require.Equal(
+		t.t, burnResp.BurnTransfer.AnchorTxHash, groupBurn.AnchorTxid,
+	)
+
+	require.Equal(t.t, groupBurn.AssetId, simpleGroupGen.AssetId[:])
+	require.Equal(
+		t.t, groupBurn.TweakedGroupKey,
+		simpleGroup.AssetGroup.TweakedGroupKey,
+	)
+
+	require.Equal(t.t, groupBurn.Note, "")
+
 	// Test case 6: Burn the single unit of a grouped collectible. We start
 	// by making sure we still have the full balance before burning.
 	AssertBalanceByID(
@@ -301,6 +368,34 @@ func testBurnAssets(t *harnessTest) {
 		simpleGroupCollectGen.AssetId, []uint64{1}, 6, 7, 1, true,
 	)
 	AssertBalanceByID(t.t, t.tapd, simpleGroupCollectGen.AssetId, 0)
+
+	AssertBalances(
+		t.t, t.tapd,
+		burnAmt+simpleCollectible.Amount+multiBurnAmt+burnAmt+1,
+		WithNumUtxos(5), WithNumAnchorUtxos(5),
+		WithScriptKeyType(asset.ScriptKeyBurn),
+	)
+
+	// We now perform some queries to test the filters of the ListBurns
+	// call.
+
+	// Fetch the burns related to the simple asset id, which should have a
+	// total of 2 burns (tc1 & tc4).
+	AssertNumBurns(t.t, t.tapd, 2, &taprpc.ListBurnsRequest{
+		AssetId: simpleAssetGen.AssetId,
+	})
+
+	// Fetch the burns related to the group key of the grouped asset in tc5.
+	// There should be 1 burn.
+	AssertNumBurns(t.t, t.tapd, 1, &taprpc.ListBurnsRequest{
+		TweakedGroupKey: simpleGroup.AssetGroup.TweakedGroupKey,
+	})
+
+	// Fetch the burns associated with the txhash of the burn in tc5. There
+	// should be 1 burn returned.
+	AssertNumBurns(t.t, t.tapd, 1, &taprpc.ListBurnsRequest{
+		AnchorTxid: groupBurnTxHash,
+	})
 }
 
 // testBurnGroupedAssets tests that some amount of an asset from an asset group
@@ -308,9 +403,10 @@ func testBurnAssets(t *harnessTest) {
 func testBurnGroupedAssets(t *harnessTest) {
 	var (
 		ctxb  = context.Background()
-		miner = t.lndHarness.Miner.Client
+		miner = t.lndHarness.Miner().Client
 
 		firstMintReq = issuableAssets[0]
+		burnNote     = "blazeit"
 	)
 
 	// We start off without any asset groups.
@@ -372,6 +468,7 @@ func testBurnGroupedAssets(t *harnessTest) {
 			AssetId: burnAssetID,
 		},
 		AmountToBurn:     burnAmt,
+		Note:             burnNote,
 		ConfirmationText: taprootassets.AssetBurnConfirmationText,
 	})
 	require.NoError(t.t, err)
@@ -388,9 +485,10 @@ func testBurnGroupedAssets(t *harnessTest) {
 
 	// Ensure that the burnt asset has the correct state.
 	burnedAsset := burnResp.BurnProof.Asset
-	allAssets, err := t.tapd.ListAssets(
-		ctxb, &taprpc.ListAssetRequest{IncludeSpent: true},
-	)
+	allAssets, err := t.tapd.ListAssets(ctxb, &taprpc.ListAssetRequest{
+		IncludeSpent:  true,
+		ScriptKeyType: allScriptKeysQuery,
+	})
 	require.NoError(t.t, err)
 	AssertAssetStateByScriptKey(
 		t.t, allAssets.Assets, burnedAsset.ScriptKey,
@@ -410,4 +508,16 @@ func testBurnGroupedAssets(t *harnessTest) {
 	encodedGroupKey = hex.EncodeToString(assetGroupKey)
 	assetGroup = assetGroups.Groups[encodedGroupKey]
 	require.Len(t.t, assetGroup.Assets, 2)
+
+	burns, err := t.tapd.ListBurns(ctxb, &taprpc.ListBurnsRequest{
+		TweakedGroupKey: assetGroupKey,
+	})
+	require.NoError(t.t, err)
+	require.Len(t.t, burns.Burns, 1)
+
+	burn := burns.Burns[0]
+
+	require.Equal(t.t, burnAmt, burn.Amount)
+	require.Equal(t.t, burnNote, burn.Note)
+	require.Equal(t.t, assetGroupKey, burn.TweakedGroupKey)
 }

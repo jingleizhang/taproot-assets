@@ -11,11 +11,13 @@ import (
 
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcec/v2/schnorr"
+	"github.com/btcsuite/btcd/wire"
 	tap "github.com/lightninglabs/taproot-assets"
 	"github.com/lightninglabs/taproot-assets/asset"
 	"github.com/lightninglabs/taproot-assets/fn"
 	"github.com/lightninglabs/taproot-assets/internal/test"
 	"github.com/lightninglabs/taproot-assets/mssmt"
+	"github.com/lightninglabs/taproot-assets/rpcutils"
 	"github.com/lightninglabs/taproot-assets/taprpc"
 	"github.com/lightninglabs/taproot-assets/taprpc/mintrpc"
 	unirpc "github.com/lightninglabs/taproot-assets/taprpc/universerpc"
@@ -29,7 +31,7 @@ import (
 // testUniverseSync tests that we're able to properly sync the universe state
 // between two nodes.
 func testUniverseSync(t *harnessTest) {
-	miner := t.lndHarness.Miner.Client
+	miner := t.lndHarness.Miner().Client
 	// First, we'll create out usual set of simple and also issuable
 	// assets.
 	rpcSimpleAssets := MintAssetsConfirmBatch(
@@ -41,10 +43,10 @@ func testUniverseSync(t *harnessTest) {
 
 	// With those assets created, we'll now create a new node that we'll
 	// use to exercise the Universe sync.
+	bobLnd := t.lndHarness.NewNodeWithCoins("Bob", nil)
 	bob := setupTapdHarness(
-		t.t, t, t.lndHarness.Bob, t.universeServer,
-		func(params *tapdHarnessParams) {
-			params.noDefaultUniverseSync = true
+		t.t, t, bobLnd, t.universeServer, func(p *tapdHarnessParams) {
+			p.noDefaultUniverseSync = true
 		},
 	)
 	defer func() {
@@ -150,7 +152,7 @@ func testUniverseSync(t *harnessTest) {
 	// query for that asset with the compressed script key.
 	firstAssetID := rpcSimpleAssets[0].AssetGenesis.AssetId
 	firstScriptKey := hex.EncodeToString(rpcSimpleAssets[0].ScriptKey)
-	firstOutpoint, err := tap.UnmarshalOutpoint(
+	firstOutpoint, err := wire.NewOutPointFromString(
 		rpcSimpleAssets[0].ChainAnchor.AnchorOutpoint,
 	)
 	require.NoError(t.t, err)
@@ -295,7 +297,7 @@ func testUniverseSync(t *harnessTest) {
 // testUniverseManualSync tests that we're able to insert proofs manually into
 // a universe instead of using a full sync.
 func testUniverseManualSync(t *harnessTest) {
-	miner := t.lndHarness.Miner.Client
+	miner := t.lndHarness.Miner().Client
 
 	// First, we'll create out usual set of issuable assets.
 	rpcIssuableAssets := MintAssetsConfirmBatch(
@@ -304,10 +306,10 @@ func testUniverseManualSync(t *harnessTest) {
 
 	// With those assets created, we'll now create a new node that we'll
 	// use to exercise the manual Universe sync.
+	bobLnd := t.lndHarness.NewNodeWithCoins("Bob", nil)
 	bob := setupTapdHarness(
-		t.t, t, t.lndHarness.Bob, t.universeServer,
-		func(params *tapdHarnessParams) {
-			params.noDefaultUniverseSync = true
+		t.t, t, bobLnd, t.universeServer, func(p *tapdHarnessParams) {
+			p.noDefaultUniverseSync = true
 		},
 	)
 	defer func() {
@@ -322,11 +324,13 @@ func testUniverseManualSync(t *harnessTest) {
 	// universe.
 	firstAsset := rpcIssuableAssets[0]
 	firstAssetGen := firstAsset.AssetGenesis
-	sendProofUniRPC(t, t.tapd, bob, firstAsset.ScriptKey, firstAssetGen)
+	transferProofNormalExportUniInsert(
+		t, t.tapd, bob, firstAsset.ScriptKey, firstAssetGen,
+	)
 
 	// We should also be able to fetch an asset from Bob's Universe, and
 	// query for that asset with the compressed script key.
-	firstOutpoint, err := tap.UnmarshalOutpoint(
+	firstOutpoint, err := wire.NewOutPointFromString(
 		firstAsset.ChainAnchor.AnchorOutpoint,
 	)
 	require.NoError(t.t, err)
@@ -385,7 +389,7 @@ func unmarshalMerkleSumNode(root *unirpc.MerkleSumNode) mssmt.Node {
 // testUniverseREST tests that we're able to properly query the universe state
 // via the REST interface.
 func testUniverseREST(t *harnessTest) {
-	miner := t.lndHarness.Miner.Client
+	miner := t.lndHarness.Miner().Client
 	// Mint a few assets that we then want to inspect in the universe.
 	rpcSimpleAssets := MintAssetsConfirmBatch(
 		t.t, miner, t.tapd, simpleAssets,
@@ -488,7 +492,7 @@ func getJSON[T proto.Message](url string) (T, error) {
 
 	err = taprpc.RESTJsonUnmarshalOpts.Unmarshal(body, jsonResp)
 	if err != nil {
-		return jsonType, fmt.Errorf("failed to unmarshal %s: %v", body,
+		return jsonType, fmt.Errorf("failed to unmarshal %s: %w", body,
 			err)
 	}
 
@@ -498,10 +502,10 @@ func getJSON[T proto.Message](url string) (T, error) {
 func testUniverseFederation(t *harnessTest) {
 	// We'll kick off the test by making a new node, without hooking it up to
 	// any existing Universe server.
+	bobLnd := t.lndHarness.NewNodeWithCoins("Bob", nil)
 	bob := setupTapdHarness(
-		t.t, t, t.lndHarness.Bob, t.universeServer,
-		func(params *tapdHarnessParams) {
-			params.noDefaultUniverseSync = true
+		t.t, t, bobLnd, t.universeServer, func(p *tapdHarnessParams) {
+			p.noDefaultUniverseSync = true
 		},
 	)
 	defer func() {
@@ -512,7 +516,7 @@ func testUniverseFederation(t *harnessTest) {
 	ctxt, cancel := context.WithTimeout(ctxb, defaultWaitTimeout)
 	defer cancel()
 
-	miner := t.lndHarness.Miner.Client
+	miner := t.lndHarness.Miner().Client
 
 	// Now that Bob is active, we'll make a set of assets with the main node.
 	firstAsset := MintAssetsConfirmBatch(t.t, miner, t.tapd, simpleAssets[:1])
@@ -687,6 +691,55 @@ func testUniverseFederation(t *harnessTest) {
 	)
 	require.NoError(t.t, err)
 	require.Equal(t.t, 0, len(fedNodes.Servers))
+
+	// When querying for a universe root that doesn't exist, we currently
+	// get an empty response. In a future version, this should be a
+	// universe.ErrNoUniverseRoot error.
+	dummyAssetIDBytes := fn.ByteSlice([32]byte{0x01})
+	rootResp, err := bob.QueryAssetRoots(ctxt, &unirpc.AssetRootQuery{
+		Id: &unirpc.ID{
+			Id: &unirpc.ID_AssetId{
+				AssetId: dummyAssetIDBytes,
+			},
+		},
+	})
+	require.NoError(t.t, err)
+
+	// The following checks show the problem: The actual roots are not nil
+	// but all the fields are empty. So they're basically useless. To not
+	// break the sync for older clients, we can't just change this right
+	// away. But we're going to change this in the future.
+	require.NotNil(t.t, rootResp.IssuanceRoot)
+	require.Nil(t.t, rootResp.IssuanceRoot.Id)
+	require.Nil(t.t, rootResp.IssuanceRoot.MssmtRoot)
+	require.Empty(t.t, rootResp.IssuanceRoot.AssetName)
+	require.Empty(t.t, rootResp.IssuanceRoot.AmountsByAssetId)
+	require.NotNil(t.t, rootResp.TransferRoot)
+	require.Nil(t.t, rootResp.TransferRoot.Id)
+	require.Nil(t.t, rootResp.TransferRoot.MssmtRoot)
+	require.Empty(t.t, rootResp.TransferRoot.AssetName)
+	require.Empty(t.t, rootResp.TransferRoot.AmountsByAssetId)
+
+	// The sync logic should detect that the response from the universe
+	// server was empty and just skip that root, not resulting in an error
+	// anymore.
+	dummyID := &unirpc.ID{
+		Id: &unirpc.ID_AssetId{
+			AssetId: dummyAssetIDBytes,
+		},
+		ProofType: unirpc.ProofType_PROOF_TYPE_ISSUANCE,
+	}
+	syncResp, err := bob.SyncUniverse(ctxt, &unirpc.SyncRequest{
+		UniverseHost: t.tapd.rpcHost(),
+		SyncMode:     unirpc.UniverseSyncMode_SYNC_ISSUANCE_ONLY,
+		SyncTargets: []*unirpc.SyncTarget{
+			{
+				Id: dummyID,
+			},
+		},
+	})
+	require.NoError(t.t, err)
+	require.Empty(t.t, syncResp.SyncedUniverses)
 }
 
 // testFederationSyncConfig tests that we can properly set and query the
@@ -708,7 +761,7 @@ func testFederationSyncConfig(t *harnessTest) {
 		AssetID:   assetID1,
 		ProofType: universe.ProofTypeIssuance,
 	}
-	uniIdRpc1 := unirpc.MarshalUniverseID(assetIDBytes1, nil)
+	uniIdRpc1 := rpcutils.MarshalUniverseID(assetIDBytes1, nil)
 	uniIdRpc1.ProofType = unirpc.ProofType_PROOF_TYPE_ISSUANCE
 
 	// Generate universe ID #2.
@@ -719,7 +772,7 @@ func testFederationSyncConfig(t *harnessTest) {
 		GroupKey:  groupKey2,
 		ProofType: universe.ProofTypeTransfer,
 	}
-	uniIdRpc2 := unirpc.MarshalUniverseID(nil, groupKeyBytes2)
+	uniIdRpc2 := rpcutils.MarshalUniverseID(nil, groupKeyBytes2)
 	uniIdRpc2.ProofType = unirpc.ProofType_PROOF_TYPE_TRANSFER
 
 	// Set both the global and a universe specific federation sync configs.

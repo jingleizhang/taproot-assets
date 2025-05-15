@@ -5,9 +5,7 @@ package itest
 import (
 	"context"
 	"flag"
-	"fmt"
 	"testing"
-	"time"
 
 	"github.com/lightninglabs/taproot-assets/taprpc"
 	"github.com/lightningnetwork/lnd/lntest"
@@ -38,37 +36,40 @@ func TestTaprootAssetsDaemon(t *testing.T) {
 	// Now we can set up our test harness (LND instance), with the chain
 	// backend we just created.
 	feeService := lntest.NewFeeService(t)
-	lndHarness := lntest.SetupHarness(t, "./lnd-itest", "bbolt", feeService)
-	defer func() {
-		// There is a timing issue in here somewhere. If we shut down
-		// lnd immediately after stopping the tapd server, sometimes
-		// we get a race in the TX notifier chan closes. The wait seems
-		// to fix it for now...
-		time.Sleep(100 * time.Millisecond)
-		lndHarness.Stop()
-	}()
-
-	lndHarness.SetupStandbyNodes()
+	lndHarness := lntest.SetupHarness(
+		t, "./lnd-itest", "bbolt", true, feeService,
+	)
+	t.Cleanup(func() {
+		lndHarness.CleanShutDown()
+	})
 
 	t.Logf("Running %v integration tests", len(testList))
 	for _, testCase := range testList {
-		logLine := fmt.Sprintf("STARTING ============ %v ============\n",
-			testCase.name)
-
 		success := t.Run(testCase.name, func(t1 *testing.T) {
+			// Create a new LND node for use with the universe
+			// server.
+			t.Log("Starting universe server LND node")
+			uniServerLndHarness := lndHarness.NewNode(
+				"uni-server-lnd", nil,
+			)
+
+			// We need to shut down any lnd nodes that were created
+			// for this test case.
+			t1.Cleanup(func() {
+				lndHarness.CleanShutDown()
+			})
+
+			// Wait for the new LND node to be fully synced to the
+			// blockchain.
+			lndHarness.WaitForBlockchainSync(uniServerLndHarness)
+
 			// The universe server and tapd client are both freshly
 			// created and later discarded for each test run to
 			// assure no state is taken over between runs.
 			tapdHarness, uniHarness, proofCourier := setupHarnesses(
-				t1, ht, lndHarness,
+				t1, ht, lndHarness, uniServerLndHarness,
 				testCase.proofCourierType,
 			)
-			lndHarness.EnsureConnected(
-				lndHarness.Alice, lndHarness.Bob,
-			)
-
-			lndHarness.Alice.AddToLogf(logLine)
-			lndHarness.Bob.AddToLogf(logLine)
 
 			ht := ht.newHarnessTest(
 				t1, lndHarness, uniHarness, tapdHarness,
@@ -103,4 +104,14 @@ func testGetInfo(t *harnessTest) {
 	// Ensure network field is set correctly.
 	expectedNetwork := t.tapd.cfg.NetParams.Name
 	require.Equal(t.t, expectedNetwork, resp.Network)
+
+	// Attempt to get the info using the CLI.
+	respGeneric, err := ExecTapCLI(ctxt, t.tapd, "getinfo")
+	require.NoError(t.t, err)
+
+	// Type assert the response to the expected type.
+	respCli := respGeneric.(*taprpc.GetInfoResponse)
+
+	// Ensure the response matches the expected response.
+	require.Equal(t.t, resp, respCli)
 }

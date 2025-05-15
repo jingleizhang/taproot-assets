@@ -16,6 +16,8 @@ import (
 	"github.com/btcsuite/btcd/wire"
 	"github.com/lightninglabs/taproot-assets/asset"
 	"github.com/lightninglabs/taproot-assets/commitment"
+	"github.com/lightninglabs/taproot-assets/fn"
+	"github.com/lightninglabs/taproot-assets/taprpc"
 	"github.com/lightningnetwork/lnd/tlv"
 )
 
@@ -56,9 +58,16 @@ var (
 	// ErrNoAddr is returned if no address is found in the address store.
 	ErrNoAddr = errors.New("address: no address found")
 
+	// ErrNoEvent is returned if no event is found in the event store.
+	ErrNoEvent = errors.New("address: no event found")
+
 	// ErrScriptKeyNotFound is returned when a script key is not found in
 	// the local database.
 	ErrScriptKeyNotFound = errors.New("script key not found")
+
+	// ErrInternalKeyNotFound is returned when an internal key is not found
+	// in the local database.
+	ErrInternalKeyNotFound = errors.New("internal key not found")
 
 	// ErrUnknownVersion is returned when encountering an address with an
 	// unrecognised version number.
@@ -72,8 +81,11 @@ const (
 	// V0 is the initial Taproot Asset address format version.
 	V0 Version = 0
 
+	// V1 addresses use V2 Taproot Asset commitments.
+	V1 Version = 1
+
 	// LatestVersion is the latest supported Taproot Asset address version.
-	latestVersion = V0
+	latestVersion = V1
 )
 
 // Tap represents a Taproot Asset address. Taproot Asset addresses specify an
@@ -119,6 +131,14 @@ type Tap struct {
 	// ProofCourierAddr is the address of the proof courier that will be
 	// used to distribute related proofs for this address.
 	ProofCourierAddr url.URL
+
+	// UnknownOddTypes is a map of unknown odd types that were encountered
+	// during decoding. This map is used to preserve unknown types that we
+	// don't know of yet, so we can still encode them back when serializing.
+	// This enables forward compatibility with future versions of the
+	// protocol as it allows new odd (optional) types to be added without
+	// breaking old clients that don't yet fully understand them.
+	UnknownOddTypes tlv.TypeMap
 }
 
 // newAddrOptions are a set of options that can modified how a new address is
@@ -153,9 +173,8 @@ func WithAssetVersion(v asset.Version) NewAddrOpt {
 func New(version Version, genesis asset.Genesis, groupKey *btcec.PublicKey,
 	groupWitness wire.TxWitness, scriptKey btcec.PublicKey,
 	internalKey btcec.PublicKey, amt uint64,
-	tapscriptSibling *commitment.TapscriptPreimage,
-	net *ChainParams, proofCourierAddr url.URL,
-	opts ...NewAddrOpt) (*Tap, error) {
+	tapscriptSibling *commitment.TapscriptPreimage, net *ChainParams,
+	proofCourierAddr url.URL, opts ...NewAddrOpt) (*Tap, error) {
 
 	options := defaultNewAddrOptions()
 	for _, opt := range opts {
@@ -192,9 +211,9 @@ func New(version Version, genesis asset.Genesis, groupKey *btcec.PublicKey,
 	// We can only use a tapscript sibling that is not a Taproot Asset
 	// commitment.
 	if tapscriptSibling != nil {
-		if err := tapscriptSibling.VerifyNoCommitment(); err != nil {
+		if _, err := tapscriptSibling.TapHash(); err != nil {
 			return nil, errors.New("address: tapscript sibling " +
-				"is a Taproot Asset commitment")
+				"is invalid")
 		}
 	}
 
@@ -230,6 +249,23 @@ func (a *Tap) Copy() *Tap {
 	return &addressCopy
 }
 
+// CommitmentVersion returns the Taproot Asset commitment version that matches
+// the address version.
+func CommitmentVersion(vers Version) (*commitment.TapCommitmentVersion,
+	error) {
+
+	switch vers {
+	// For V0, the correct commitment version could be V0 or V1; we
+	// can't know without accessing all leaves of the commitment itself.
+	case V0:
+		return nil, nil
+	case V1:
+		return fn.Ptr(commitment.TapCommitmentV2), nil
+	default:
+		return nil, ErrUnknownVersion
+	}
+}
+
 // Net returns the ChainParams struct matching the Taproot Asset address
 // network.
 func (a *Tap) Net() (*ChainParams, error) {
@@ -249,7 +285,11 @@ func (a *Tap) AttachGenesis(gen asset.Genesis) {
 // TapCommitmentKey is the key that maps to the root commitment for the asset
 // group specified by a Taproot Asset address.
 func (a *Tap) TapCommitmentKey() [32]byte {
-	return asset.TapCommitmentKey(a.AssetID, a.GroupKey)
+	assetSpecifier := asset.NewSpecifierOptionalGroupPubKey(
+		a.AssetID, a.GroupKey,
+	)
+
+	return asset.TapCommitmentKey(assetSpecifier)
 }
 
 // AssetCommitmentKey is the key that maps to the asset leaf for the asset
@@ -280,14 +320,18 @@ func (a *Tap) TapCommitment() (*commitment.TapCommitment, error) {
 	}
 	newAsset, err := asset.New(
 		a.assetGen, a.Amount, 0, 0, asset.NewScriptKey(&a.ScriptKey),
-		groupKey,
-		asset.WithAssetVersion(a.AssetVersion),
+		groupKey, asset.WithAssetVersion(a.AssetVersion),
 	)
 	if err != nil {
 		return nil, err
 	}
 
-	return commitment.FromAssets(newAsset)
+	commitmentVersion, err := CommitmentVersion(a.Version)
+	if err != nil {
+		return nil, err
+	}
+
+	return commitment.FromAssets(commitmentVersion, newAsset)
 }
 
 // TaprootOutputKey returns the on-chain Taproot output key.
@@ -345,7 +389,8 @@ func (a *Tap) EncodeRecords() []tlv.Record {
 		records, newProofCourierAddrRecord(&a.ProofCourierAddr),
 	)
 
-	return records
+	// Add any unknown odd types that were encountered during decoding.
+	return asset.CombineRecords(records, a.UnknownOddTypes)
 }
 
 // DecodeRecords provides all records known for an address for proper
@@ -379,7 +424,17 @@ func (a *Tap) Decode(r io.Reader) error {
 	if err != nil {
 		return err
 	}
-	return stream.DecodeP2P(r)
+
+	unknownOddTypes, err := asset.TlvStrictDecodeP2P(
+		stream, r, KnownAddressTypes,
+	)
+	if err != nil {
+		return err
+	}
+
+	a.UnknownOddTypes = unknownOddTypes
+
+	return nil
 }
 
 // EncodeAddress returns a bech32m string encoding of a Taproot Asset address.
@@ -418,7 +473,7 @@ func (a *Tap) String() string {
 // this implementation of tap.
 func IsUnknownVersion(v Version) bool {
 	switch v {
-	case V0:
+	case V0, V1:
 		return false
 	default:
 		return true
@@ -481,4 +536,41 @@ func DecodeAddress(addr string, net *ChainParams) (*Tap, error) {
 	}
 
 	return &a, nil
+}
+
+// UnmarshalVersion parses an address version from the RPC variant.
+func UnmarshalVersion(version taprpc.AddrVersion) (Version, error) {
+	// For now, we'll only support two address versions. The ones in the
+	// future should be reserved for future use, so we disallow unknown
+	// versions.
+	switch version {
+	case taprpc.AddrVersion_ADDR_VERSION_UNSPECIFIED:
+		return V1, nil
+
+	case taprpc.AddrVersion_ADDR_VERSION_V0:
+		return V0, nil
+
+	case taprpc.AddrVersion_ADDR_VERSION_V1:
+		return V1, nil
+
+	default:
+		return 0, fmt.Errorf("unknown address version: %v", version)
+	}
+}
+
+// MarshalVersion marshals the native address version into the RPC variant.
+func MarshalVersion(version Version) (taprpc.AddrVersion, error) {
+	// For now, we'll only support two address versions. The ones in the
+	// future should be reserved for future use, so we disallow unknown
+	// versions.
+	switch version {
+	case V0:
+		return taprpc.AddrVersion_ADDR_VERSION_V0, nil
+
+	case V1:
+		return taprpc.AddrVersion_ADDR_VERSION_V1, nil
+
+	default:
+		return 0, fmt.Errorf("unknown address version: %v", version)
+	}
 }

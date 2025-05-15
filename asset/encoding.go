@@ -11,9 +11,17 @@ import (
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcec/v2/schnorr"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
+	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
+	"github.com/lightninglabs/taproot-assets/fn"
 	"github.com/lightninglabs/taproot-assets/mssmt"
 	"github.com/lightningnetwork/lnd/tlv"
+)
+
+// TLV types for TapLeaf encode/decode.
+const (
+	typeTapLeafVersion tlv.Type = 1
+	typeTapLeafScript  tlv.Type = 2
 )
 
 var (
@@ -24,6 +32,10 @@ var (
 	// ErrByteSliceTooLarge is returned when an encoded byte slice is too
 	// large.
 	ErrByteSliceTooLarge = errors.New("bytes: too large")
+
+	// ErrDuplicateScriptKeys is returned when two alt leaves have the same
+	// script key.
+	ErrDuplicateScriptKeys = errors.New("alt leaf: duplicate script keys")
 )
 
 func VarIntEncoder(w io.Writer, val any, buf *[8]byte) error {
@@ -132,13 +144,16 @@ func CompressedPubKeyEncoder(w io.Writer, val any, buf *[8]byte) error {
 	return tlv.NewTypeForEncodingErr(val, "*btcec.PublicKey")
 }
 
-func CompressedPubKeyDecoder(r io.Reader, val any, buf *[8]byte, l uint64) error {
+func CompressedPubKeyDecoder(r io.Reader, val any, buf *[8]byte,
+	l uint64) error {
+
 	if typ, ok := val.(**btcec.PublicKey); ok {
 		var keyBytes [btcec.PubKeyBytesLenCompressed]byte
 		err := tlv.DBytes33(r, &keyBytes, buf, btcec.PubKeyBytesLenCompressed)
 		if err != nil {
 			return err
 		}
+
 		var key *btcec.PublicKey
 		// Handle empty key, which is not on the curve.
 		if keyBytes == [btcec.PubKeyBytesLenCompressed]byte{} {
@@ -152,6 +167,7 @@ func CompressedPubKeyDecoder(r io.Reader, val any, buf *[8]byte, l uint64) error
 		*typ = key
 		return nil
 	}
+
 	return tlv.NewTypeForDecodingErr(
 		val, "*btcec.PublicKey", l, btcec.PubKeyBytesLenCompressed,
 	)
@@ -663,4 +679,274 @@ func LeafDecoder(r io.Reader, val any, buf *[8]byte, l uint64) error {
 		return nil
 	}
 	return tlv.NewTypeForEncodingErr(val, "Asset")
+}
+
+func EncodeTapBranchNodes(branch TapBranchNodes) [][]byte {
+	return [][]byte{
+		bytes.Clone(branch.left[:]), bytes.Clone(branch.right[:]),
+	}
+}
+
+func DecodeTapBranchNodes(branchData [][]byte) (*TapBranchNodes, error) {
+	if len(branchData) != 2 {
+		return nil, ErrInvalidTapBranch
+	}
+
+	left, right := branchData[0], branchData[1]
+
+	// Given data must be 32 bytes long to be a valid TapHash.
+	if len(left) != chainhash.HashSize || len(right) != chainhash.HashSize {
+		return nil, fmt.Errorf("invalid tapbranch taphash length")
+	}
+
+	var leftHash, rightHash [chainhash.HashSize]byte
+	copy(leftHash[:], left)
+	copy(rightHash[:], right)
+
+	return &TapBranchNodes{
+		left:  leftHash,
+		right: rightHash,
+	}, nil
+}
+
+func EncodeTapLeafNodes(leaves TapLeafNodes) ([][]byte, error) {
+	innerLeaves := ToLeaves(leaves)
+
+	return fn.MapErr(innerLeaves, func(l txscript.TapLeaf) ([]byte, error) {
+		return EncodeTapLeaf(&l)
+	})
+}
+
+func DecodeTapLeafNodes(leafData [][]byte) (*TapLeafNodes, error) {
+	if len(leafData) == 0 {
+		return nil, fmt.Errorf("no tapleaves provided")
+	}
+
+	orderedLeaves := make([]txscript.TapLeaf, len(leafData))
+	for i, leafBytes := range leafData {
+		leaf, err := DecodeTapLeaf(leafBytes)
+		if err != nil {
+			return nil, err
+		}
+
+		orderedLeaves[i] = *leaf
+	}
+
+	// The tapLeaf decoder is less strict than the TapLeafNodes type. Check
+	// that all leaves meet the restrictions for TapLeafNodes.
+	err := CheckTapLeavesSanity(orderedLeaves)
+	if err != nil {
+		return nil, err
+	}
+
+	return &TapLeafNodes{
+		v: orderedLeaves,
+	}, nil
+}
+
+// The following TapLeaf {en,de}coders are a duplicate of those used in
+// btcwallet. Specifically, the inner loop logic for handling []TapLeaf objects.
+// https://github.com/btcsuite/btcwallet/blob/master/waddrmgr/tlv.go#L160
+// The {en,de}coders here omit the extra size prefix for the leaf TLV used in
+// btcwallet. This duplication is needed until we update btcwallet to export
+// these methods.
+
+// EncodeTapLeaf encodes a TapLeaf into a byte slice containing a TapLeaf TLV
+// record, prefixed with a varint indicating the length of the record.
+func EncodeTapLeaf(leaf *txscript.TapLeaf) ([]byte, error) {
+	if leaf == nil {
+		return nil, fmt.Errorf("cannot encode nil tapleaf")
+	}
+	if len(leaf.Script) == 0 {
+		return nil, fmt.Errorf("tapleaf script is empty")
+	}
+
+	leafVersion := uint8(leaf.LeafVersion)
+	tlvStream, err := tlv.NewStream(
+		tlv.MakePrimitiveRecord(typeTapLeafVersion, &leafVersion),
+		tlv.MakePrimitiveRecord(typeTapLeafScript, &leaf.Script),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	var leafTLVBytes bytes.Buffer
+	err = tlvStream.Encode(&leafTLVBytes)
+	if err != nil {
+		return nil, err
+	}
+
+	return leafTLVBytes.Bytes(), nil
+}
+
+// DecodeTapLeaf decodes a byte slice containing a TapLeaf TLV record prefixed
+// with a varint indicating the length of the record.
+func DecodeTapLeaf(leafData []byte) (*txscript.TapLeaf, error) {
+	var (
+		leafVersion uint8
+		script      []byte
+	)
+
+	tlvStream, err := tlv.NewStream(
+		tlv.MakePrimitiveRecord(typeTapLeafVersion, &leafVersion),
+		tlv.MakePrimitiveRecord(typeTapLeafScript, &script),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	err = tlvStream.Decode(bytes.NewReader(leafData))
+	if err != nil {
+		return nil, err
+	}
+
+	leaf := txscript.TapLeaf{
+		LeafVersion: txscript.TapscriptLeafVersion(leafVersion),
+		Script:      script,
+	}
+
+	return &leaf, nil
+}
+
+func AltLeavesEncoder(w io.Writer, val any, buf *[8]byte) error {
+	if t, ok := val.(*[]AltLeaf[Asset]); ok {
+		// If the AltLeaves slice is empty, we will still encode its
+		// length here (as 0). Callers should avoid encoding empty
+		// AltLeaves slices.
+		if err := tlv.WriteVarInt(w, uint64(len(*t)), buf); err != nil {
+			return err
+		}
+
+		var streamBuf bytes.Buffer
+		leafKeys := make(map[SerializedKey]struct{})
+		for _, leaf := range *t {
+			// Check that this leaf has a unique script key compared
+			// to all previous leaves. This type assertion is safe
+			// as we've made an equivalent assertion above.
+			leafKey := ToSerialized(leaf.(*Asset).ScriptKey.PubKey)
+			_, ok := leafKeys[leafKey]
+			if ok {
+				return fmt.Errorf("%w: %x",
+					ErrDuplicateScriptKeys, leafKey)
+			}
+
+			leafKeys[leafKey] = struct{}{}
+			err := leaf.EncodeAltLeaf(&streamBuf)
+			if err != nil {
+				return err
+			}
+			streamBytes := streamBuf.Bytes()
+			err = InlineVarBytesEncoder(w, &streamBytes, buf)
+			if err != nil {
+				return err
+			}
+
+			streamBuf.Reset()
+		}
+		return nil
+	}
+	return tlv.NewTypeForEncodingErr(val, "[]AltLeaf")
+}
+
+func AltLeavesDecoder(r io.Reader, val any, buf *[8]byte, l uint64) error {
+	// There is no limit on the number of alt leaves, but the total size of
+	// all alt leaves must be below 64 KiB.
+	if l > math.MaxUint16 {
+		return tlv.ErrRecordTooLarge
+	}
+
+	if typ, ok := val.(*[]AltLeaf[Asset]); ok {
+		// Each alt leaf is at least 42 bytes, which limits the total
+		// number of aux leaves. So we don't need to enforce a strict
+		// limit here.
+		numItems, err := tlv.ReadVarInt(r, buf)
+		if err != nil {
+			return err
+		}
+
+		leaves := make([]AltLeaf[Asset], numItems)
+		leafKeys := make(map[SerializedKey]struct{})
+		for i := uint64(0); i < numItems; i++ {
+			var streamBytes []byte
+			err = InlineVarBytesDecoder(
+				r, &streamBytes, buf, math.MaxUint16,
+			)
+			if err != nil {
+				return err
+			}
+
+			var leaf Asset
+			err = leaf.DecodeAltLeaf(bytes.NewReader(streamBytes))
+			if err != nil {
+				return err
+			}
+
+			// Check that each alt leaf has a unique script key.
+			leafKey := ToSerialized(leaf.ScriptKey.PubKey)
+			_, ok := leafKeys[leafKey]
+			if ok {
+				return fmt.Errorf("%w: %x",
+					ErrDuplicateScriptKeys, leafKey)
+			}
+
+			leafKeys[leafKey] = struct{}{}
+			leaves[i] = AltLeaf[Asset](&leaf)
+		}
+
+		*typ = leaves
+		return nil
+	}
+	return tlv.NewTypeForEncodingErr(val, "[]*AltLeaf")
+}
+
+func GroupKeyRevealEncoder(w io.Writer, val any, _ *[8]byte) error {
+	if t, ok := val.(*GroupKeyReveal); ok {
+		if err := (*t).Encode(w); err != nil {
+			return fmt.Errorf("unable to encode group key "+
+				"reveal: %w", err)
+		}
+
+		return nil
+	}
+
+	return tlv.NewTypeForEncodingErr(val, "GroupKeyReveal")
+}
+
+func GroupKeyRevealDecoder(r io.Reader, val any, buf *[8]byte, l uint64) error {
+	// Return early if the val is not a pointer to a GroupKeyReveal.
+	typ, ok := val.(*GroupKeyReveal)
+	if !ok {
+		return tlv.NewTypeForEncodingErr(val, "GroupKeyReveal")
+	}
+
+	// If the length is less than or equal to the sum of the lengths of the
+	// internal key and the tapscript root, then we'll attempt to decode it
+	// as a GroupKeyRevealV0.
+	internalKeyLen := uint64(btcec.PubKeyBytesLenCompressed)
+	tapscriptRootLen := uint64(sha256.Size)
+
+	if l <= internalKeyLen+tapscriptRootLen {
+		// Attempt decoding with GroupKeyRevealV0.
+		var gkrV0 GroupKeyRevealV0
+
+		err := gkrV0.Decode(r, buf, l)
+		if err != nil {
+			return fmt.Errorf("group key reveal V0 decode "+
+				"error: %w", err)
+		}
+
+		*typ = &gkrV0
+		return nil
+	}
+
+	// Attempt decoding with GroupKeyRevealV1.
+	var gkrV1 GroupKeyRevealV1
+
+	err := gkrV1.Decode(r, buf, l)
+	if err != nil {
+		return fmt.Errorf("group key reveal V1 decode error: %w", err)
+	}
+
+	*typ = &gkrV1
+	return nil
 }

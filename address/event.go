@@ -48,6 +48,11 @@ type EventQueryParams struct {
 	// StatusTo is the largest status to query for (inclusive). Can be
 	// set to nil to return events of all states.
 	StatusTo *Status
+
+	// CreationTimeFrom is the earliest creation time to query for
+	// (inclusive). Can be set to nil to return events of all creation
+	// times.
+	CreationTimeFrom *time.Time
 }
 
 // Event represents a single incoming asset transfer that was initiated by
@@ -110,6 +115,11 @@ type EventStorage interface {
 	// parameters.
 	QueryAddrEvents(ctx context.Context, params EventQueryParams) ([]*Event,
 		error)
+
+	// QueryEvent returns a single address event by its address and
+	// outpoint.
+	QueryEvent(ctx context.Context, addr *AddrWithKeyInfo,
+		outpoint wire.OutPoint) (*Event, error)
 
 	// CompleteEvent updates an address event as being complete and links it
 	// with the proof and asset that was imported/created for it.

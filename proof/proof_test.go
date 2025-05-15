@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,20 +15,22 @@ import (
 
 	"github.com/btcsuite/btcd/blockchain"
 	"github.com/btcsuite/btcd/btcec/v2"
-	"github.com/btcsuite/btcd/btcec/v2/schnorr"
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/chaincfg"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
+	"github.com/btcsuite/btclog/v2"
 	"github.com/davecgh/go-spew/spew"
 	"github.com/decred/dcrd/dcrec/secp256k1/v4"
 	"github.com/lightninglabs/taproot-assets/asset"
 	"github.com/lightninglabs/taproot-assets/commitment"
+	"github.com/lightninglabs/taproot-assets/fn"
 	"github.com/lightninglabs/taproot-assets/internal/test"
-	"github.com/lightningnetwork/lnd/build"
-	"github.com/lightningnetwork/lnd/keychain"
+	lfn "github.com/lightningnetwork/lnd/fn/v2"
+	"github.com/lightningnetwork/lnd/tlv"
 	"github.com/stretchr/testify/require"
+	"pgregory.net/rapid"
 )
 
 var (
@@ -85,6 +89,120 @@ func assertEqualTaprootProof(t *testing.T, expected, actual *TaprootProof) {
 	}
 }
 
+// assertEqualGroupKeyRevealV0 asserts that the expected and actual group key
+// reveal V0 are equal.
+func assertEqualGroupKeyRevealV0(t *testing.T, expected,
+	actual asset.GroupKeyRevealV0, expectedGenesisAssetID asset.ID) {
+
+	t.Helper()
+
+	require.Equal(t, expected.RawKey(), actual.RawKey())
+
+	// Compare the tapscript root. Normalize nil to empty slice for
+	// comparison.
+	expectedRoot := expected.TapscriptRoot()
+	if expectedRoot == nil {
+		expectedRoot = []byte{}
+	}
+
+	actualRoot := actual.TapscriptRoot()
+	if actualRoot == nil {
+		actualRoot = []byte{}
+	}
+
+	require.Equal(t, expectedRoot, actualRoot)
+
+	// Assert that the asset group pub key is equal for the expected genesis
+	// asset ID.
+	expectedGroupPubKey, err := expected.GroupPubKey(expectedGenesisAssetID)
+	require.NoError(t, err)
+
+	actualGroupPubKey, err := actual.GroupPubKey(expectedGenesisAssetID)
+	require.NoError(t, err)
+
+	require.Equal(t, expectedGroupPubKey, actualGroupPubKey)
+}
+
+// assertEqualGroupKeyRevealV1 asserts that the expected and actual group key
+// reveal V1 are equal.
+func assertEqualGroupKeyRevealV1(t *testing.T, expected,
+	actual asset.GroupKeyRevealV1, expectedGenesisAssetID asset.ID) {
+
+	require.Equal(t, expected.RawKey(), actual.RawKey())
+	require.Equal(t, expected.Version(), actual.Version())
+
+	// Compare the tapscript root. Normalize nil to empty slice for
+	// comparison.
+	expectedRoot := expected.TapscriptRoot()
+	if expectedRoot == nil {
+		expectedRoot = []byte{}
+	}
+
+	actualRoot := actual.TapscriptRoot()
+	if actualRoot == nil {
+		actualRoot = []byte{}
+	}
+
+	require.Equal(t, expectedRoot, actualRoot)
+
+	// Assert that the asset group pub key is equal for the expected genesis
+	// asset ID.
+	expectedGroupPubKey, err := expected.GroupPubKey(expectedGenesisAssetID)
+	require.NoError(t, err)
+
+	actualGroupPubKey, err := actual.GroupPubKey(expectedGenesisAssetID)
+	require.NoError(t, err)
+
+	require.Equal(t, expectedGroupPubKey, actualGroupPubKey)
+
+	// Compare the custom subtree root.
+	require.Equal(
+		t, expected.CustomSubtreeRoot(), actual.CustomSubtreeRoot(),
+	)
+}
+
+// assertEqualGroupKeyReveal asserts that the expected and actual group key
+// reveal are equal.
+func assertEqualGroupKeyReveal(t *testing.T, expected,
+	actual asset.GroupKeyReveal, expectedGenesisAssetID asset.ID) {
+
+	t.Helper()
+
+	// Handle nil cases.
+	if expected == nil {
+		require.Nil(t, actual)
+		return
+	}
+	require.NotNil(t, actual)
+
+	// Dispatch to group key reveal version 0 assertion.
+	if expectedV0, ok := expected.(*asset.GroupKeyRevealV0); ok {
+		// If expected is V0 then actual should be V0.
+		actualV0, actualOk := actual.(*asset.GroupKeyRevealV0)
+		require.True(t, actualOk)
+
+		assertEqualGroupKeyRevealV0(
+			t, *expectedV0, *actualV0, expectedGenesisAssetID,
+		)
+		return
+	}
+
+	// Dispatch to group key reveal version 1 assertion.
+	if expectedV1, ok := expected.(*asset.GroupKeyRevealV1); ok {
+		// If expected is V1 then actual should be V1.
+		actualV1, actualOk := actual.(*asset.GroupKeyRevealV1)
+		require.True(t, actualOk)
+
+		assertEqualGroupKeyRevealV1(
+			t, *expectedV1, *actualV1, expectedGenesisAssetID,
+		)
+		return
+	}
+
+	// Unexpected group key reveal type.
+	require.FailNow(t, "unexpected group key reveal type")
+}
+
 func assertEqualProof(t *testing.T, expected, actual *Proof) {
 	t.Helper()
 
@@ -95,11 +213,14 @@ func assertEqualProof(t *testing.T, expected, actual *Proof) {
 	require.Equal(t, expected.TxMerkleProof, actual.TxMerkleProof)
 	require.Equal(t, expected.Asset, actual.Asset)
 
-	assertEqualTaprootProof(t, &expected.InclusionProof, &actual.InclusionProof)
+	assertEqualTaprootProof(
+		t, &expected.InclusionProof, &actual.InclusionProof,
+	)
 
 	for i := range expected.ExclusionProofs {
 		assertEqualTaprootProof(
-			t, &expected.ExclusionProofs[i], &actual.ExclusionProofs[i],
+			t, &expected.ExclusionProofs[i],
+			&actual.ExclusionProofs[i],
 		)
 	}
 
@@ -125,7 +246,9 @@ func assertEqualProof(t *testing.T, expected, actual *Proof) {
 			len(expected.AdditionalInputs),
 		)
 		for j := range expected.AdditionalInputs[i].proofs {
-			e, err := expected.AdditionalInputs[i].ProofAt(uint32(j))
+			e, err := expected.AdditionalInputs[i].ProofAt(
+				uint32(j),
+			)
 			require.NoError(t, err)
 
 			a, err := actual.AdditionalInputs[i].ProofAt(uint32(j))
@@ -135,6 +258,55 @@ func assertEqualProof(t *testing.T, expected, actual *Proof) {
 	}
 
 	require.Equal(t, expected.ChallengeWitness, actual.ChallengeWitness)
+
+	assertEqualGroupKeyReveal(
+		t, expected.GroupKeyReveal, actual.GroupKeyReveal,
+		expected.Asset.Genesis.ID(),
+	)
+}
+
+// TestProofEncodingGroupKeyRevealV1 tests encoding and decoding a proof with a
+// group key reveal V1.
+func TestProofEncodingGroupKeyRevealV1(t *testing.T) {
+	t.Parallel()
+
+	testBlocks := readTestData(t)
+	oddTxBlock := testBlocks[0]
+
+	genesis := asset.RandGenesis(t, asset.Normal)
+	scriptKey := test.RandPubKey(t)
+	proof := RandProof(t, genesis, scriptKey, oddTxBlock, 0, 1)
+
+	internalKey := test.RandPubKey(t)
+	customRoot := chainhash.Hash(test.RandBytes(32))
+
+	versions := []asset.NonSpendLeafVersion{
+		asset.OpReturnVersion, asset.PedersenVersion,
+	}
+	for _, version := range versions {
+		// Override the group key reveal with a V1 reveal.
+		groupKeyReveal, err := asset.NewGroupKeyRevealV1(
+			version, *internalKey, genesis.ID(),
+			fn.Some(customRoot),
+		)
+		require.NoError(t, err)
+
+		proof.GroupKeyReveal = &groupKeyReveal
+
+		file, err := NewFile(V0, proof, proof)
+		require.NoError(t, err)
+		proof.AdditionalInputs = []File{*file, *file}
+
+		proofBytes, err := proof.Bytes()
+		require.NoError(t, err)
+
+		var decodedProof Proof
+		require.NoError(
+			t, decodedProof.Decode(bytes.NewReader(proofBytes)),
+		)
+
+		assertEqualProof(t, &proof, &decodedProof)
+	}
 }
 
 func TestProofEncoding(t *testing.T) {
@@ -143,130 +315,16 @@ func TestProofEncoding(t *testing.T) {
 	testBlocks := readTestData(t)
 	oddTxBlock := testBlocks[0]
 
-	txMerkleProof, err := NewTxMerkleProof(oddTxBlock.Transactions, 0)
-	require.NoError(t, err)
-
 	genesis := asset.RandGenesis(t, asset.Collectible)
 	scriptKey := test.RandPubKey(t)
-	tweakedScriptKey := asset.NewScriptKey(scriptKey)
-	protoAsset := asset.NewAssetNoErr(
-		t, genesis, 1, 0, 0, tweakedScriptKey, nil,
-	)
-	groupKey := asset.RandGroupKey(t, genesis, protoAsset)
-	groupReveal := asset.GroupKeyReveal{
-		RawKey:        asset.ToSerialized(&groupKey.GroupPubKey),
-		TapscriptRoot: test.RandBytes(32),
-	}
+	proof := RandProof(t, genesis, scriptKey, oddTxBlock, 0, 1)
 
-	mintCommitment, assets, err := commitment.Mint(
-		genesis, groupKey, &commitment.AssetDetails{
-			Type:             asset.Collectible,
-			ScriptKey:        test.PubToKeyDesc(scriptKey),
-			Amount:           nil,
-			LockTime:         1337,
-			RelativeLockTime: 6,
-		},
-	)
-	require.NoError(t, err)
-	asset := assets[0]
-	asset.GroupKey.RawKey = keychain.KeyDescriptor{}
-
-	// Empty the group witness, since it will eventually be stored as the
-	// asset's witness within the proof.
-	// TODO(guggero): Actually store the witness in the proof.
-	asset.GroupKey.Witness = nil
-
-	// Empty the raw script key, since we only serialize the tweaked
-	// pubkey. We'll also force the main script key to be an x-only key as
-	// well.
-	asset.ScriptKey.PubKey, err = schnorr.ParsePubKey(
-		schnorr.SerializePubKey(asset.ScriptKey.PubKey),
-	)
-	require.NoError(t, err)
-
-	asset.ScriptKey.TweakedScriptKey = nil
-
-	_, commitmentProof, err := mintCommitment.Proof(
-		asset.TapCommitmentKey(), asset.AssetCommitmentKey(),
-	)
-	require.NoError(t, err)
-
-	leaf1 := txscript.NewBaseTapLeaf([]byte{1})
-	leaf2 := txscript.NewBaseTapLeaf([]byte{2})
-	testLeafPreimage := commitment.NewPreimageFromLeaf(leaf1)
-	testLeafPreimage2 := commitment.NewPreimageFromLeaf(leaf2)
-	testBranchPreimage := commitment.NewPreimageFromBranch(
-		txscript.NewTapBranch(leaf1, leaf2),
-	)
-	proof := Proof{
-		PrevOut:       genesis.FirstPrevOut,
-		BlockHeader:   oddTxBlock.Header,
-		BlockHeight:   42,
-		AnchorTx:      *oddTxBlock.Transactions[0],
-		TxMerkleProof: *txMerkleProof,
-		Asset:         *asset,
-		InclusionProof: TaprootProof{
-			OutputIndex: 1,
-			InternalKey: test.RandPubKey(t),
-			CommitmentProof: &CommitmentProof{
-				Proof:              *commitmentProof,
-				TapSiblingPreimage: testLeafPreimage,
-			},
-			TapscriptProof: nil,
-		},
-		ExclusionProofs: []TaprootProof{
-			{
-				OutputIndex: 2,
-				InternalKey: test.RandPubKey(t),
-				CommitmentProof: &CommitmentProof{
-					Proof:              *commitmentProof,
-					TapSiblingPreimage: testLeafPreimage,
-				},
-				TapscriptProof: nil,
-			},
-			{
-				OutputIndex:     3,
-				InternalKey:     test.RandPubKey(t),
-				CommitmentProof: nil,
-				TapscriptProof: &TapscriptProof{
-					TapPreimage1: testBranchPreimage,
-					TapPreimage2: testLeafPreimage2,
-					Bip86:        true,
-				},
-			},
-			{
-				OutputIndex:     4,
-				InternalKey:     test.RandPubKey(t),
-				CommitmentProof: nil,
-				TapscriptProof: &TapscriptProof{
-					Bip86: true,
-				},
-			},
-		},
-		SplitRootProof: &TaprootProof{
-			OutputIndex: 4,
-			InternalKey: test.RandPubKey(t),
-			CommitmentProof: &CommitmentProof{
-				Proof:              *commitmentProof,
-				TapSiblingPreimage: nil,
-			},
-		},
-		MetaReveal: &MetaReveal{
-			Data: []byte("quoth the raven nevermore"),
-			Type: MetaOpaque,
-		},
-		AdditionalInputs: []File{},
-		ChallengeWitness: wire.TxWitness{[]byte("foo"), []byte("bar")},
-		GenesisReveal:    &genesis,
-		GroupKeyReveal:   &groupReveal,
-	}
 	file, err := NewFile(V0, proof, proof)
 	require.NoError(t, err)
 	proof.AdditionalInputs = []File{*file, *file}
 
-	var proofBuf bytes.Buffer
-	require.NoError(t, proof.Encode(&proofBuf))
-	proofBytes := proofBuf.Bytes()
+	proofBytes, err := proof.Bytes()
+	require.NoError(t, err)
 
 	var decodedProof Proof
 	require.NoError(t, decodedProof.Decode(bytes.NewReader(proofBytes)))
@@ -298,12 +356,12 @@ func TestProofEncoding(t *testing.T) {
 	require.False(t, IsSingleProof(nil))
 
 	// Test with a nil tapscript root in the group reveal.
-	proof.GroupKeyReveal.TapscriptRoot = nil
+	proof.GroupKeyReveal.SetTapscriptRoot(nil)
 	file, err = NewFile(V0, proof, proof)
 	require.NoError(t, err)
 	proof.AdditionalInputs = []File{*file, *file}
 
-	proofBuf.Reset()
+	var proofBuf bytes.Buffer
 	require.NoError(t, proof.Encode(&proofBuf))
 	var decodedProof2 Proof
 	require.NoError(t, decodedProof2.Decode(&proofBuf))
@@ -346,7 +404,7 @@ func genRandomGenesisWithProof(t testing.TB, assetType asset.Type,
 
 	t.Helper()
 
-	genesisPrivKey := test.RandPrivKey(t)
+	genesisPrivKey := test.RandPrivKey()
 	genesisPubKey := test.PubToKeyDesc(genesisPrivKey.PubKey())
 
 	// If we have a specified meta reveal, then we'll replace the meta hash
@@ -374,19 +432,18 @@ func genRandomGenesisWithProof(t testing.TB, assetType asset.Type,
 		asset.WithAssetVersion(assetVersion),
 	)
 	assetGroupKey := asset.RandGroupKey(t, assetGenesis, protoAsset)
-	groupKeyReveal := &asset.GroupKeyReveal{
-		RawKey: asset.ToSerialized(
-			assetGroupKey.RawKey.PubKey,
-		),
-		TapscriptRoot: assetGroupKey.TapscriptRoot,
-	}
+	groupKeyReveal := asset.NewGroupKeyRevealV0(
+		asset.ToSerialized(assetGroupKey.RawKey.PubKey),
+		assetGroupKey.TapscriptRoot,
+	)
 
 	if groupRevealMutator != nil {
 		groupRevealMutator(groupKeyReveal)
 	}
 
 	tapCommitment, assets, err := commitment.Mint(
-		assetGenesis, assetGroupKey, &commitment.AssetDetails{
+		commitment.RandTapCommitVersion(), assetGenesis, assetGroupKey,
+		&commitment.AssetDetails{
 			Type:             assetType,
 			ScriptKey:        genesisPubKey,
 			Amount:           amt,
@@ -396,6 +453,15 @@ func genRandomGenesisWithProof(t testing.TB, assetType asset.Type,
 		},
 	)
 	require.NoError(t, err)
+
+	// Include 1 or more alt leaves in the anchor output Tap commitment.
+	// Since this is also used for generating the test vectors, we don't
+	// actually want to have zero alt leaves.
+	innerAltLeaves := asset.RandAltLeaves(t, false)
+	altLeaves := asset.ToAltLeaves(innerAltLeaves)
+	err = tapCommitment.MergeAltLeaves(altLeaves)
+	require.NoError(t, err)
+
 	genesisAsset := assets[0]
 	_, commitmentProof, err := tapCommitment.Proof(
 		genesisAsset.TapCommitmentKey(),
@@ -468,12 +534,13 @@ func genRandomGenesisWithProof(t testing.TB, assetType asset.Type,
 		AdditionalInputs: nil,
 		GenesisReveal:    genReveal,
 		GroupKeyReveal:   groupKeyReveal,
+		AltLeaves:        altLeaves,
 	}, genesisPrivKey
 }
 
 type genMutator func(*asset.Genesis)
 
-type groupRevealMutator func(*asset.GroupKeyReveal)
+type groupRevealMutator func(asset.GroupKeyReveal)
 
 type genRevealMutator func(*asset.Genesis) *asset.Genesis
 
@@ -482,13 +549,25 @@ func TestGenesisProofVerification(t *testing.T) {
 
 	// Create a script tree that we'll use for our tapscript sibling test
 	// cases.
-	scriptInternalKey := test.RandPrivKey(t).PubKey()
+	scriptInternalKey := test.RandPrivKey().PubKey()
 	leaf1 := test.ScriptHashLock(t, []byte("foobar"))
 	leaf2 := test.ScriptSchnorrSig(t, scriptInternalKey)
+	testLeafPreimage, err := commitment.NewPreimageFromLeaf(leaf1)
+	require.NoError(t, err)
 
 	// The order doesn't matter here as they are sorted before hashing.
 	branch := txscript.NewTapBranch(leaf1, leaf2)
+	testBranchPreimage := commitment.NewPreimageFromBranch(branch)
 	amount := uint64(5000)
+
+	dummyURL, err := url.Parse("universerpc://some-host:1234")
+	require.NoError(t, err)
+
+	dummyURL2, err := url.Parse("universerpc://another-host:765")
+	require.NoError(t, err)
+
+	oneURL := fn.Some[[]url.URL]([]url.URL{*dummyURL})
+	twoURL := fn.Some[[]url.URL]([]url.URL{*dummyURL, *dummyURL2})
 
 	testCases := []struct {
 		name                 string
@@ -516,20 +595,16 @@ func TestGenesisProofVerification(t *testing.T) {
 			assetVersion: asset.V1,
 		},
 		{
-			name:      "collectible with leaf preimage",
-			assetType: asset.Collectible,
-			tapscriptPreimage: commitment.NewPreimageFromLeaf(
-				leaf1,
-			),
-			noMetaHash: true,
+			name:              "collectible with leaf preimage",
+			assetType:         asset.Collectible,
+			tapscriptPreimage: testLeafPreimage,
+			noMetaHash:        true,
 		},
 		{
-			name:      "collectible with branch preimage",
-			assetType: asset.Collectible,
-			tapscriptPreimage: commitment.NewPreimageFromBranch(
-				branch,
-			),
-			noMetaHash: true,
+			name:              "collectible with branch preimage",
+			assetType:         asset.Collectible,
+			tapscriptPreimage: &testBranchPreimage,
+			noMetaHash:        true,
 		},
 		{
 			name:       "normal genesis",
@@ -545,22 +620,18 @@ func TestGenesisProofVerification(t *testing.T) {
 			assetVersion: asset.V1,
 		},
 		{
-			name:      "normal with leaf preimage",
-			assetType: asset.Normal,
-			amount:    &amount,
-			tapscriptPreimage: commitment.NewPreimageFromLeaf(
-				leaf1,
-			),
-			noMetaHash: true,
+			name:              "normal with leaf preimage",
+			assetType:         asset.Normal,
+			amount:            &amount,
+			tapscriptPreimage: testLeafPreimage,
+			noMetaHash:        true,
 		},
 		{
-			name:      "normal with branch preimage",
-			assetType: asset.Normal,
-			amount:    &amount,
-			tapscriptPreimage: commitment.NewPreimageFromBranch(
-				branch,
-			),
-			noMetaHash: true,
+			name:              "normal with branch preimage",
+			assetType:         asset.Normal,
+			amount:            &amount,
+			tapscriptPreimage: &testBranchPreimage,
+			noMetaHash:        true,
 		},
 		{
 			name:      "normal asset with a meta reveal",
@@ -614,6 +685,20 @@ func TestGenesisProofVerification(t *testing.T) {
 			expectedErr: ErrGenesisRevealRequired,
 		},
 		{
+			name:      "meta reveal with unknown odd type",
+			assetType: asset.Collectible,
+			metaReveal: &MetaReveal{
+				Data: []byte("{\"foo\": \"bar\"}"),
+				Type: MetaJson,
+				UnknownOddTypes: tlv.TypeMap{
+					//nolint:lll
+					test.TestVectorAllowedUnknownType: []byte(
+						"decimalDisplay?",
+					),
+				},
+			},
+		},
+		{
 			name:       "genesis reveal asset ID mismatch",
 			assetType:  asset.Normal,
 			amount:     &amount,
@@ -659,8 +744,10 @@ func TestGenesisProofVerification(t *testing.T) {
 			name:       "group key reveal invalid key",
 			assetType:  asset.Collectible,
 			noMetaHash: true,
-			groupRevealMutator: func(gkr *asset.GroupKeyReveal) {
-				gkr.RawKey[0] = 0x01
+			groupRevealMutator: func(gkr asset.GroupKeyReveal) {
+				rawKey := gkr.RawKey()
+				rawKey[0] = 0x01
+				gkr.SetRawKey(rawKey)
 			},
 			expectedErr: secp256k1.ErrPubKeyInvalidFormat,
 		},
@@ -669,10 +756,47 @@ func TestGenesisProofVerification(t *testing.T) {
 			assetType:  asset.Normal,
 			amount:     &amount,
 			noMetaHash: true,
-			groupRevealMutator: func(gkr *asset.GroupKeyReveal) {
-				gkr.TapscriptRoot = test.RandBytes(32)
+			groupRevealMutator: func(gkr asset.GroupKeyReveal) {
+				gkr.SetTapscriptRoot(test.RandBytes(32))
 			},
 			expectedErr: ErrGroupKeyRevealMismatch,
+		},
+		{
+			name: "normal asset with a meta reveal and " +
+				"decimal display and canonical universe URL",
+			assetType: asset.Normal,
+			amount:    &amount,
+			metaReveal: &MetaReveal{
+				Data: []byte("meant in crooking " +
+					"nevermore"),
+				DecimalDisplay:     fn.Some[uint32](8),
+				CanonicalUniverses: oneURL,
+			},
+		},
+		{
+			name: "collectible with a meta reveal and " +
+				"decimal display and canonical universe URL",
+			assetType: asset.Collectible,
+			metaReveal: &MetaReveal{
+				Data: []byte("shall be lifted " +
+					"nevermore"),
+				DecimalDisplay:     fn.Some[uint32](3),
+				CanonicalUniverses: oneURL,
+			},
+		},
+		{
+			name:      "normal asset with all meta reveal fields",
+			assetType: asset.Normal,
+			amount:    &amount,
+			metaReveal: &MetaReveal{
+				Data:                []byte("fully loaded"),
+				DecimalDisplay:      fn.Some[uint32](11),
+				UniverseCommitments: true,
+				CanonicalUniverses:  twoURL,
+				DelegationKey: fn.MaybeSome(
+					asset.NUMSPubKey,
+				),
+			},
 		},
 	}
 
@@ -688,14 +812,14 @@ func TestGenesisProofVerification(t *testing.T) {
 				tc.genesisRevealMutator, tc.groupRevealMutator,
 				tc.assetVersion,
 			)
+
 			_, err := genesisProof.Verify(
-				context.Background(), nil, MockHeaderVerifier,
-				MockGroupVerifier,
+				context.Background(), nil, MockChainLookup,
+				MockVerifierCtx,
 			)
 			require.ErrorIs(t, err, tc.expectedErr)
 
-			var buf bytes.Buffer
-			err = genesisProof.Encode(&buf)
+			genesisProofBytes, err := genesisProof.Bytes()
 			require.NoError(tt, err)
 
 			if tc.expectedErr == nil {
@@ -706,7 +830,7 @@ func TestGenesisProofVerification(t *testing.T) {
 							t, &genesisProof,
 						),
 						Expected: hex.EncodeToString(
-							buf.Bytes(),
+							genesisProofBytes,
 						),
 						Comment: tc.name,
 					},
@@ -736,10 +860,14 @@ func TestProofBlockHeaderVerification(t *testing.T) {
 		originalBlockHeight = proof.BlockHeight
 	)
 
+	vCtx := MockVerifierCtx
+
 	// Header verifier compares given header to expected header. Verifier
 	// does not return error.
 	errHeaderVerifier := fmt.Errorf("invalid block header")
-	headerVerifier := func(header wire.BlockHeader, height uint32) error {
+	vCtx.HeaderVerifier = func(header wire.BlockHeader,
+		height uint32) error {
+
 		// Compare given block header against base reference block
 		// header.
 		if header != originalBlockHeader || height != originalBlockHeight {
@@ -750,16 +878,14 @@ func TestProofBlockHeaderVerification(t *testing.T) {
 
 	// Verify that the original proof block header is as expected and
 	// therefore an error is not returned.
-	_, err := proof.Verify(
-		context.Background(), nil, headerVerifier, MockGroupVerifier,
-	)
+	_, err := proof.Verify(context.Background(), nil, MockChainLookup, vCtx)
 	require.NoError(t, err)
 
 	// Modify proof block header, then check that the verification function
 	// propagates the correct error.
 	proof.BlockHeader.Nonce += 1
 	_, actualErr := proof.Verify(
-		context.Background(), nil, headerVerifier, MockGroupVerifier,
+		context.Background(), nil, MockChainLookup, vCtx,
 	)
 	require.ErrorIs(t, actualErr, errHeaderVerifier)
 
@@ -770,7 +896,7 @@ func TestProofBlockHeaderVerification(t *testing.T) {
 	// propagates the correct error.
 	proof.BlockHeight += 1
 	_, actualErr = proof.Verify(
-		context.Background(), nil, headerVerifier, MockGroupVerifier,
+		context.Background(), nil, MockChainLookup, vCtx,
 	)
 	require.ErrorIs(t, actualErr, errHeaderVerifier)
 }
@@ -790,17 +916,13 @@ func TestProofFileVerification(t *testing.T) {
 	err = f.Decode(bytes.NewReader(proofBytes))
 	require.NoError(t, err)
 
-	_, err = f.Verify(
-		context.Background(), MockHeaderVerifier, MockGroupVerifier,
-	)
+	_, err = f.Verify(context.Background(), MockVerifierCtx)
 	require.NoError(t, err)
 
 	// Ensure that verification of a proof of unknown version fails.
 	f.Version = Version(212)
 
-	lastAsset, err := f.Verify(
-		context.Background(), MockHeaderVerifier, MockGroupVerifier,
-	)
+	lastAsset, err := f.Verify(context.Background(), MockVerifierCtx)
 	require.Nil(t, lastAsset)
 	require.ErrorIs(t, err, ErrUnknownVersion)
 }
@@ -827,29 +949,116 @@ func TestProofVerification(t *testing.T) {
 
 	inclusionTxOut := p.AnchorTx.TxOut[p.InclusionProof.OutputIndex]
 	t.Logf("Proof inclusion tx out: %x", inclusionTxOut.PkScript)
-	proofKey, proofTree, err := p.InclusionProof.DeriveByAssetInclusion(
-		&p.Asset,
-	)
+	proofKeys, err := p.InclusionProof.DeriveByAssetInclusion(&p.Asset, nil)
 	require.NoError(t, err)
-	rootHash := proofTree.TapscriptRoot(nil)
+
 	t.Logf("Proof internal key: %x",
 		p.InclusionProof.InternalKey.SerializeCompressed())
-	t.Logf("Proof root hash: %x", rootHash[:])
-	t.Logf("Proof key: %x", proofKey.SerializeCompressed())
+
+	for proofKey, commit := range proofKeys {
+		rootHash := commit.TapscriptRoot(nil)
+		t.Logf("Proof root hash: %x", rootHash[:])
+		logString := "CommitmentNonV2"
+		if commit.Version == commitment.TapCommitmentV2 {
+			logString = "CommitmentV2"
+		}
+
+		t.Logf("%s proof key: %x", logString, proofKey)
+	}
 
 	var buf bytes.Buffer
 	require.NoError(t, p.Asset.Encode(&buf))
 	t.Logf("Proof asset encoded: %x", buf.Bytes())
 
+	ta := asset.NewTestFromAsset(t, &p.Asset)
+	assetJSON, err := json.Marshal(ta)
+	require.NoError(t, err)
+
+	t.Logf("Proof asset JSON: %s", assetJSON)
+
+	// If we have a challenge witness, we can verify that without having the
+	// previous proof.
+	if len(p.ChallengeWitness) > 0 {
+		_, err = p.Verify(
+			context.Background(), nil, MockChainLookup,
+			MockVerifierCtx,
+		)
+		require.NoError(t, err)
+	}
+
+	// Verifying the inclusion and exclusion proofs can also be done without
+	// the previous proof.
+	_, err = p.VerifyProofs()
+	require.NoError(t, err)
+
 	// Ensure that verification of a proof of unknown version fails.
 	p.Version = TransitionVersion(212)
 
 	lastAsset, err := p.Verify(
-		context.Background(), nil, MockHeaderVerifier,
-		MockGroupVerifier,
+		context.Background(), nil, MockChainLookup, MockVerifierCtx,
 	)
 	require.Nil(t, lastAsset)
 	require.ErrorIs(t, err, ErrUnknownVersion)
+}
+
+// TestProofFileVerificationIgnoreChecker tests that the ignore checker can be
+// used as a proof rejection cache.
+func TestProofFileVerificationIgnoreChecker(t *testing.T) {
+	proofHex, err := os.ReadFile(proofFileHexFileName)
+	require.NoError(t, err)
+
+	proofBytes, err := hex.DecodeString(
+		strings.Trim(string(proofHex), "\n"),
+	)
+	require.NoError(t, err)
+
+	proofFile := &File{}
+	err = proofFile.Decode(bytes.NewReader(proofBytes))
+	require.NoError(t, err)
+
+	numProofs := proofFile.NumProofs()
+
+	rapid.Check(t, func(t *rapid.T) {
+		// Pick an invalid proof index in the range. -1 means that no
+		// proofs are invalid.
+		invalidIdx := rapid.IntRange(-1, numProofs-1).Draw(
+			t, "invalidIdx",
+		)
+
+		vCtx := MockVerifierCtx
+
+		reject := invalidIdx >= 0
+
+		if reject {
+			p, err := proofFile.ProofAt(uint32(invalidIdx))
+			require.NoError(t, err)
+
+			assetPoint := AssetPoint{
+				OutPoint: wire.OutPoint{
+					Hash:  p.AnchorTx.TxHash(),
+					Index: p.InclusionProof.OutputIndex,
+				},
+				ID: p.Asset.ID(),
+				ScriptKey: asset.ToSerialized(
+					p.Asset.ScriptKey.PubKey,
+				),
+			}
+
+			ignoreChecker := newMockIgnoreChecker(
+				false, assetPoint,
+			)
+			vCtx.IgnoreChecker = lfn.Some[IgnoreChecker](
+				ignoreChecker,
+			)
+		}
+
+		_, err = proofFile.Verify(context.Background(), vCtx)
+		if reject {
+			require.ErrorIs(t, err, ErrProofInvalid)
+		} else {
+			require.NoError(t, err)
+		}
+	})
 }
 
 // TestOwnershipProofVerification ensures that the ownership proof encoding and
@@ -868,8 +1077,7 @@ func TestOwnershipProofVerification(t *testing.T) {
 	require.NoError(t, err)
 
 	snapshot, err := p.Verify(
-		context.Background(), nil, MockHeaderVerifier,
-		MockGroupVerifier,
+		context.Background(), nil, MockChainLookup, MockVerifierCtx,
 	)
 	require.NoError(t, err)
 	require.NotNil(t, snapshot)
@@ -1022,13 +1230,55 @@ func runBIPTestVector(t *testing.T, testVectors *TestVectors) {
 
 			p := validCase.Proof.ToProof(tt)
 
-			var buf bytes.Buffer
-			err := p.Encode(&buf)
+			proofBytes, err := p.Bytes()
 			require.NoError(tt, err)
 
 			areEqual := validCase.Expected == hex.EncodeToString(
-				buf.Bytes(),
+				proofBytes,
 			)
+
+			// Make sure the proof in the test vectors doesn't use
+			// a record type we haven't marked as known/supported
+			// yet. If the following check fails, you need to update
+			// the KnownProofTypes set.
+			for _, record := range p.EncodeRecords() {
+				// Test vectors may contain this one type to
+				// demonstrate that it is not rejected.
+				if record.Type() ==
+					test.TestVectorAllowedUnknownType {
+
+					continue
+				}
+
+				require.Contains(
+					tt, KnownProofTypes, record.Type(),
+				)
+			}
+
+			checkTaprootProofTypes(tt, p.InclusionProof)
+			for i := range p.ExclusionProofs {
+				checkTaprootProofTypes(tt, p.ExclusionProofs[i])
+			}
+
+			if p.MetaReveal != nil {
+				metaRecords := p.MetaReveal.EncodeRecords()
+				for _, record := range metaRecords {
+					// Test vectors may contain this one
+					// type to demonstrate that it is not
+					// rejected.
+					// nolint:lll
+					if record.Type() ==
+						test.TestVectorAllowedUnknownType {
+
+						continue
+					}
+
+					require.Contains(
+						tt, KnownMetaRevealTypes,
+						record.Type(),
+					)
+				}
+			}
 
 			// Create nice diff if things don't match.
 			if !areEqual {
@@ -1048,7 +1298,7 @@ func runBIPTestVector(t *testing.T, testVectors *TestVectors) {
 				// Make sure we still fail the test.
 				require.Equal(
 					tt, validCase.Expected,
-					hex.EncodeToString(buf.Bytes()),
+					hex.EncodeToString(proofBytes),
 				)
 			}
 
@@ -1061,6 +1311,28 @@ func runBIPTestVector(t *testing.T, testVectors *TestVectors) {
 			require.NoError(tt, err)
 
 			require.Equal(tt, p, decoded)
+
+			// We can't verify the full proof chain but at least we
+			// can verify the inclusion/exclusion proofs.
+			_, err = decoded.VerifyProofs()
+			require.NoError(tt, err)
+
+			// If there is a genesis reveal, we can validate the
+			// full proof chain, as it's the first proof in the
+			// chain.
+			if decoded.GenesisReveal != nil {
+				vCtx := VerifierCtx{
+					HeaderVerifier: MockHeaderVerifier,
+					MerkleVerifier: DefaultMerkleVerifier,
+					GroupVerifier:  MockGroupVerifier,
+					ChainLookupGen: MockChainLookup,
+				}
+				_, err = decoded.Verify(
+					context.Background(), nil,
+					MockChainLookup, vCtx,
+				)
+				require.NoError(tt, err)
+			}
 		})
 	}
 
@@ -1077,9 +1349,118 @@ func runBIPTestVector(t *testing.T, testVectors *TestVectors) {
 	}
 }
 
+// checkTaprootProofTypes ensures that the taproot proof contains only known
+// TLV types.
+func checkTaprootProofTypes(t *testing.T, p TaprootProof) {
+	for _, record := range p.EncodeRecords() {
+		// Test vectors may contain this one type to demonstrate that
+		// it is not rejected.
+		if record.Type() ==
+			test.TestVectorAllowedUnknownType {
+
+			continue
+		}
+
+		require.Contains(t, KnownTaprootProofTypes, record.Type())
+	}
+
+	if p.CommitmentProof != nil {
+		for _, record := range p.CommitmentProof.EncodeRecords() {
+			// Test vectors may contain this one type to demonstrate
+			// that it is not rejected.
+			if record.Type() ==
+				test.TestVectorAllowedUnknownType {
+
+				continue
+			}
+
+			require.Contains(
+				t, KnownCommitmentProofTypes, record.Type(),
+			)
+
+			tap := p.CommitmentProof.TaprootAssetProof
+			types := commitment.KnownTaprootAssetProofTypes
+			for _, record := range tap.Records() {
+				require.Contains(
+					t, types, record.Type(),
+				)
+			}
+
+			if p.CommitmentProof.AssetProof != nil {
+				ap := p.CommitmentProof.AssetProof
+				types := commitment.KnownAssetProofTypes
+				for _, record := range ap.Records() {
+					require.Contains(
+						t, types, record.Type(),
+					)
+				}
+			}
+		}
+	}
+
+	if p.TapscriptProof != nil {
+		for _, record := range p.TapscriptProof.EncodeRecords() {
+			// Test vectors may contain this one type to demonstrate
+			// that it is not rejected.
+			if record.Type() ==
+				test.TestVectorAllowedUnknownType {
+
+				continue
+			}
+
+			require.Contains(
+				t, KnownTapscriptProofTypes, record.Type(),
+			)
+		}
+	}
+}
+
+// TestProofUnknownOddType tests that an unknown odd type is allowed in a proof
+// and that we can still arrive at the correct serialized version with it.
+func TestProofUnknownOddType(t *testing.T) {
+	t.Parallel()
+
+	testBlocks := readTestData(t)
+	oddTxBlock := testBlocks[0]
+
+	genesis := asset.RandGenesis(t, asset.Collectible)
+	scriptKey := test.RandPubKey(t)
+	knownProof := RandProof(t, genesis, scriptKey, oddTxBlock, 0, 1)
+
+	var knownProofBytes []byte
+	test.RunUnknownOddTypeTest(
+		t, &knownProof, &asset.ErrUnknownType{},
+		func(buf *bytes.Buffer, proof *Proof) error {
+			err := proof.Encode(buf)
+
+			knownProofBytes = fn.CopySlice(buf.Bytes())
+
+			return err
+		},
+		func(buf *bytes.Buffer) (*Proof, error) {
+			var parsedProof Proof
+			return &parsedProof, parsedProof.Decode(buf)
+		},
+		func(parsedProof *Proof, unknownTypes tlv.TypeMap) {
+			require.Equal(
+				t, unknownTypes, parsedProof.UnknownOddTypes,
+			)
+
+			// The proof should've changed, to make sure the unknown
+			// value was taken into account when creating the
+			// serialized proof.
+			parsedProofBytes, err := parsedProof.Bytes()
+			require.NoError(t, err)
+
+			require.NotEqual(t, knownProofBytes, parsedProofBytes)
+
+			parsedProof.UnknownOddTypes = nil
+			require.Equal(t, &knownProof, parsedProof)
+		},
+	)
+}
+
 func init() {
-	logWriter := build.NewRotatingLogWriter()
-	logger := logWriter.GenSubLogger(Subsystem, func() {})
-	logWriter.RegisterSubLogger(Subsystem, logger)
-	UseLogger(logger)
+	logger := btclog.NewSLogger(btclog.NewDefaultHandler(os.Stdout))
+	UseLogger(logger.SubSystem(Subsystem))
 }

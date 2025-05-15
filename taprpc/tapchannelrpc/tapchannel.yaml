@@ -1,0 +1,20 @@
+type: google.api.Service
+config_version: 3
+
+http:
+  rules:
+    - selector: tapchannelrpc.TaprootAssetChannels.FundChannel
+      post: "/v1/taproot-assets/channels/fund"
+      body: "*"
+    - selector: tapchannelrpc.TaprootAssetChannels.EncodeCustomRecords
+      post: "/v1/taproot-assets/channels/encode-custom-data"
+      body: "*"
+    - selector: tapchannelrpc.TaprootAssetChannels.SendPayment
+      post: "/v1/taproot-assets/channels/send-payment"
+      body: "*"
+    - selector: tapchannelrpc.TaprootAssetChannels.AddInvoice
+      post: "/v1/taproot-assets/channels/invoice"
+      body: "*"
+    - selector: tapchannelrpc.TaprootAssetChannels.DecodeAssetPayReq
+      post: "/v1/taproot-assets/channels/invoice/decode"
+      body: "*"

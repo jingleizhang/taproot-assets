@@ -3,6 +3,7 @@ package tapdb
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -17,6 +18,7 @@ import (
 	"github.com/lightninglabs/taproot-assets/proof"
 	"github.com/lightninglabs/taproot-assets/tapdb/sqlc"
 	"github.com/lightninglabs/taproot-assets/tapgarden"
+	"github.com/lightninglabs/taproot-assets/tapsend"
 	"github.com/lightningnetwork/lnd/keychain"
 	"golang.org/x/exp/maps"
 )
@@ -59,6 +61,10 @@ type (
 
 	// AssetGroupKey is used to insert a new asset key group into the DB.
 	AssetGroupKey = sqlc.UpsertAssetGroupKeyParams
+
+	// BatchTapSiblingUpdate is used to update a batch with the root hash
+	// of a tapscript sibling associated with it.
+	BatchTapSiblingUpdate = sqlc.BindMintingBatchWithTapSiblingParams
 
 	// BatchChainUpdate is used to update a batch with the minting
 	// transaction associated with it.
@@ -106,8 +112,13 @@ type (
 	// MintingBatchInit is used to create a new minting batch.
 	MintingBatchInit = sqlc.NewMintingBatchParams
 
-	// ProofUpdate is used to update a proof file on disk.
-	ProofUpdate = sqlc.UpsertAssetProofParams
+	// ProofUpdateByID is used to update a proof file on disk by asset
+	// database ID.
+	ProofUpdateByID = sqlc.UpsertAssetProofByIDParams
+
+	// FetchAssetID is used to fetch the primary key ID of an asset, by
+	// outpoint and tweaked script key.
+	FetchAssetID = sqlc.FetchAssetIDParams
 
 	// NewScriptKey wraps the params needed to insert a new script key on
 	// disk.
@@ -116,6 +127,10 @@ type (
 	// NewAssetMeta wraps the params needed to insert a new asset meta on
 	// disk.
 	NewAssetMeta = sqlc.UpsertAssetMetaParams
+
+	// MintAnchorUniCommitParams wraps the params needed to insert a new
+	// mint anchor uni commitment on disk.
+	MintAnchorUniCommitParams = sqlc.UpsertMintAnchorUniCommitmentParams
 )
 
 // PendingAssetStore is a sub-set of the main sqlc.Querier interface that
@@ -128,6 +143,14 @@ type PendingAssetStore interface {
 
 	// GroupStore houses the methods related to querying asset groups.
 	GroupStore
+
+	// FetchScriptKeyStore houses the methods related to fetching all
+	// information about a script key.
+	FetchScriptKeyStore
+
+	// TapscriptTreeStore houses the methods related to storing, fetching,
+	// and deleting tapscript trees.
+	TapscriptTreeStore
 
 	// NewMintingBatch creates a new minting batch.
 	NewMintingBatch(ctx context.Context, arg MintingBatchInit) error
@@ -173,9 +196,15 @@ type PendingAssetStore interface {
 	FetchSeedlingByID(ctx context.Context,
 		seedlingID int64) (AssetSeedling, error)
 
+	// BindMintingBatchWithTapSibling adds a tapscript tree root hash to an
+	// existing batch.
+	BindMintingBatchWithTapSibling(ctx context.Context,
+		arg BatchTapSiblingUpdate) error
+
 	// BindMintingBatchWithTx adds the minting transaction to an existing
 	// batch.
-	BindMintingBatchWithTx(ctx context.Context, arg BatchChainUpdate) error
+	BindMintingBatchWithTx(ctx context.Context,
+		arg BatchChainUpdate) (int64, error)
 
 	// UpdateBatchGenesisTx updates the batch tx attached to an existing
 	// batch.
@@ -202,17 +231,46 @@ type PendingAssetStore interface {
 	FetchAssetsForBatch(ctx context.Context, rawKey []byte) ([]AssetSprout,
 		error)
 
-	// UpsertAssetProof inserts a new or updates an existing asset proof on
-	// disk.
-	//
-	// TODO(roasbeef): move somewhere else??
-	UpsertAssetProof(ctx context.Context,
-		arg sqlc.UpsertAssetProofParams) error
+	// FetchAssetID fetches the `asset_id` (primary key) from the assets
+	// table for a given asset identified by `Outpoint` and
+	// `TweakedScriptKey`.
+	FetchAssetID(ctx context.Context, arg FetchAssetID) ([]int64, error)
+
+	// UpsertAssetProofByID inserts a new or updates an existing asset
+	// proof on disk.
+	UpsertAssetProofByID(ctx context.Context, arg ProofUpdateByID) error
 
 	// FetchAssetMetaForAsset fetches the asset meta for a given asset.
 	FetchAssetMetaForAsset(ctx context.Context,
 		assetID []byte) (sqlc.FetchAssetMetaForAssetRow, error)
+
+	// FetchMintAnchorUniCommitment fetches the mint anchor uni commitment
+	// for a given batch.
+	FetchMintAnchorUniCommitment(ctx context.Context,
+		batchID int32) (sqlc.MintAnchorUniCommitment, error)
+
+	// UpsertMintAnchorUniCommitment inserts a new or updates an existing
+	// mint anchor uni commitment on disk.
+	UpsertMintAnchorUniCommitment(ctx context.Context,
+		arg MintAnchorUniCommitParams) (int64, error)
 }
+
+var (
+	// ErrFetchMintingBatches is returned when fetching multiple minting
+	// batches fails.
+	ErrFetchMintingBatches = errors.New("unable to fetch minting batches")
+
+	// ErrBatchParsing is returned when parsing a fetching minting batch
+	// fails.
+	ErrBatchParsing = errors.New("unable to parse batch")
+
+	// ErrBindBatchTx is returned when binding a tx to a minting batch
+	// fails.
+	ErrBindBatchTx = errors.New("unable to bind batch tx")
+
+	// ErrEncodePsbt is returned when serializing a PSBT fails.
+	ErrEncodePsbt = errors.New("unable to encode psbt")
+)
 
 // AssetStoreTxOptions defines the set of db txn options the PendingAssetStore
 // understands.
@@ -260,6 +318,85 @@ func NewAssetMintingStore(db BatchedPendingAssetStore) *AssetMintingStore {
 	}
 }
 
+// OptionalSeedlingFields contains database IDs for optional seedling fields
+// that have been stored on disk.
+type OptionalSeedlingFields struct {
+	GroupInternalKeyID sql.NullInt64
+	GroupGenesisID     sql.NullInt64
+	GroupAnchorID      sql.NullInt64
+}
+
+// insertMintAnchorTx inserts a mint anchor transaction into the database.
+func insertMintAnchorTx(ctx context.Context, q PendingAssetStore,
+	anchorPackage tapgarden.FundedMintAnchorPsbt,
+	batchKey btcec.PublicKey, genesisOutpoint wire.OutPoint) error {
+
+	// Ensure that the genesis point is in the database.
+	genesisPointDbID, err := upsertGenesisPoint(
+		ctx, q, genesisOutpoint,
+	)
+	if err != nil {
+		return fmt.Errorf("%w: %w", ErrUpsertGenesisPoint, err)
+	}
+
+	var psbtBuf bytes.Buffer
+	err = anchorPackage.Pkt.Serialize(&psbtBuf)
+	if err != nil {
+		return fmt.Errorf("%w: %w", ErrEncodePsbt, err)
+	}
+
+	rawBatchKey := batchKey.SerializeCompressed()
+	enableUniverseCommitments := anchorPackage.PreCommitmentOutput.IsSome()
+
+	batchID, err := q.BindMintingBatchWithTx(ctx, BatchChainUpdate{
+		RawKey:              rawBatchKey,
+		MintingTxPsbt:       psbtBuf.Bytes(),
+		ChangeOutputIndex:   sqlInt32(anchorPackage.ChangeOutputIndex),
+		AssetsOutputIndex:   sqlInt32(anchorPackage.AssetAnchorOutIdx),
+		GenesisID:           sqlInt64(genesisPointDbID),
+		UniverseCommitments: enableUniverseCommitments,
+	})
+	if err != nil {
+		return fmt.Errorf("%w: %w", ErrBindBatchTx, err)
+	}
+
+	// If universe commitments are not enabled for this batch, we can
+	// return early.
+	if !enableUniverseCommitments {
+		return nil
+	}
+
+	// At this point, universe commitments are enabled for this batch, so
+	// we'll insert the mint anchor uni commitment record.
+	preCommitOut, err := anchorPackage.PreCommitmentOutput.UnwrapOrErr(
+		fmt.Errorf("pre-commitment outpoint bundle not set"),
+	)
+	if err != nil {
+		return err
+	}
+
+	// Serialize internal key.
+	internalKey := preCommitOut.InternalKey.SerializeCompressed()
+
+	// Serialize group key.
+	groupPubKey := preCommitOut.GroupPubKey.SerializeCompressed()
+
+	_, err = q.UpsertMintAnchorUniCommitment(
+		ctx, MintAnchorUniCommitParams{
+			BatchID:            int32(batchID),
+			TxOutputIndex:      int32(preCommitOut.OutIdx),
+			TaprootInternalKey: internalKey,
+			GroupKey:           groupPubKey,
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("unable to insert mint anchor uni "+
+			"commitment: %w", err)
+	}
+
+	return nil
+}
+
 // CommitMintingBatch commits a new minting batch to disk along with any
 // seedlings specified as part of the batch. A new internal key is also
 // created, with the batch referencing that internal key. This internal key
@@ -280,8 +417,7 @@ func (a *AssetMintingStore) CommitMintingBatch(ctx context.Context,
 			KeyIndex:  int32(newBatch.BatchKey.Index),
 		})
 		if err != nil {
-			return fmt.Errorf("unable to insert internal "+
-				"key: %w", err)
+			return fmt.Errorf("%w: %w", ErrUpsertInternalKey, err)
 		}
 
 		// With our internal key inserted, we can now insert a new
@@ -293,6 +429,39 @@ func (a *AssetMintingStore) CommitMintingBatch(ctx context.Context,
 		}); err != nil {
 			return fmt.Errorf("unable to insert minting "+
 				"batch: %w", err)
+		}
+
+		// With the batch key and batch itself inserted, we can insert
+		// the batch tapscript sibling if present.
+		newBatchSibling := newBatch.TapSibling()
+		if newBatchSibling != nil {
+			tapSibling := BatchTapSiblingUpdate{
+				RawKey:           rawBatchKey,
+				TapscriptSibling: newBatchSibling,
+			}
+			err = q.BindMintingBatchWithTapSibling(ctx, tapSibling)
+			if err != nil {
+				return fmt.Errorf("unable to insert batch "+
+					"sibling: %w", err)
+			}
+		}
+
+		// If the batch is funded, we can also insert the batch TX and
+		// batch genesis outpoint.
+		if newBatch.GenesisPacket != nil {
+			genesisPacket := newBatch.GenesisPacket
+			genesisTx := genesisPacket.Pkt.UnsignedTx
+			genesisOutpoint := genesisTx.TxIn[0].PreviousOutPoint
+
+			// Insert the batch transaction.
+			err = insertMintAnchorTx(
+				ctx, q, *genesisPacket,
+				*newBatch.BatchKey.PubKey, genesisOutpoint,
+			)
+			if err != nil {
+				return fmt.Errorf("unable to insert mint "+
+					"anchor tx: %w", err)
+			}
 		}
 
 		// Now that our minting batch is in place, which references the
@@ -324,34 +493,37 @@ func (a *AssetMintingStore) CommitMintingBatch(ctx context.Context,
 				EmissionEnabled: seedling.EnableEmission,
 			}
 
-			// If this seedling is being issued to an existing
-			// group, we need to reference the genesis that
-			// was first used to create the group.
-			if seedling.HasGroupKey() {
-				genesisID, err := fetchGenesisID(
-					ctx, q, *seedling.GroupInfo.Genesis,
-				)
-				if err != nil {
-					return err
-				}
-
-				dbSeedling.GroupGenesisID = sqlInt64(genesisID)
+			scriptKeyID, err := upsertScriptKey(
+				ctx, seedling.ScriptKey, q,
+			)
+			if err != nil {
+				return fmt.Errorf("unable to insert seedling "+
+					"script key: %w", err)
 			}
 
-			// If this seedling is being issued to a group being
-			// created in this batch, we need to reference the
-			// anchor seedling for the group.
-			if seedling.GroupAnchor != nil {
-				anchorID, err := fetchSeedlingID(
-					ctx, q, rawBatchKey,
-					*seedling.GroupAnchor,
-				)
-				if err != nil {
-					return err
-				}
+			dbSeedling.ScriptKeyID = sqlInt64(scriptKeyID)
 
-				dbSeedling.GroupAnchorID = sqlInt64(anchorID)
+			tapscriptRootSize := len(seedling.GroupTapscriptRoot)
+			if tapscriptRootSize != 0 &&
+				tapscriptRootSize != sha256.Size {
+
+				return ErrTapscriptRootSize
 			}
+
+			dbSeedling.GroupTapscriptRoot = seedling.
+				GroupTapscriptRoot
+
+			optionalDbIDs, err := insertOptionalSeedlingParams(
+				ctx, q, rawBatchKey, seedling,
+			)
+			if err != nil {
+				return err
+			}
+
+			dbSeedling.GroupInternalKeyID =
+				optionalDbIDs.GroupInternalKeyID
+			dbSeedling.GroupGenesisID = optionalDbIDs.GroupGenesisID
+			dbSeedling.GroupAnchorID = optionalDbIDs.GroupAnchorID
 
 			err = q.InsertAssetSeedling(ctx, dbSeedling)
 			if err != nil {
@@ -363,6 +535,60 @@ func (a *AssetMintingStore) CommitMintingBatch(ctx context.Context,
 	})
 
 	return err
+}
+
+func insertOptionalSeedlingParams(ctx context.Context, q PendingAssetStore,
+	batchKey []byte, seedling *tapgarden.Seedling) (OptionalSeedlingFields,
+	error) {
+
+	var (
+		fieldIDs OptionalSeedlingFields
+		err      error
+	)
+
+	if seedling.GroupInternalKey != nil {
+		rawKeyBytes := seedling.GroupInternalKey.PubKey.
+			SerializeCompressed()
+		internalKeyID, err := q.UpsertInternalKey(ctx, InternalKey{
+			RawKey:    rawKeyBytes,
+			KeyFamily: int32(seedling.GroupInternalKey.Family),
+			KeyIndex:  int32(seedling.GroupInternalKey.Index),
+		})
+
+		if err != nil {
+			return fieldIDs, err
+		}
+
+		fieldIDs.GroupInternalKeyID = sqlInt64(internalKeyID)
+	}
+
+	// If this seedling is being issued to an existing group, we need to
+	// reference the genesis that was first used to create the group.
+	if seedling.HasGroupKey() {
+		genesisID, err := fetchGenesisID(
+			ctx, q, *seedling.GroupInfo.Genesis,
+		)
+		if err != nil {
+			return fieldIDs, err
+		}
+
+		fieldIDs.GroupGenesisID = sqlInt64(genesisID)
+	}
+
+	// If this seedling is being issued to a group being created in this
+	// batch, we need to reference the anchor seedling for the group.
+	if seedling.GroupAnchor != nil {
+		anchorID, err := fetchSeedlingID(
+			ctx, q, batchKey, *seedling.GroupAnchor,
+		)
+		if err != nil {
+			return fieldIDs, err
+		}
+
+		fieldIDs.GroupAnchorID = sqlInt64(anchorID)
+	}
+
+	return fieldIDs, err
 }
 
 // AddSeedlingsToBatch adds a new set of seedlings to an existing batch.
@@ -398,39 +624,42 @@ func (a *AssetMintingStore) AddSeedlingsToBatch(ctx context.Context,
 				EmissionEnabled: seedling.EnableEmission,
 			}
 
-			// If this seedling is being issued to an existing
-			// group, we need to reference the genesis that
-			// was first used to create the group.
-			if seedling.HasGroupKey() {
-				genesisID, err := fetchGenesisID(
-					ctx, q, *seedling.GroupInfo.Genesis,
-				)
-				if err != nil {
-					return err
-				}
-
-				dbSeedling.GroupGenesisID = sqlInt64(genesisID)
+			scriptKeyID, err := upsertScriptKey(
+				ctx, seedling.ScriptKey, q,
+			)
+			if err != nil {
+				return fmt.Errorf("unable to insert seedling "+
+					"script key: %w", err)
 			}
 
-			// If this seedling is being issued to a group being
-			// created in this batch, we need to reference the
-			// anchor seedling for the group.
-			if seedling.GroupAnchor != nil {
-				anchorID, err := fetchSeedlingID(
-					ctx, q, rawBatchKey,
-					*seedling.GroupAnchor,
-				)
-				if err != nil {
-					return err
-				}
+			dbSeedling.ScriptKeyID = sqlInt64(scriptKeyID)
 
-				dbSeedling.GroupAnchorID = sqlInt64(anchorID)
+			tapscriptRootSize := len(seedling.GroupTapscriptRoot)
+			if tapscriptRootSize != 0 &&
+				tapscriptRootSize != sha256.Size {
+
+				return ErrTapscriptRootSize
 			}
+
+			dbSeedling.GroupTapscriptRoot = seedling.
+				GroupTapscriptRoot
+
+			optionalDbIDs, err := insertOptionalSeedlingParams(
+				ctx, q, rawBatchKey, seedling,
+			)
+			if err != nil {
+				return err
+			}
+
+			dbSeedling.GroupInternalKeyID =
+				optionalDbIDs.GroupInternalKeyID
+			dbSeedling.GroupGenesisID = optionalDbIDs.GroupGenesisID
+			dbSeedling.GroupAnchorID = optionalDbIDs.GroupAnchorID
 
 			err = q.InsertAssetSeedlingIntoBatch(ctx, dbSeedling)
 			if err != nil {
 				return fmt.Errorf("unable to insert "+
-					"seedling into db: %v", err)
+					"seedling into db: %w", err)
 			}
 		}
 
@@ -440,8 +669,8 @@ func (a *AssetMintingStore) AddSeedlingsToBatch(ctx context.Context,
 
 // fetchSeedlingID attempts to fetch the ID for a seedling from a specific
 // batch. This is performed within the context of a greater DB transaction.
-func fetchSeedlingID(ctx context.Context, q PendingAssetStore,
-	batchKey []byte, seedlingName string) (int64, error) {
+func fetchSeedlingID(ctx context.Context, q PendingAssetStore, batchKey []byte,
+	seedlingName string) (int64, error) {
 
 	seedlingParams := AssetSeedlingTuple{
 		SeedlingName: seedlingName,
@@ -479,6 +708,76 @@ func fetchAssetSeedlings(ctx context.Context, q PendingAssetStore,
 			EnableEmission: dbSeedling.EmissionEnabled,
 		}
 
+		if dbSeedling.TweakedScriptKey != nil {
+			tweakedScriptKey, err := btcec.ParsePubKey(
+				dbSeedling.TweakedScriptKey,
+			)
+			if err != nil {
+				return nil, err
+			}
+
+			scriptKeyInternalPub, err := btcec.ParsePubKey(
+				dbSeedling.ScriptKeyRaw,
+			)
+			if err != nil {
+				return nil, err
+			}
+
+			scriptKeyLocator := keychain.KeyLocator{
+				Index: extractSqlInt32[uint32](
+					dbSeedling.ScriptKeyIndex,
+				),
+				Family: extractSqlInt32[keychain.KeyFamily](
+					dbSeedling.ScriptKeyFam,
+				),
+			}
+
+			scriptKeyRawKey := keychain.KeyDescriptor{
+				KeyLocator: scriptKeyLocator,
+				PubKey:     scriptKeyInternalPub,
+			}
+			scriptKeyTweak := dbSeedling.ScriptKeyTweak
+			scriptType := extractSqlInt16[asset.ScriptKeyType](
+				dbSeedling.ScriptKeyType,
+			)
+			seedling.ScriptKey = asset.ScriptKey{
+				PubKey: tweakedScriptKey,
+				TweakedScriptKey: &asset.TweakedScriptKey{
+					RawKey: scriptKeyRawKey,
+					Tweak:  scriptKeyTweak,
+					Type:   scriptType,
+				},
+			}
+		}
+
+		if dbSeedling.GroupKeyRaw != nil {
+			groupKeyPub, err := btcec.ParsePubKey(
+				dbSeedling.GroupKeyRaw,
+			)
+			if err != nil {
+				return nil, err
+			}
+
+			groupKeyLocator := keychain.KeyLocator{
+				Index: extractSqlInt32[uint32](
+					dbSeedling.GroupKeyIndex,
+				),
+				Family: extractSqlInt32[keychain.KeyFamily](
+					dbSeedling.GroupKeyFam,
+				),
+			}
+
+			seedling.GroupInternalKey = &keychain.KeyDescriptor{
+				KeyLocator: groupKeyLocator,
+				PubKey:     groupKeyPub,
+			}
+		}
+
+		if len(dbSeedling.GroupTapscriptRoot) != 0 {
+			seedling.GroupTapscriptRoot = dbSeedling.
+				GroupTapscriptRoot
+		}
+
 		// Fetch the group info for seedlings with a specific group.
 		// There can only be one group per genesis.
 		if dbSeedling.GroupGenesisID.Valid {
@@ -510,14 +809,15 @@ func fetchAssetSeedlings(ctx context.Context, q PendingAssetStore,
 			seedling.GroupAnchor = &seedlingAnchor.AssetName
 		}
 
-		if len(dbSeedling.MetaDataBlob) != 0 {
-			seedling.Meta = &proof.MetaReveal{
-				Data: dbSeedling.MetaDataBlob,
-				Type: proof.MetaType(
-					dbSeedling.MetaDataType.Int16,
-				),
-			}
+		metaOpt, err := parseAssetMetaReveal(dbSeedling.AssetsMetum)
+		if err != nil {
+			return nil, fmt.Errorf("unable to parse asset meta: %w",
+				err)
 		}
+
+		metaOpt.WhenSome(func(meta proof.MetaReveal) {
+			seedling.Meta = &meta
+		})
 
 		seedlings[seedling.AssetName] = seedling
 	}
@@ -534,29 +834,31 @@ func fetchAssetSeedlings(ctx context.Context, q PendingAssetStore,
 // generation, the GroupKeyFamily and GroupKeyIndex fields of the
 // FetchAssetsForBatchRow need to be manually modified to be sql.NullInt32.
 func fetchAssetSprouts(ctx context.Context, q PendingAssetStore,
-	rawBatchKey []byte) (*commitment.TapCommitment, error) {
+	rawBatchKey, batchSibling, genScript []byte) (*commitment.TapCommitment,
+	error) {
 
 	dbSprout, err := q.FetchAssetsForBatch(ctx, rawBatchKey)
 	if err != nil {
 		return nil, fmt.Errorf("unable to fetch batch assets: %w", err)
 	}
 
+	if len(dbSprout) == 0 {
+		return nil, fmt.Errorf("no sprouts found for batch %x",
+			rawBatchKey)
+	}
+
 	// We collect all the sprouts into fully grown assets, from which we'll
 	// then create asset and tap level commitments.
-	assetSprouts := make([]*asset.Asset, len(dbSprout))
+	sprouts := make([]*asset.Asset, len(dbSprout))
 	for i, sprout := range dbSprout {
 		// First, we'll decode the script key which very asset must
 		// specify, and populate the key locator information
-		scriptKeyPub, err := btcec.ParsePubKey(sprout.ScriptKeyRaw)
+		scriptKey, err := parseScriptKey(
+			sprout.InternalKey, sprout.ScriptKey,
+		)
 		if err != nil {
-			return nil, err
-		}
-		scriptKey := keychain.KeyDescriptor{
-			PubKey: scriptKeyPub,
-			KeyLocator: keychain.KeyLocator{
-				Index:  uint32(sprout.ScriptKeyIndex),
-				Family: keychain.KeyFamily(sprout.ScriptKeyFam),
-			},
+			return nil, fmt.Errorf("unable to decode script key: "+
+				"%w", err)
 		}
 
 		// Not all assets have a key group, so we only need to
@@ -588,15 +890,17 @@ func fetchAssetSprouts(ctx context.Context, q PendingAssetStore,
 						Index: extractSqlInt32[uint32](
 							sprout.GroupKeyIndex,
 						),
-						Family: keychain.KeyFamily(
-							extractSqlInt32[keychain.KeyFamily](
-								sprout.GroupKeyFamily,
-							),
+						Family: extractSqlInt32[keychain.KeyFamily](
+							sprout.GroupKeyFamily,
 						),
 					},
 				},
 				GroupPubKey: *tweakedGroupKey,
 				Witness:     groupWitness,
+			}
+
+			if len(sprout.TapscriptRoot) != 0 {
+				groupKey.TapscriptRoot = sprout.TapscriptRoot
 			}
 		}
 
@@ -608,8 +912,7 @@ func fetchAssetSprouts(ctx context.Context, q PendingAssetStore,
 			bytes.NewReader(sprout.GenesisPrevOut), 0, 0,
 			&genesisPrevOut,
 		); err != nil {
-			return nil, fmt.Errorf("unable to read "+
-				"outpoint: %w", err)
+			return nil, fmt.Errorf("%w: %w", ErrReadOutpoint, err)
 		}
 		assetGenesis := asset.Genesis{
 			FirstPrevOut: genesisPrevOut,
@@ -618,8 +921,11 @@ func fetchAssetSprouts(ctx context.Context, q PendingAssetStore,
 			Type:         asset.Type(sprout.AssetType),
 		}
 
-		if len(sprout.MetaHash) != 0 {
-			copy(assetGenesis.MetaHash[:], sprout.MetaHash)
+		if len(sprout.AssetsMetum.MetaDataHash) != 0 {
+			copy(
+				assetGenesis.MetaHash[:],
+				sprout.AssetsMetum.MetaDataHash,
+			)
 		}
 
 		// With the base information extracted, we'll use that to
@@ -638,26 +944,37 @@ func fetchAssetSprouts(ctx context.Context, q PendingAssetStore,
 
 		assetSprout, err := asset.New(
 			assetGenesis, amount, lockTime, relativeLocktime,
-			asset.NewScriptKeyBip86(scriptKey), groupKey,
+			scriptKey, groupKey,
 			asset.WithAssetVersion(asset.Version(sprout.Version)),
 		)
 		if err != nil {
 			return nil, fmt.Errorf("unable to create new sprout: "+
-				"%v", err)
+				"%w", err)
 		}
 
 		// TODO(roasbeef): need to update the above to set the
 		// witnesses of a valid asset
-
-		assetSprouts[i] = assetSprout
+		sprouts[i] = assetSprout
 	}
 
-	tapCommitment, err := commitment.FromAssets(assetSprouts...)
+	// Verify that we can reconstruct the genesis output script used in the
+	// anchor TX.
+	batchKey, err := btcec.ParsePubKey(rawBatchKey)
 	if err != nil {
 		return nil, err
 	}
 
-	return tapCommitment, nil
+	var tapSibling *chainhash.Hash
+	if len(batchSibling) != 0 {
+		tapSibling, err = chainhash.NewHash(batchSibling)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return tapgarden.VerifyOutputScript(
+		batchKey, tapSibling, genScript, sprouts,
+	)
 }
 
 // fetchAssetMetas attempts to fetch the asset meta reveal for each of the
@@ -670,25 +987,74 @@ func fetchAssetMetas(ctx context.Context, db PendingAssetStore,
 	for _, assetT := range assets {
 		assetID := assetT.ID()
 
-		assetMeta, err := db.FetchAssetMetaForAsset(ctx, assetID[:])
-		switch {
-		// If the asset doesn't have a meta data reveal, then we can
-		// skip it.
-		case errors.Is(err, sql.ErrNoRows):
-			continue
-
-		case err != nil:
+		assetMeta, err := fetchMetaByAssetID(ctx, db, assetID)
+		if err != nil {
 			return nil, err
 		}
 
-		scriptKey := asset.ToSerialized(assetT.ScriptKey.PubKey)
-		assetMetas[scriptKey] = &proof.MetaReveal{
-			Data: assetMeta.MetaDataBlob,
-			Type: proof.MetaType(assetMeta.MetaDataType.Int16),
+		// If the asset doesn't have a meta data reveal, then we can
+		// skip it.
+		if assetMeta == nil {
+			continue
 		}
+
+		scriptKey := asset.ToSerialized(assetT.ScriptKey.PubKey)
+		assetMetas[scriptKey] = assetMeta
 	}
 
 	return assetMetas, nil
+}
+
+// fetchMetaByAssetID fetches a single asset meta reveal.
+func fetchMetaByAssetID(ctx context.Context, db PendingAssetStore,
+	ID asset.ID) (*proof.MetaReveal, error) {
+
+	assetMeta, err := db.FetchAssetMetaForAsset(ctx, ID[:])
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return nil, nil
+
+	case err != nil:
+		return nil, err
+	}
+
+	// Parse the meta reveal from the database. We expect it to exist at
+	// this point, as we didn't get an sql.ErrNoRows error above.
+	metaOpt, err := parseAssetMetaReveal(assetMeta.AssetsMetum)
+	if err != nil {
+		return nil, fmt.Errorf("unable to parse asset meta: %w", err)
+	}
+
+	meta, err := metaOpt.UnwrapOrErr(ErrNoAssetMeta)
+	if err != nil {
+		return nil, err
+	}
+
+	return &meta, nil
+}
+
+// FetchAssetMeta fetches the meta reveal for an asset genesis.
+func (a *AssetMintingStore) FetchAssetMeta(ctx context.Context,
+	ID asset.ID) (*proof.MetaReveal, error) {
+
+	var assetMeta *proof.MetaReveal
+
+	readOpts := NewAssetStoreReadTx()
+	dbErr := a.db.ExecTx(ctx, &readOpts, func(q PendingAssetStore) error {
+		var err error
+		assetMeta, err = fetchMetaByAssetID(ctx, q, ID)
+		if err != nil {
+			return err
+		}
+
+		return nil
+	})
+
+	if dbErr != nil {
+		return nil, dbErr
+	}
+
+	return assetMeta, nil
 }
 
 // FetchNonFinalBatches fetches all the batches that aren't fully finalized on
@@ -705,20 +1071,18 @@ func (a *AssetMintingStore) FetchNonFinalBatches(
 			ctx, int16(tapgarden.BatchStateFinalized),
 		)
 		if err != nil {
-			return fmt.Errorf("unable to fetch minting "+
-				"batches: %w", err)
+			return fmt.Errorf("%w: %w", ErrFetchMintingBatches, err)
 		}
 
 		parseBatch := func(batch MintingBatchI) (*tapgarden.MintingBatch,
 			error) {
 
-			convBatch := convertMintingBatchI(batch)
-			return marshalMintingBatch(ctx, q, convBatch)
+			return marshalMintingBatch(ctx, q, MintingBatchF(batch))
 		}
 
 		batches, err = fn.MapErr(dbBatches, parseBatch)
 		if err != nil {
-			return fmt.Errorf("batch parsing failed: %w", err)
+			return fmt.Errorf("%w: %w", ErrBatchParsing, err)
 		}
 
 		return nil
@@ -740,20 +1104,18 @@ func (a *AssetMintingStore) FetchAllBatches(
 	dbErr := a.db.ExecTx(ctx, &readOpts, func(q PendingAssetStore) error {
 		dbBatches, err := q.AllMintingBatches(ctx)
 		if err != nil {
-			return fmt.Errorf("unable to fetch minting "+
-				"batches: %w", err)
+			return fmt.Errorf("%w: %w", ErrFetchMintingBatches, err)
 		}
 
 		parseBatch := func(batch MintingBatchA) (*tapgarden.MintingBatch,
 			error) {
 
-			convBatch := convertMintingBatchA(batch)
-			return marshalMintingBatch(ctx, q, convBatch)
+			return marshalMintingBatch(ctx, q, MintingBatchF(batch))
 		}
 
 		batches, err = fn.MapErr(dbBatches, parseBatch)
 		if err != nil {
-			return fmt.Errorf("batch parsing failed: %w", err)
+			return fmt.Errorf("%w: %w", ErrBatchParsing, err)
 		}
 
 		return nil
@@ -785,7 +1147,7 @@ func (a *AssetMintingStore) FetchMintingBatch(ctx context.Context,
 
 		batch, err = marshalMintingBatch(ctx, q, dbBatch)
 		if err != nil {
-			return fmt.Errorf("batch parsing failed: %w", err)
+			return fmt.Errorf("%w: %w", ErrBatchParsing, err)
 		}
 
 		return nil
@@ -798,18 +1160,6 @@ func (a *AssetMintingStore) FetchMintingBatch(ctx context.Context,
 	}
 
 	return batch, nil
-}
-
-// convertMintingBatchI converts a batch fetched with FetchNonFinalBatches to
-// another type so it can be parsed.
-func convertMintingBatchI(batch MintingBatchI) MintingBatchF {
-	return MintingBatchF(batch)
-}
-
-// convertMintingBatchA converts a batch fetched with AllMintingBatches to
-// another type so it can be parsed.
-func convertMintingBatchA(batch MintingBatchA) MintingBatchF {
-	return MintingBatchF(batch)
 }
 
 // marshalMintingBatch marshals a minting batch into its native type,
@@ -845,6 +1195,15 @@ func marshalMintingBatch(ctx context.Context, q PendingAssetStore,
 
 	batch.UpdateState(batchState)
 
+	if len(dbBatch.TapscriptSibling) != 0 {
+		batchSibling, err := chainhash.NewHash(dbBatch.TapscriptSibling)
+		if err != nil {
+			return nil, err
+		}
+
+		batch.UpdateTapSibling(batchSibling)
+	}
+
 	if dbBatch.MintingTxPsbt != nil {
 		genesisPkt, err := psbt.NewFromRawBytes(
 			bytes.NewReader(dbBatch.MintingTxPsbt), false,
@@ -852,32 +1211,108 @@ func marshalMintingBatch(ctx context.Context, q PendingAssetStore,
 		if err != nil {
 			return nil, err
 		}
-		batch.GenesisPacket = &tapgarden.FundedPsbt{
-			Pkt: genesisPkt,
-			ChangeOutputIndex: extractSqlInt32[int32](
-				dbBatch.ChangeOutputIndex,
-			),
+
+		if !dbBatch.AssetsOutputIndex.Valid {
+			return nil, fmt.Errorf("missing asset anchor output " +
+				"index")
+		}
+		assetAnchorOutIdx := dbBatch.AssetsOutputIndex.Int32
+
+		// If the batch has universe commitments, we will retrieve
+		// the pre-commitment output index from the database.
+		var preCommitOut fn.Option[tapgarden.PreCommitmentOutput]
+		if dbBatch.UniverseCommitments {
+			res, err := q.FetchMintAnchorUniCommitment(
+				ctx, int32(dbBatch.BatchID),
+			)
+			if err != nil {
+				return nil, fmt.Errorf("unable to fetch mint "+
+					"anchor uni commitment: %w", err)
+			}
+
+			// Parse the internal key from the database.
+			internalKey, err := btcec.ParsePubKey(
+				res.TaprootInternalKey,
+			)
+			if err != nil {
+				return nil, fmt.Errorf("error parsing "+
+					"taproot internal key: %w", err)
+			}
+
+			// Parse the group public key from the database.
+			groupPubKey, err := btcec.ParsePubKey(res.GroupKey)
+			if err != nil {
+				return nil, fmt.Errorf("error parsing "+
+					"group public key: %w", err)
+			}
+
+			preCommitOut = fn.Some(
+				tapgarden.PreCommitmentOutput{
+					OutIdx:      uint32(res.TxOutputIndex),
+					InternalKey: *internalKey,
+					GroupPubKey: *groupPubKey,
+				},
+			)
+		}
+
+		batch.GenesisPacket = &tapgarden.FundedMintAnchorPsbt{
+			FundedPsbt: tapsend.FundedPsbt{
+				Pkt: genesisPkt,
+				ChangeOutputIndex: extractSqlInt32[int32](
+					dbBatch.ChangeOutputIndex,
+				),
+			},
+			AssetAnchorOutIdx:   uint32(assetAnchorOutIdx),
+			PreCommitmentOutput: preCommitOut,
 		}
 	}
 
-	// Depending on what state this batch is in, we'll
-	// either fetch the set of seedlings (asset
-	// descriptions w/ no real assets), or the set of
-	// sprouts (full defined assets, but not yet mined).
+	// Depending on what state this batch is in, we'll either return the set
+	// of seedlings (asset descriptions w/ no real assets), or the set of
+	// sprouts (full defined assets, but not yet mined). In all cases, we
+	// start by fetching the batch seedlings.
+	batchSeedlings, err := fetchAssetSeedlings(
+		ctx, q, dbBatch.RawKey,
+	)
+	if err != nil {
+		return nil, err
+	}
+
 	switch batchState {
+	// A batch in these states will only have seedlings.
 	case tapgarden.BatchStatePending,
 		tapgarden.BatchStateFrozen,
 		tapgarden.BatchStateSeedlingCancelled:
 
-		// In this case we can just fetch the set of
-		// descriptions of future assets to be.
-		batch.Seedlings, err = fetchAssetSeedlings(
-			ctx, q, dbBatch.RawKey,
-		)
+		batch.Seedlings = batchSeedlings
+
+	// For finalized batches, we need to fetch the assets from the proof
+	// archiver and not the DB. Set the batch seedlings here so they can be
+	// used later to fetch those proofs.
+	case tapgarden.BatchStateFinalized:
+		// A finalized batch must have a populated genesis packet.
+		if batch.GenesisPacket == nil {
+			return nil, fmt.Errorf("sprouted batch missing " +
+				"genesis packet")
+		}
+
+		batch.Seedlings = batchSeedlings
 
 	default:
+		if batch.GenesisPacket == nil {
+			return nil, fmt.Errorf("sprouted batch missing " +
+				"genesis packet")
+		}
+
+		anchorOutputIndex := uint32(0)
+		if batch.GenesisPacket.ChangeOutputIndex == 0 {
+			anchorOutputIndex = 1
+		}
+		genesisTx := batch.GenesisPacket.Pkt.UnsignedTx
+		genesisScript := genesisTx.TxOut[anchorOutputIndex].PkScript
+		tapscriptSibling := batch.TapSibling()
 		batch.RootAssetCommitment, err = fetchAssetSprouts(
-			ctx, q, dbBatch.RawKey,
+			ctx, q, dbBatch.RawKey, tapscriptSibling, genesisScript,
 		)
 		if err != nil {
 			return nil, err
@@ -891,9 +1326,9 @@ func marshalMintingBatch(ctx context.Context, q PendingAssetStore,
 		batch.AssetMetas, err = fetchAssetMetas(
 			ctx, q, assetsInBatch,
 		)
-	}
-	if err != nil {
-		return nil, err
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	return batch, nil
@@ -912,6 +1347,22 @@ func (a *AssetMintingStore) UpdateBatchState(ctx context.Context,
 	})
 }
 
+// CommitBatchTapSibling updates the tapscript sibling of a batch based on the
+// batch key.
+func (a *AssetMintingStore) CommitBatchTapSibling(ctx context.Context,
+	batchKey *btcec.PublicKey, batchSibling *chainhash.Hash) error {
+
+	siblingUpdate := BatchTapSiblingUpdate{
+		RawKey:           batchKey.SerializeCompressed(),
+		TapscriptSibling: batchSibling[:],
+	}
+
+	var writeTxOpts AssetStoreTxOptions
+	return a.db.ExecTx(ctx, &writeTxOpts, func(q PendingAssetStore) error {
+		return q.BindMintingBatchWithTapSibling(ctx, siblingUpdate)
+	})
+}
+
 // encodeOutpoint encodes the outpoint point in Bitcoin wire format, returning
 // the final result.
 func encodeOutpoint(outPoint wire.OutPoint) ([]byte, error) {
@@ -924,11 +1375,134 @@ func encodeOutpoint(outPoint wire.OutPoint) ([]byte, error) {
 	return b.Bytes(), nil
 }
 
+// CommitBatchTx updates the genesis transaction of a batch based on the batch
+// key.
+func (a *AssetMintingStore) CommitBatchTx(ctx context.Context,
+	batchKey *btcec.PublicKey,
+	genesisPacket tapgarden.FundedMintAnchorPsbt) error {
+
+	genesisOutpoint := genesisPacket.Pkt.UnsignedTx.TxIn[0].PreviousOutPoint
+
+	var writeTxOpts AssetStoreTxOptions
+	return a.db.ExecTx(ctx, &writeTxOpts, func(q PendingAssetStore) error {
+		// Insert the batch transaction.
+		err := insertMintAnchorTx(
+			ctx, q, genesisPacket, *batchKey, genesisOutpoint,
+		)
+		if err != nil {
+			return fmt.Errorf("unable to insert mint anchor "+
+				"tx: %w", err)
+		}
+
+		return nil
+	})
+}
+
+// AddSeedlingGroups stores the asset groups for seedlings associated with a
+// batch.
+func (a *AssetMintingStore) AddSeedlingGroups(ctx context.Context,
+	genesisOutpoint wire.OutPoint, assetGroups []*asset.AssetGroup) error {
+
+	var writeTxOpts AssetStoreTxOptions
+	return a.db.ExecTx(ctx, &writeTxOpts, func(q PendingAssetStore) error {
+		// fetch the outpoint ID inserted during funding
+		genesisPointID, err := upsertGenesisPoint(
+			ctx, q, genesisOutpoint,
+		)
+		if err != nil {
+			return fmt.Errorf("%w: %w", ErrUpsertGenesisPoint, err)
+		}
+
+		// insert genesis and group key
+		for idx := range assetGroups {
+			genAssetID, err := upsertGenesis(
+				ctx, q, genesisPointID,
+				*assetGroups[idx].Genesis,
+			)
+			if err != nil {
+				return fmt.Errorf("unable to upsert grouped "+
+					"seedling genesis: %w", err)
+			}
+
+			_, err = upsertGroupKey(
+				ctx, assetGroups[idx].GroupKey, q,
+				genesisPointID, genAssetID,
+			)
+			if err != nil {
+				return fmt.Errorf("unable to upsert group for "+
+					"grouped seedling: %w", err)
+			}
+		}
+
+		return nil
+	})
+}
+
+// FetchSeedlingGroups is used to fetch the asset groups for seedlings
+// associated with a funded batch.
+func (a *AssetMintingStore) FetchSeedlingGroups(ctx context.Context,
+	genPoint wire.OutPoint, anchorOutputIndex uint32,
+	seedlings []*tapgarden.Seedling) ([]*asset.AssetGroup, error) {
+
+	var (
+		seedlingGroups []*asset.AssetGroup
+		err            error
+	)
+
+	seedlingGens := fn.Map(seedlings,
+		func(s *tapgarden.Seedling) *asset.Genesis {
+			return fn.Ptr(s.Genesis(genPoint, anchorOutputIndex))
+		},
+	)
+
+	// Read geneses and asset groups.
+	readOpts := NewAssetStoreReadTx()
+	dbErr := a.db.ExecTx(ctx, &readOpts, func(q PendingAssetStore) error {
+		seedlingGroups, err = fetchSeedlingGroups(ctx, q, seedlingGens)
+		return err
+	})
+	if dbErr != nil {
+		return nil, dbErr
+	}
+
+	return seedlingGroups, nil
+}
+
+// fetchSeedlingGroups fetches the asset groups for multiple geneses.
+func fetchSeedlingGroups(ctx context.Context, q PendingAssetStore,
+	gens []*asset.Genesis) ([]*asset.AssetGroup, error) {
+
+	seedlingGroups := make([]*asset.AssetGroup, 0, len(gens))
+	for _, gen := range gens {
+		genID, err := fetchGenesisID(ctx, q, *gen)
+		if err != nil {
+			// Re-map the error about a missing asset
+			// genesis so it can be better handled in the
+			// planter.
+			if errors.Is(err, ErrFetchGenesisID) {
+				return nil, tapgarden.ErrNoGenesis
+			}
+
+			return nil, err
+		}
+
+		groupKey, err := fetchGroupByGenesis(ctx, q, genID)
+		if err != nil {
+			return nil, err
+		}
+
+		seedlingGroups = append(seedlingGroups, groupKey)
+	}
+
+	return seedlingGroups, nil
+}
+
 // AddSproutsToBatch updates a batch with the passed batch transaction and also
 // binds the genesis transaction (which will create the set of assets in the
 // batch) to the batch itself.
 func (a *AssetMintingStore) AddSproutsToBatch(ctx context.Context,
-	batchKey *btcec.PublicKey, genesisPacket *tapgarden.FundedPsbt,
+	batchKey *btcec.PublicKey,
+	genesisPacket *tapgarden.FundedMintAnchorPsbt,
 	assetRoot *commitment.TapCommitment) error {
 
 	// Before we open the DB transaction below, we'll fetch the set of
@@ -957,7 +1531,8 @@ func (a *AssetMintingStore) AddSproutsToBatch(ctx context.Context,
 
 	var writeTxOpts AssetStoreTxOptions
 	return a.db.ExecTx(ctx, &writeTxOpts, func(q PendingAssetStore) error {
-		genesisPointID, _, err := upsertAssetsWithGenesis(
+		// Upsert the assets with genesis.
+		_, _, err := upsertAssetsWithGenesis(
 			ctx, q, genesisOutpoint, sortedAssets, nil,
 		)
 		if err != nil {
@@ -965,23 +1540,13 @@ func (a *AssetMintingStore) AddSproutsToBatch(ctx context.Context,
 				"genesis: %w", err)
 		}
 
-		// With all the assets inserted, we'll now update the
-		// corresponding batch that references all these assets with
-		// the genesis packet, and genesis point information.
-		var psbtBuf bytes.Buffer
-		if err := genesisPacket.Pkt.Serialize(&psbtBuf); err != nil {
-			return fmt.Errorf("unable to encode psbt: %v", err)
-		}
-		err = q.BindMintingBatchWithTx(ctx, BatchChainUpdate{
-			RawKey:        rawBatchKey,
-			MintingTxPsbt: psbtBuf.Bytes(),
-			ChangeOutputIndex: sqlInt32(
-				genesisPacket.ChangeOutputIndex,
-			),
-			GenesisID: sqlInt64(genesisPointID),
-		})
+		// Insert the batch transaction.
+		err = insertMintAnchorTx(
+			ctx, q, *genesisPacket, *batchKey, genesisOutpoint,
+		)
 		if err != nil {
-			return fmt.Errorf("unable to add batch tx: %w", err)
+			return fmt.Errorf("unable to insert mint anchor "+
+				"tx: %w", err)
 		}
 
 		// Finally, update the batch state to BatchStateCommitted.
@@ -1001,8 +1566,9 @@ func (a *AssetMintingStore) AddSproutsToBatch(ctx context.Context,
 // TODO(roasbeef): or could just re-read assets from disk and set the script
 // root manually?
 func (a *AssetMintingStore) CommitSignedGenesisTx(ctx context.Context,
-	batchKey *btcec.PublicKey, genesisPkt *tapgarden.FundedPsbt,
-	anchorOutputIndex uint32, merkleRoot []byte) error {
+	batchKey *btcec.PublicKey, genesisPkt *tapsend.FundedPsbt,
+	anchorOutputIndex uint32, merkleRoot, tapTreeRoot []byte,
+	tapSibling []byte) error {
 
 	// The managed UTXO we'll insert only contains the raw tx of the
 	// genesis packet, so we'll extract that now.
@@ -1051,7 +1617,8 @@ func (a *AssetMintingStore) CommitSignedGenesisTx(ctx context.Context,
 			MintingTxPsbt: psbtBuf.Bytes(),
 		})
 		if err != nil {
-			return fmt.Errorf("unable to update genesis tx: %w", err)
+			return fmt.Errorf("unable to update genesis tx: %w",
+				err)
 		}
 
 		// Before we can insert a managed UTXO, we'll need to insert a
@@ -1069,19 +1636,20 @@ func (a *AssetMintingStore) CommitSignedGenesisTx(ctx context.Context,
 		// Now that the genesis tx has been updated within the main
 		// batch, we'll create a new managed UTXO for this batch as
 		// this is where all the assets will be anchored within.
+		rootVersion := uint8(commitment.TapCommitmentV2)
 		utxoID, err := q.UpsertManagedUTXO(ctx, RawManagedUTXO{
-			RawKey:   rawBatchKey,
-			Outpoint: anchorOutpoint,
-			AmtSats:  anchorOutput.Value,
-			// When minting, we never have a tapscript sibling, so
-			// the TaprootAssetRoot root is always equal to the
-			// merkle root.
-			TaprootAssetRoot: merkleRoot,
+			RawKey:           rawBatchKey,
+			Outpoint:         anchorOutpoint,
+			AmtSats:          anchorOutput.Value,
+			TaprootAssetRoot: tapTreeRoot,
+			TapscriptSibling: tapSibling,
 			MerkleRoot:       merkleRoot,
 			TxnID:            chainTXID,
+			RootVersion:      sqlInt16(rootVersion),
 		})
 		if err != nil {
-			return fmt.Errorf("unable to insert managed utxo: %w", err)
+			return fmt.Errorf("unable to insert managed utxo: %w",
+				err)
 		}
 
 		// With the managed UTXO inserted, we also need to update all
@@ -1092,16 +1660,18 @@ func (a *AssetMintingStore) CommitSignedGenesisTx(ctx context.Context,
 			AnchorUtxoID: sqlInt64(utxoID),
 		})
 		if err != nil {
-			return fmt.Errorf("unable to anchor pending assets: %v", err)
+			return fmt.Errorf("unable to anchor pending assets: %w",
+				err)
 		}
 
-		// Next, we'll anchor the genesis point to point to the chain
+		// Next, we'll anchor the genesis point-to-point to the chain
 		// transaction we inserted above.
 		if err := q.AnchorGenesisPoint(ctx, GenesisPointAnchor{
 			PrevOut:    genesisOutpoint,
 			AnchorTxID: sqlInt64(chainTXID),
 		}); err != nil {
-			return fmt.Errorf("unable to anchor genesis tx: %w", err)
+			return fmt.Errorf("unable to anchor genesis tx: %w",
+				err)
 		}
 
 		// Finally, update the batch state to BatchStateBroadcast.
@@ -1147,9 +1717,28 @@ func (a *AssetMintingStore) MarkBatchConfirmed(ctx context.Context,
 		// As a final act, we'll now insert the proof files for each of
 		// the assets that were fully confirmed with this block.
 		for scriptKey, proofBlob := range mintingProofs {
-			err := q.UpsertAssetProof(ctx, ProofUpdate{
-				TweakedScriptKey: scriptKey.CopyBytes(),
-				ProofFile:        proofBlob,
+			// We need to fetch the table primary key `asset_id`
+			// first, as we need it to update the proof.
+			dbAssetIds, err := q.FetchAssetID(ctx, FetchAssetID{
+				TweakedScriptKey: scriptKey[:],
+			})
+			if err != nil {
+				return err
+			}
+
+			// We should not have more than one `asset_id`.
+			if len(dbAssetIds) > 1 {
+				return fmt.Errorf("expected 1 asset id, found "+
+					"%d with asset ids %v",
+					len(dbAssetIds), dbAssetIds)
+			}
+
+			// Upload proof by the dbAssetId, which is the _primary
+			// key_ of the asset in table assets, not the BIPS
+			// concept of `asset_id`.
+			err = q.UpsertAssetProofByID(ctx, ProofUpdateByID{
+				AssetID:   dbAssetIds[0],
+				ProofFile: proofBlob,
 			})
 			if err != nil {
 				return fmt.Errorf("unable to insert proof "+
@@ -1206,6 +1795,149 @@ func (a *AssetMintingStore) FetchGroupByGroupKey(ctx context.Context,
 	return dbGroup, nil
 }
 
+// FetchScriptKeyByTweakedKey fetches the populated script key given the tweaked
+// script key.
+func (a *AssetMintingStore) FetchScriptKeyByTweakedKey(ctx context.Context,
+	tweakedKey *btcec.PublicKey) (*asset.TweakedScriptKey, error) {
+
+	var (
+		scriptKey *asset.TweakedScriptKey
+		err       error
+	)
+
+	readOpts := NewAssetStoreReadTx()
+	dbErr := a.db.ExecTx(ctx, &readOpts, func(q PendingAssetStore) error {
+		scriptKey, err = fetchScriptKey(ctx, q, tweakedKey)
+		return err
+	})
+
+	switch {
+	case errors.Is(dbErr, sql.ErrNoRows):
+		return nil, fmt.Errorf("script key not found")
+
+	case dbErr != nil:
+		return nil, err
+	}
+
+	return scriptKey, nil
+}
+
+// StoreTapscriptTree persists a Tapscript tree given a validated set of
+// TapLeafs or a TapBranch. If the store succeeds, the root hash of the
+// Tapscript tree is returned.
+func (a *AssetMintingStore) StoreTapscriptTree(ctx context.Context,
+	treeNodes asset.TapscriptTreeNodes) (*chainhash.Hash, error) {
+
+	var (
+		rootHash       chainhash.Hash
+		isBranch       bool
+		treeNodesBytes [][]byte
+		err            error
+	)
+
+	asset.GetLeaves(treeNodes).WhenSome(func(tln asset.TapLeafNodes) {
+		rootHash = asset.LeafNodesRootHash(tln)
+		treeNodesBytes, err = asset.EncodeTapLeafNodes(tln)
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	// For a TapBranch, we must set isBranch to ensure that the branch data
+	// will be decoded correctly.
+	asset.GetBranch(treeNodes).WhenSome(func(tbn asset.TapBranchNodes) {
+		isBranch = true
+		rootHash = asset.BranchNodesRootHash(tbn)
+		treeNodesBytes = asset.EncodeTapBranchNodes(tbn)
+	})
+
+	// If no tapscript tree data was encoded, the given tapscript tree was
+	// malformed. Return before modifying the database.
+	if len(treeNodesBytes) == 0 {
+		return nil, fmt.Errorf("unable to encode tapscript tree")
+	}
+
+	var writeTxOpts AssetStoreTxOptions
+	err = a.db.ExecTx(ctx, &writeTxOpts, func(a PendingAssetStore) error {
+		return upsertTapscriptTree(
+			ctx, a, rootHash[:], isBranch, treeNodesBytes,
+		)
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return &rootHash, nil
+}
+
+// LoadTapscriptTree loads the Tapscript tree with the given root hash, and
+// decodes the tree into a TapscriptTreeNodes object.
+func (a *AssetMintingStore) LoadTapscriptTree(ctx context.Context,
+	rootHash chainhash.Hash) (*asset.TapscriptTreeNodes, error) {
+
+	var (
+		dbTreeNodes []TapscriptTreeNode
+		err         error
+	)
+
+	readOpts := NewAssetStoreReadTx()
+	dbErr := a.db.ExecTx(ctx, &readOpts, func(a PendingAssetStore) error {
+		dbTreeNodes, err = a.FetchTapscriptTree(ctx, rootHash[:])
+		return err
+	})
+	if dbErr != nil {
+		return nil, dbErr
+	}
+
+	// The query can return zero nodes without returning an error, so handle
+	// that case explicitly here.
+	if len(dbTreeNodes) == 0 {
+		return nil, asset.ErrTreeNotFound
+	}
+
+	nodeBytes := fn.Map(dbTreeNodes, func(dbNode TapscriptTreeNode) []byte {
+		return dbNode.RawNode
+	})
+
+	// Each node signals if the tree was stored as a set of leaves or a
+	// branch, so we can read this flag from any node.
+	isBranch := dbTreeNodes[0].BranchOnly
+	if isBranch {
+		// For a tree stored as a TapBranch, there can only be two nodes
+		// returned.
+		if len(dbTreeNodes) != 2 {
+			return nil, asset.ErrInvalidTapBranch
+		}
+
+		branchNodes, err := asset.DecodeTapBranchNodes(nodeBytes)
+		if err != nil {
+			return nil, err
+		}
+
+		return fn.Ptr(asset.FromBranch(*branchNodes)), nil
+	}
+
+	// If the tree was not stored as a branch, it must be a set of leaves.
+	leafNodes, err := asset.DecodeTapLeafNodes(nodeBytes)
+	if err != nil {
+		return nil, err
+	}
+
+	return fn.Ptr(asset.FromLeaves(*leafNodes)), nil
+}
+
+// DeleteTapscriptTree deletes the Tapscript tree with the given root hash,
+// including all nodes and edges.
+func (a *AssetMintingStore) DeleteTapscriptTree(ctx context.Context,
+	rootHash chainhash.Hash) error {
+
+	var writeTxOpts AssetStoreTxOptions
+	return a.db.ExecTx(ctx, &writeTxOpts, func(a PendingAssetStore) error {
+		return deleteTapscriptTree(ctx, a, rootHash[:])
+	})
+}
+
 // A compile-time assertion to ensure that AssetMintingStore meets the
 // tapgarden.MintingStore interface.
 var _ tapgarden.MintingStore = (*AssetMintingStore)(nil)
+var _ asset.TapscriptTreeManager = (*AssetMintingStore)(nil)

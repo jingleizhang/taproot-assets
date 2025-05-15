@@ -1,0 +1,892 @@
+{
+  "swagger": "2.0",
+  "info": {
+    "title": "rfqrpc/rfq.proto",
+    "version": "version not set"
+  },
+  "tags": [
+    {
+      "name": "Rfq"
+    }
+  ],
+  "consumes": [
+    "application/json"
+  ],
+  "produces": [
+    "application/json"
+  ],
+  "paths": {
+    "/v1/taproot-assets/rfq/buyoffer/asset-id/{asset_specifier.asset_id_str}": {
+      "post": {
+        "summary": "tapcli: `rfq buyoffer`\nAddAssetBuyOffer is used to add a buy offer for a specific asset. If a\nbuy offer already exists for the asset, it will be updated.",
+        "description": "A buy offer is used by the node to selectively accept or reject incoming\nasset sell quote requests before price is considered.",
+        "operationId": "Rfq_AddAssetBuyOffer",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/rfqrpcAddAssetBuyOfferResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "asset_specifier.asset_id_str",
+            "description": "The 32-byte asset ID encoded as a hex string (use this for REST).",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/RfqAddAssetBuyOfferBody"
+            }
+          }
+        ],
+        "tags": [
+          "Rfq"
+        ]
+      }
+    },
+    "/v1/taproot-assets/rfq/buyoffer/group-key/{asset_specifier.group_key_str}": {
+      "post": {
+        "summary": "tapcli: `rfq buyoffer`\nAddAssetBuyOffer is used to add a buy offer for a specific asset. If a\nbuy offer already exists for the asset, it will be updated.",
+        "description": "A buy offer is used by the node to selectively accept or reject incoming\nasset sell quote requests before price is considered.",
+        "operationId": "Rfq_AddAssetBuyOffer2",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/rfqrpcAddAssetBuyOfferResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "asset_specifier.group_key_str",
+            "description": "The 32-byte asset group key encoded as hex string (use this for\nREST).",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/RfqAddAssetBuyOfferBody"
+            }
+          }
+        ],
+        "tags": [
+          "Rfq"
+        ]
+      }
+    },
+    "/v1/taproot-assets/rfq/buyorder/asset-id/{asset_specifier.asset_id_str}": {
+      "post": {
+        "summary": "tapcli: `rfq buyorder`\nAddAssetBuyOrder is used to add a buy order for a specific asset. If a buy\norder already exists for the asset, it will be updated.",
+        "description": "A buy order instructs the RFQ (Request For Quote) system to request a quote\nfrom a peer for the acquisition of an asset.\n\nThe normal use of a buy order is as follows:\n1. Alice, operating a wallet node, wants to receive a Tap asset as payment\nby issuing a Lightning invoice.\n2. Alice has an asset channel established with Bob's edge node.\n3. Before issuing the invoice, Alice needs to agree on an exchange rate with\nBob, who will facilitate the asset transfer.\n4. To obtain the best exchange rate, Alice creates a buy order specifying\nthe desired asset.\n5. Alice's RFQ subsystem processes the buy order and sends buy requests to\nrelevant peers to find the best rate. In this example, Bob is the only\navailable peer.\n6. Once Bob provides a satisfactory quote, Alice accepts it.\n7. Alice issues the Lightning invoice, which Charlie will pay.\n8. Instead of paying Alice directly, Charlie pays Bob.\n9. Bob then forwards the agreed amount of the Tap asset to Alice over their\nasset channel.",
+        "operationId": "Rfq_AddAssetBuyOrder",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/rfqrpcAddAssetBuyOrderResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "asset_specifier.asset_id_str",
+            "description": "The 32-byte asset ID encoded as a hex string (use this for REST).",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/RfqAddAssetBuyOrderBody"
+            }
+          }
+        ],
+        "tags": [
+          "Rfq"
+        ]
+      }
+    },
+    "/v1/taproot-assets/rfq/buyorder/group-key/{asset_specifier.group_key_str}": {
+      "post": {
+        "summary": "tapcli: `rfq buyorder`\nAddAssetBuyOrder is used to add a buy order for a specific asset. If a buy\norder already exists for the asset, it will be updated.",
+        "description": "A buy order instructs the RFQ (Request For Quote) system to request a quote\nfrom a peer for the acquisition of an asset.\n\nThe normal use of a buy order is as follows:\n1. Alice, operating a wallet node, wants to receive a Tap asset as payment\nby issuing a Lightning invoice.\n2. Alice has an asset channel established with Bob's edge node.\n3. Before issuing the invoice, Alice needs to agree on an exchange rate with\nBob, who will facilitate the asset transfer.\n4. To obtain the best exchange rate, Alice creates a buy order specifying\nthe desired asset.\n5. Alice's RFQ subsystem processes the buy order and sends buy requests to\nrelevant peers to find the best rate. In this example, Bob is the only\navailable peer.\n6. Once Bob provides a satisfactory quote, Alice accepts it.\n7. Alice issues the Lightning invoice, which Charlie will pay.\n8. Instead of paying Alice directly, Charlie pays Bob.\n9. Bob then forwards the agreed amount of the Tap asset to Alice over their\nasset channel.",
+        "operationId": "Rfq_AddAssetBuyOrder2",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/rfqrpcAddAssetBuyOrderResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "asset_specifier.group_key_str",
+            "description": "The 32-byte asset group key encoded as hex string (use this for\nREST).",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/RfqAddAssetBuyOrderBody"
+            }
+          }
+        ],
+        "tags": [
+          "Rfq"
+        ]
+      }
+    },
+    "/v1/taproot-assets/rfq/ntfs": {
+      "post": {
+        "summary": "SubscribeRfqEventNtfns is used to subscribe to RFQ events.",
+        "operationId": "Rfq_SubscribeRfqEventNtfns",
+        "responses": {
+          "200": {
+            "description": "A successful response.(streaming responses)",
+            "schema": {
+              "type": "object",
+              "properties": {
+                "result": {
+                  "$ref": "#/definitions/rfqrpcRfqEvent"
+                },
+                "error": {
+                  "$ref": "#/definitions/rpcStatus"
+                }
+              },
+              "title": "Stream result of rfqrpcRfqEvent"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/rfqrpcSubscribeRfqEventNtfnsRequest"
+            }
+          }
+        ],
+        "tags": [
+          "Rfq"
+        ]
+      }
+    },
+    "/v1/taproot-assets/rfq/quotes/peeraccepted": {
+      "get": {
+        "summary": "tapcli: `rfq acceptedquotes`\nQueryPeerAcceptedQuotes is used to query for quotes that were requested by\nour node and have been accepted our peers.",
+        "operationId": "Rfq_QueryPeerAcceptedQuotes",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/rfqrpcQueryPeerAcceptedQuotesResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "tags": [
+          "Rfq"
+        ]
+      }
+    },
+    "/v1/taproot-assets/rfq/selloffer/asset-id/{asset_specifier.asset_id_str}": {
+      "post": {
+        "summary": "tapcli: `rfq selloffer`\nAddAssetSellOffer is used to add a sell offer for a specific asset. If a\nsell offer already exists for the asset, it will be updated.",
+        "operationId": "Rfq_AddAssetSellOffer",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/rfqrpcAddAssetSellOfferResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "asset_specifier.asset_id_str",
+            "description": "The 32-byte asset ID encoded as a hex string (use this for REST).",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/RfqAddAssetSellOfferBody"
+            }
+          }
+        ],
+        "tags": [
+          "Rfq"
+        ]
+      }
+    },
+    "/v1/taproot-assets/rfq/selloffer/group-key/{asset_specifier.group_key_str}": {
+      "post": {
+        "summary": "tapcli: `rfq selloffer`\nAddAssetSellOffer is used to add a sell offer for a specific asset. If a\nsell offer already exists for the asset, it will be updated.",
+        "operationId": "Rfq_AddAssetSellOffer2",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/rfqrpcAddAssetSellOfferResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "asset_specifier.group_key_str",
+            "description": "The 32-byte asset group key encoded as hex string (use this for\nREST).",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/RfqAddAssetSellOfferBody"
+            }
+          }
+        ],
+        "tags": [
+          "Rfq"
+        ]
+      }
+    },
+    "/v1/taproot-assets/rfq/sellorder/asset-id/{asset_specifier.asset_id_str}": {
+      "post": {
+        "summary": "tapcli: `rfq sellorder`\nAddAssetSellOrder is used to add a sell order for a specific asset. If a\nsell order already exists for the asset, it will be updated.",
+        "operationId": "Rfq_AddAssetSellOrder",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/rfqrpcAddAssetSellOrderResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "asset_specifier.asset_id_str",
+            "description": "The 32-byte asset ID encoded as a hex string (use this for REST).",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/RfqAddAssetSellOrderBody"
+            }
+          }
+        ],
+        "tags": [
+          "Rfq"
+        ]
+      }
+    },
+    "/v1/taproot-assets/rfq/sellorder/group-key/{asset_specifier.group_key_str}": {
+      "post": {
+        "summary": "tapcli: `rfq sellorder`\nAddAssetSellOrder is used to add a sell order for a specific asset. If a\nsell order already exists for the asset, it will be updated.",
+        "operationId": "Rfq_AddAssetSellOrder2",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/rfqrpcAddAssetSellOrderResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "asset_specifier.group_key_str",
+            "description": "The 32-byte asset group key encoded as hex string (use this for\nREST).",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/RfqAddAssetSellOrderBody"
+            }
+          }
+        ],
+        "tags": [
+          "Rfq"
+        ]
+      }
+    }
+  },
+  "definitions": {
+    "RfqAddAssetBuyOfferBody": {
+      "type": "object",
+      "properties": {
+        "asset_specifier": {
+          "type": "object",
+          "properties": {
+            "asset_id": {
+              "type": "string",
+              "format": "byte",
+              "description": "The 32-byte asset ID specified as raw bytes (gRPC only)."
+            },
+            "asset_id_str": {
+              "type": "string",
+              "description": "The 32-byte asset ID encoded as a hex string (use this for REST)."
+            },
+            "group_key": {
+              "type": "string",
+              "format": "byte",
+              "description": "The 32-byte asset group key specified as raw bytes (gRPC only)."
+            }
+          },
+          "description": "asset_specifier is the subject asset.",
+          "title": "asset_specifier is the subject asset."
+        },
+        "max_units": {
+          "type": "string",
+          "format": "uint64",
+          "description": "max_units is the maximum amount of the asset to buy."
+        }
+      }
+    },
+    "RfqAddAssetBuyOrderBody": {
+      "type": "object",
+      "properties": {
+        "asset_specifier": {
+          "type": "object",
+          "properties": {
+            "asset_id": {
+              "type": "string",
+              "format": "byte",
+              "description": "The 32-byte asset ID specified as raw bytes (gRPC only)."
+            },
+            "asset_id_str": {
+              "type": "string",
+              "description": "The 32-byte asset ID encoded as a hex string (use this for REST)."
+            },
+            "group_key": {
+              "type": "string",
+              "format": "byte",
+              "description": "The 32-byte asset group key specified as raw bytes (gRPC only)."
+            }
+          },
+          "description": "asset_specifier is the subject asset.",
+          "title": "asset_specifier is the subject asset."
+        },
+        "asset_max_amt": {
+          "type": "string",
+          "format": "uint64",
+          "description": "The maximum amount of the asset that the provider must be willing to\noffer."
+        },
+        "expiry": {
+          "type": "string",
+          "format": "uint64",
+          "description": "The unix timestamp in seconds after which the order is no longer valid."
+        },
+        "peer_pub_key": {
+          "type": "string",
+          "format": "byte",
+          "description": "peer_pub_key is an optional field for specifying the public key of the\nintended recipient peer for the order."
+        },
+        "timeout_seconds": {
+          "type": "integer",
+          "format": "int64",
+          "description": "timeout_seconds is the number of seconds to wait for the peer to respond\nwith an accepted quote (or a rejection)."
+        },
+        "skip_asset_channel_check": {
+          "type": "boolean",
+          "description": "If set, the check if a channel with the given asset exists with the peer\nwill be skipped. An active channel with the peer is still required for\nthe RFQ negotiation to work. This flag shouldn't be set outside of test\nscenarios."
+        }
+      }
+    },
+    "RfqAddAssetSellOfferBody": {
+      "type": "object",
+      "properties": {
+        "asset_specifier": {
+          "type": "object",
+          "properties": {
+            "asset_id": {
+              "type": "string",
+              "format": "byte",
+              "description": "The 32-byte asset ID specified as raw bytes (gRPC only)."
+            },
+            "asset_id_str": {
+              "type": "string",
+              "description": "The 32-byte asset ID encoded as a hex string (use this for REST)."
+            },
+            "group_key": {
+              "type": "string",
+              "format": "byte",
+              "description": "The 32-byte asset group key specified as raw bytes (gRPC only)."
+            }
+          },
+          "description": "asset_specifier is the subject asset.",
+          "title": "asset_specifier is the subject asset."
+        },
+        "max_units": {
+          "type": "string",
+          "format": "uint64",
+          "description": "max_units is the maximum amount of the asset to sell."
+        }
+      }
+    },
+    "RfqAddAssetSellOrderBody": {
+      "type": "object",
+      "properties": {
+        "asset_specifier": {
+          "type": "object",
+          "properties": {
+            "asset_id": {
+              "type": "string",
+              "format": "byte",
+              "description": "The 32-byte asset ID specified as raw bytes (gRPC only)."
+            },
+            "asset_id_str": {
+              "type": "string",
+              "description": "The 32-byte asset ID encoded as a hex string (use this for REST)."
+            },
+            "group_key": {
+              "type": "string",
+              "format": "byte",
+              "description": "The 32-byte asset group key specified as raw bytes (gRPC only)."
+            }
+          },
+          "description": "asset_specifier is the subject asset.",
+          "title": "asset_specifier is the subject asset."
+        },
+        "payment_max_amt": {
+          "type": "string",
+          "format": "uint64",
+          "description": "The maximum msat amount that the responding peer must agree to pay\n(units: millisats)."
+        },
+        "expiry": {
+          "type": "string",
+          "format": "uint64",
+          "description": "The unix timestamp in seconds after which the order is no longer valid."
+        },
+        "peer_pub_key": {
+          "type": "string",
+          "format": "byte",
+          "description": "peer_pub_key is an optional field for specifying the public key of the\nintended recipient peer for the order."
+        },
+        "timeout_seconds": {
+          "type": "integer",
+          "format": "int64",
+          "description": "timeout_seconds is the number of seconds to wait for the peer to respond\nwith an accepted quote (or a rejection)."
+        },
+        "skip_asset_channel_check": {
+          "type": "boolean",
+          "description": "If set, the check if a channel with the given asset exists with the peer\nwill be skipped. An active channel with the peer is still required for\nthe RFQ negotiation to work. This flag shouldn't be set outside of test\nscenarios."
+        }
+      }
+    },
+    "protobufAny": {
+      "type": "object",
+      "properties": {
+        "@type": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": {}
+    },
+    "rfqrpcAcceptHtlcEvent": {
+      "type": "object",
+      "properties": {
+        "timestamp": {
+          "type": "string",
+          "format": "uint64",
+          "description": "Unix timestamp in microseconds."
+        },
+        "scid": {
+          "type": "string",
+          "format": "uint64",
+          "description": "scid is the short channel ID of the channel over which the payment for\nthe quote is made."
+        }
+      }
+    },
+    "rfqrpcAddAssetBuyOfferResponse": {
+      "type": "object"
+    },
+    "rfqrpcAddAssetBuyOrderResponse": {
+      "type": "object",
+      "properties": {
+        "accepted_quote": {
+          "$ref": "#/definitions/rfqrpcPeerAcceptedBuyQuote",
+          "description": "accepted_quote holds the quote received from the peer as a response\nto our quote request."
+        },
+        "invalid_quote": {
+          "$ref": "#/definitions/rfqrpcInvalidQuoteResponse",
+          "description": "invalid_quote is returned if the quote response received from the\npeer was invalid or insufficient."
+        },
+        "rejected_quote": {
+          "$ref": "#/definitions/rfqrpcRejectedQuoteResponse",
+          "description": "rejected_quote is returned if the quote request was rejected by the\npeer."
+        }
+      }
+    },
+    "rfqrpcAddAssetSellOfferResponse": {
+      "type": "object"
+    },
+    "rfqrpcAddAssetSellOrderResponse": {
+      "type": "object",
+      "properties": {
+        "accepted_quote": {
+          "$ref": "#/definitions/rfqrpcPeerAcceptedSellQuote",
+          "description": "accepted_quote holds the quote received from the peer as a response\nto our quote request."
+        },
+        "invalid_quote": {
+          "$ref": "#/definitions/rfqrpcInvalidQuoteResponse",
+          "description": "invalid_quote is returned if the quote response received from the\npeer was invalid or insufficient."
+        },
+        "rejected_quote": {
+          "$ref": "#/definitions/rfqrpcRejectedQuoteResponse",
+          "description": "rejected_quote is returned if the quote request was rejected by the\npeer."
+        }
+      }
+    },
+    "rfqrpcAssetSpecifier": {
+      "type": "object",
+      "properties": {
+        "asset_id": {
+          "type": "string",
+          "format": "byte",
+          "description": "The 32-byte asset ID specified as raw bytes (gRPC only)."
+        },
+        "asset_id_str": {
+          "type": "string",
+          "description": "The 32-byte asset ID encoded as a hex string (use this for REST)."
+        },
+        "group_key": {
+          "type": "string",
+          "format": "byte",
+          "description": "The 32-byte asset group key specified as raw bytes (gRPC only)."
+        },
+        "group_key_str": {
+          "type": "string",
+          "description": "The 32-byte asset group key encoded as hex string (use this for\nREST)."
+        }
+      }
+    },
+    "rfqrpcFixedPoint": {
+      "type": "object",
+      "properties": {
+        "coefficient": {
+          "type": "string",
+          "description": "The coefficient is the fractional value scaled-up as an integer. This\ninteger is represented as a string as it may be too large to fit in a\nuint64."
+        },
+        "scale": {
+          "type": "integer",
+          "format": "int64",
+          "description": "The scale is the component that determines how many decimal places\nthe coefficient should be divided by to obtain the fractional value."
+        }
+      },
+      "description": "FixedPoint is a scaled integer representation of a fractional number.\n\nThis type consists of two integer fields: a coefficient and a scale.\nUsing this format enables precise and consistent representation of fractional\nnumbers while avoiding floating-point data types, which are prone to\nprecision errors.\n\nThe relationship between the fractional representation and its fixed-point\nrepresentation is expressed as:\n```\nV = F_c / (10^F_s)\n```\nwhere:\n\n* `V` is the fractional value.\n\n* `F_c` is the coefficient component of the fixed-point representation. It is\n   the scaled-up fractional value represented as an integer.\n\n* `F_s` is the scale component. It is an integer specifying how\n  many decimal places `F_c` should be divided by to obtain the fractional\n  representation."
+    },
+    "rfqrpcInvalidQuoteResponse": {
+      "type": "object",
+      "properties": {
+        "status": {
+          "$ref": "#/definitions/rfqrpcQuoteRespStatus",
+          "description": "status is the status of the quote response."
+        },
+        "peer": {
+          "type": "string",
+          "description": "peer is the quote counterparty peer."
+        },
+        "id": {
+          "type": "string",
+          "format": "byte",
+          "description": "id is the unique identifier of the quote request."
+        }
+      },
+      "description": "InvalidQuoteResponse is a message that is returned when a quote response is\ninvalid or insufficient."
+    },
+    "rfqrpcPeerAcceptedBuyQuote": {
+      "type": "object",
+      "properties": {
+        "peer": {
+          "type": "string",
+          "description": "Quote counterparty peer."
+        },
+        "id": {
+          "type": "string",
+          "format": "byte",
+          "description": "The unique identifier of the quote request."
+        },
+        "scid": {
+          "type": "string",
+          "format": "uint64",
+          "description": "The short channel ID of the channel over which the payment for the quote\nshould be made."
+        },
+        "asset_max_amount": {
+          "type": "string",
+          "format": "uint64",
+          "description": "The maximum exchange amount denoted in the subject asset. This includes\nthe user-configured maximum routing fees, so the actual payment amount\nwill be less than this. This just defines the maximum volume that the\nedge node has accepted to divest with the given rate."
+        },
+        "ask_asset_rate": {
+          "$ref": "#/definitions/rfqrpcFixedPoint",
+          "description": "ask_asset_rate is the asset to BTC conversion rate represented as a\nfixed-point number."
+        },
+        "expiry": {
+          "type": "string",
+          "format": "uint64",
+          "description": "The unix timestamp in seconds after which the quote is no longer valid."
+        },
+        "min_transportable_units": {
+          "type": "string",
+          "format": "uint64",
+          "description": "The smallest amount of asset units that can be transported within a\nsingle HTLC over the Lightning Network with the given rate. This is the\nasset unit equivalent of 354 satoshis, which is the minimum amount for an\nHTLC to be above the dust limit."
+        }
+      }
+    },
+    "rfqrpcPeerAcceptedBuyQuoteEvent": {
+      "type": "object",
+      "properties": {
+        "timestamp": {
+          "type": "string",
+          "format": "uint64",
+          "description": "Unix timestamp in microseconds."
+        },
+        "peer_accepted_buy_quote": {
+          "$ref": "#/definitions/rfqrpcPeerAcceptedBuyQuote",
+          "description": "The asset buy quote that was accepted by out peer."
+        }
+      }
+    },
+    "rfqrpcPeerAcceptedSellQuote": {
+      "type": "object",
+      "properties": {
+        "peer": {
+          "type": "string",
+          "description": "Quote counterparty peer."
+        },
+        "id": {
+          "type": "string",
+          "format": "byte",
+          "description": "The unique identifier of the quote request."
+        },
+        "scid": {
+          "type": "string",
+          "format": "uint64",
+          "description": "scid is the short channel ID of the channel over which the payment for\nthe quote should be made."
+        },
+        "asset_amount": {
+          "type": "string",
+          "format": "uint64",
+          "description": "asset_amount is the amount of the subject asset."
+        },
+        "bid_asset_rate": {
+          "$ref": "#/definitions/rfqrpcFixedPoint",
+          "description": "bid_asset_rate is the asset to BTC conversion rate represented as a\nfixed-point number."
+        },
+        "expiry": {
+          "type": "string",
+          "format": "uint64",
+          "description": "The unix timestamp in seconds after which the quote is no longer valid."
+        },
+        "min_transportable_msat": {
+          "type": "string",
+          "format": "uint64",
+          "description": "The minimum amount of milli-satoshis that need to be sent out in order to\ntransport a single asset unit over the Lightning Network with the given\nrate. This is the base amount of 354,000 milli-satoshi (the minimum\namount for a non-dust HTLC) plus the equivalent of one asset unit in\nmilli-satoshis."
+        }
+      }
+    },
+    "rfqrpcPeerAcceptedSellQuoteEvent": {
+      "type": "object",
+      "properties": {
+        "timestamp": {
+          "type": "string",
+          "format": "uint64",
+          "description": "Unix timestamp in microseconds."
+        },
+        "peer_accepted_sell_quote": {
+          "$ref": "#/definitions/rfqrpcPeerAcceptedSellQuote",
+          "description": "The asset sell quote that was accepted by out peer."
+        }
+      }
+    },
+    "rfqrpcQueryPeerAcceptedQuotesResponse": {
+      "type": "object",
+      "properties": {
+        "buy_quotes": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "$ref": "#/definitions/rfqrpcPeerAcceptedBuyQuote"
+          },
+          "description": "buy_quotes is a list of asset buy quotes which were requested by our\nnode and have been accepted by our peers."
+        },
+        "sell_quotes": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "$ref": "#/definitions/rfqrpcPeerAcceptedSellQuote"
+          },
+          "description": "sell_quotes is a list of asset sell quotes which were requested by our\nnode and have been accepted by our peers."
+        }
+      }
+    },
+    "rfqrpcQuoteRespStatus": {
+      "type": "string",
+      "enum": [
+        "INVALID_ASSET_RATES",
+        "INVALID_EXPIRY",
+        "PRICE_ORACLE_QUERY_ERR"
+      ],
+      "default": "INVALID_ASSET_RATES",
+      "description": "QuoteRespStatus is an enum that represents the status of a quote response.\n\n - INVALID_ASSET_RATES: INVALID_ASSET_RATES indicates that at least one asset rate in the\nquote response is invalid.\n - INVALID_EXPIRY: INVALID_EXPIRY indicates that the expiry in the quote response is\ninvalid.\n - PRICE_ORACLE_QUERY_ERR: PRICE_ORACLE_QUERY_ERR indicates that an error occurred when querying the\nprice oracle whilst evaluating the quote response."
+    },
+    "rfqrpcRejectedQuoteResponse": {
+      "type": "object",
+      "properties": {
+        "peer": {
+          "type": "string",
+          "description": "peer is the quote counterparty peer."
+        },
+        "id": {
+          "type": "string",
+          "format": "byte",
+          "description": "id is the unique identifier of the quote request."
+        },
+        "error_message": {
+          "type": "string",
+          "description": "error_message is a human-readable error message."
+        },
+        "error_code": {
+          "type": "integer",
+          "format": "int64",
+          "description": "error_code is a machine-readable error code."
+        }
+      },
+      "description": "RejectedQuoteResponse is a message that is returned when a quote request is\nrejected by the peer."
+    },
+    "rfqrpcRfqEvent": {
+      "type": "object",
+      "properties": {
+        "peer_accepted_buy_quote": {
+          "$ref": "#/definitions/rfqrpcPeerAcceptedBuyQuoteEvent",
+          "description": "peer_accepted_buy_quote is an event that is emitted when a peer\naccepted (incoming) asset buy quote message is received."
+        },
+        "peer_accepted_sell_quote": {
+          "$ref": "#/definitions/rfqrpcPeerAcceptedSellQuoteEvent",
+          "description": "peer_accepted_sell_offer is an event that is emitted when a peer\naccepted (incoming) asset sell quote message is received."
+        },
+        "accept_htlc": {
+          "$ref": "#/definitions/rfqrpcAcceptHtlcEvent",
+          "description": "accept_htlc is an event that is sent when a HTLC is accepted by the\nRFQ service."
+        }
+      }
+    },
+    "rfqrpcSubscribeRfqEventNtfnsRequest": {
+      "type": "object"
+    },
+    "rpcStatus": {
+      "type": "object",
+      "properties": {
+        "code": {
+          "type": "integer",
+          "format": "int32"
+        },
+        "message": {
+          "type": "string"
+        },
+        "details": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "$ref": "#/definitions/protobufAny"
+          }
+        }
+      }
+    }
+  }
+}

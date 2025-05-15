@@ -19,15 +19,17 @@ import (
 )
 
 func genTaprootKeySpend(t testing.TB, privKey btcec.PrivateKey,
-	virtualTx *wire.MsgTx, input *asset.Asset, idx uint32) wire.TxWitness {
+	virtualTx *wire.MsgTx, input, newAsset *asset.Asset,
+	idx uint32) wire.TxWitness {
 
 	t.Helper()
 
 	virtualTxCopy := asset.VirtualTxWithInput(
-		virtualTx, input, idx, nil,
+		virtualTx, newAsset.LockTime, newAsset.RelativeLockTime, idx,
+		nil,
 	)
 	sigHash, err := tapscript.InputKeySpendSigHash(
-		virtualTxCopy, input, idx, txscript.SigHashDefault,
+		virtualTxCopy, input, newAsset, idx, txscript.SigHashDefault,
 	)
 	require.NoError(t, err)
 
@@ -116,7 +118,7 @@ func runAppendTransitionTest(t *testing.T, assetType asset.Type, amt uint64,
 	require.NoError(t, err)
 
 	// Transfer the asset to a new owner.
-	recipientPrivKey := test.RandPrivKey(t)
+	recipientPrivKey := test.RandPrivKey()
 	newAsset := *genesisProof.Asset.Copy()
 	newAsset.ScriptKey = asset.NewScriptKeyBip86(
 		test.PubToKeyDesc(recipientPrivKey.PubKey()),
@@ -128,7 +130,12 @@ func runAppendTransitionTest(t *testing.T, assetType asset.Type, amt uint64,
 
 	assetCommitment, err := commitment.NewAssetCommitment(&newAsset)
 	require.NoError(t, err)
-	tapCommitment, err := commitment.NewTapCommitment(assetCommitment)
+	tapCommitment, err := commitment.NewTapCommitment(nil, assetCommitment)
+	require.NoError(t, err)
+
+	// Add some alt leaves to the commitment anchoring the asset transfer.
+	altLeaves := asset.ToAltLeaves(asset.RandAltLeaves(t, true))
+	err = tapCommitment.MergeAltLeaves(altLeaves)
 	require.NoError(t, err)
 
 	tapscriptRoot := tapCommitment.TapscriptRoot(nil)
@@ -154,7 +161,7 @@ func runAppendTransitionTest(t *testing.T, assetType asset.Type, amt uint64,
 	// Add a P2TR change output to test the exclusion proof.
 	var changeInternalKey *btcec.PublicKey
 	if withBip86Change {
-		changeInternalKey = test.RandPrivKey(t).PubKey()
+		changeInternalKey = test.RandPrivKey().PubKey()
 		changeTaprootKey := txscript.ComputeTaprootKeyNoScript(
 			changeInternalKey,
 		)
@@ -205,12 +212,12 @@ func runAppendTransitionTest(t *testing.T, assetType asset.Type, amt uint64,
 
 	// Append the new transition to the genesis blob.
 	transitionBlob, transitionProof, err := AppendTransition(
-		genesisBlob, transitionParams, MockHeaderVerifier,
-		MockGroupVerifier,
+		genesisBlob, transitionParams, MockVerifierCtx,
 	)
 	require.NoError(t, err)
 	require.Greater(t, len(transitionBlob), len(genesisBlob))
 	require.Equal(t, txMerkleProof, &transitionProof.TxMerkleProof)
+	asset.CompareAltLeaves(t, altLeaves, transitionProof.AltLeaves)
 	verifyBlob(t, transitionBlob)
 
 	// Stop here if we don't test asset splitting.
@@ -219,9 +226,9 @@ func runAppendTransitionTest(t *testing.T, assetType asset.Type, amt uint64,
 	}
 
 	// If we want to test splitting, we do that now, as a second transfer.
-	split1PrivKey := test.RandPrivKey(t)
-	split2PrivKey := test.RandPrivKey(t)
-	split3PrivKey := test.RandPrivKey(t)
+	split1PrivKey := test.RandPrivKey()
+	split2PrivKey := test.RandPrivKey()
+	split3PrivKey := test.RandPrivKey()
 	transitionOutpoint := wire.OutPoint{
 		Hash:  transitionProof.AnchorTx.TxHash(),
 		Index: transitionProof.InclusionProof.OutputIndex,
@@ -279,11 +286,26 @@ func runAppendTransitionTest(t *testing.T, assetType asset.Type, amt uint64,
 		split3AssetNoSplitProof,
 	)
 	require.NoError(t, err)
-	tap1Commitment, err := commitment.NewTapCommitment(split1Commitment)
+	split1AltLeaves := asset.ToAltLeaves(asset.RandAltLeaves(t, true))
+	split2AltLeaves := asset.ToAltLeaves(asset.RandAltLeaves(t, true))
+	split3AltLeaves := asset.ToAltLeaves(asset.RandAltLeaves(t, true))
+	tap1Commitment, err := commitment.NewTapCommitment(
+		nil, split1Commitment,
+	)
 	require.NoError(t, err)
-	tap2Commitment, err := commitment.NewTapCommitment(split2Commitment)
+	err = tap1Commitment.MergeAltLeaves(split1AltLeaves)
 	require.NoError(t, err)
-	tap3Commitment, err := commitment.NewTapCommitment(split3Commitment)
+	tap2Commitment, err := commitment.NewTapCommitment(
+		nil, split2Commitment,
+	)
+	require.NoError(t, err)
+	err = tap2Commitment.MergeAltLeaves(split2AltLeaves)
+	require.NoError(t, err)
+	tap3Commitment, err := commitment.NewTapCommitment(
+		nil, split3Commitment,
+	)
+	require.NoError(t, err)
+	err = tap3Commitment.MergeAltLeaves(split3AltLeaves)
 	require.NoError(t, err)
 
 	tapscript1Root := tap1Commitment.TapscriptRoot(nil)
@@ -398,12 +420,12 @@ func runAppendTransitionTest(t *testing.T, assetType asset.Type, amt uint64,
 	}
 
 	split1Blob, split1Proof, err := AppendTransition(
-		transitionBlob, split1Params, MockHeaderVerifier,
-		MockGroupVerifier,
+		transitionBlob, split1Params, MockVerifierCtx,
 	)
 	require.NoError(t, err)
 	require.Greater(t, len(split1Blob), len(transitionBlob))
 	require.Equal(t, splitTxMerkleProof, &split1Proof.TxMerkleProof)
+	asset.CompareAltLeaves(t, split1AltLeaves, split1Proof.AltLeaves)
 	split1Snapshot := verifyBlob(t, split1Blob)
 	require.False(t, split1Snapshot.SplitAsset)
 
@@ -440,12 +462,12 @@ func runAppendTransitionTest(t *testing.T, assetType asset.Type, amt uint64,
 	}
 
 	split2Blob, split2Proof, err := AppendTransition(
-		transitionBlob, split2Params, MockHeaderVerifier,
-		MockGroupVerifier,
+		transitionBlob, split2Params, MockVerifierCtx,
 	)
 	require.NoError(t, err)
 	require.Greater(t, len(split2Blob), len(transitionBlob))
 	require.Equal(t, splitTxMerkleProof, &split2Proof.TxMerkleProof)
+	asset.CompareAltLeaves(t, split2AltLeaves, split2Proof.AltLeaves)
 	split2Snapshot := verifyBlob(t, split2Blob)
 
 	require.True(t, split2Snapshot.SplitAsset)
@@ -483,12 +505,12 @@ func runAppendTransitionTest(t *testing.T, assetType asset.Type, amt uint64,
 	}
 
 	split3Blob, split3Proof, err := AppendTransition(
-		transitionBlob, split3Params, MockHeaderVerifier,
-		MockGroupVerifier,
+		transitionBlob, split3Params, MockVerifierCtx,
 	)
 	require.NoError(t, err)
 	require.Greater(t, len(split3Blob), len(transitionBlob))
 	require.Equal(t, splitTxMerkleProof, &split3Proof.TxMerkleProof)
+	asset.CompareAltLeaves(t, split3AltLeaves, split3Proof.AltLeaves)
 	split3Snapshot := verifyBlob(t, split3Blob)
 
 	require.True(t, split3Snapshot.SplitAsset)
@@ -521,7 +543,7 @@ func signAssetTransfer(t testing.TB, prevProof *Proof, newAsset *asset.Asset,
 	virtualTx, _, err := tapscript.VirtualTx(newAsset, inputs)
 	require.NoError(t, err)
 	newWitness := genTaprootKeySpend(
-		t, *senderPrivKey, virtualTx, &prevProof.Asset, 0,
+		t, *senderPrivKey, virtualTx, &prevProof.Asset, newAsset, 0,
 	)
 	require.NoError(t, err)
 	newAsset.PrevWitnesses[0].TxWitness = newWitness
@@ -543,9 +565,7 @@ func verifyBlob(t testing.TB, blob Blob) *AssetSnapshot {
 	f := NewEmptyFile(V0)
 	require.NoError(t, f.Decode(bytes.NewReader(blob)))
 
-	finalSnapshot, err := f.Verify(
-		context.Background(), MockHeaderVerifier, MockGroupVerifier,
-	)
+	finalSnapshot, err := f.Verify(context.Background(), MockVerifierCtx)
 	require.NoError(t, err)
 
 	return finalSnapshot

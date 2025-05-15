@@ -1,11 +1,13 @@
 package address
 
 import (
+	"bytes"
 	"net/url"
 
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/lightninglabs/taproot-assets/asset"
 	"github.com/lightninglabs/taproot-assets/commitment"
+	"github.com/lightninglabs/taproot-assets/fn"
 	"github.com/lightningnetwork/lnd/tlv"
 )
 
@@ -40,6 +42,14 @@ const (
 
 	// addrProofCourierType is the TLV type of the proof courier address.
 	addrProofCourierAddrType addressTLVType = 12
+)
+
+// KnownAddressTypes is a set of all known address TLV types. This set is
+// asserted to be complete by a check in the BIP test vector unit tests.
+var KnownAddressTypes = fn.NewSet(
+	addrVersionType, addrAssetVersionType, addrAssetIDType,
+	addrGroupKeyType, addrScriptKeyType, addrInternalKeyType,
+	addrTapscriptSiblingType, addrAmountType, addrProofCourierAddrType,
 )
 
 func newAddressVersionRecord(version *Version) tlv.Record {
@@ -86,8 +96,14 @@ func newAddressTapscriptSiblingRecord(
 	tapscriptSibling **commitment.TapscriptPreimage) tlv.Record {
 
 	sizeFunc := func() uint64 {
-		// 1 byte for the type, and then the pre-image itself.
-		return 1 + uint64(len((*tapscriptSibling).SiblingPreimage))
+		var buf bytes.Buffer
+		err := commitment.TapscriptPreimageEncoder(
+			&buf, tapscriptSibling, &[8]byte{},
+		)
+		if err != nil {
+			panic(err)
+		}
+		return uint64(len(buf.Bytes()))
 	}
 	return tlv.MakeDynamicRecord(
 		addrTapscriptSiblingType, tapscriptSibling, sizeFunc,
@@ -115,6 +131,6 @@ func newProofCourierAddrRecord(addr *url.URL) tlv.Record {
 
 	return tlv.MakeDynamicRecord(
 		addrProofCourierAddrType, addr, recordSize,
-		urlEncoder, urlDecoder,
+		asset.UrlEncoder, asset.UrlDecoder,
 	)
 }

@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/lightninglabs/taproot-assets/asset"
 	"github.com/lightninglabs/taproot-assets/fn"
 	"github.com/lightninglabs/taproot-assets/mssmt"
@@ -151,16 +150,15 @@ func parseCommon(assets ...*asset.Asset) (*AssetCommitment, error) {
 		assetsMap[key] = newAsset
 	}
 
-	var groupPubKey *btcec.PublicKey
-	if assetGroupKey != nil {
-		groupPubKey = &assetGroupKey.GroupPubKey
-	}
-
 	// The tapKey here is what will be used to place this asset commitment
 	// into the top-level Taproot Asset commitment. For assets without a
 	// group key, then this will be the normal asset ID. Otherwise, this'll
 	// be the sha256 of the group key.
-	tapKey := asset.TapCommitmentKey(firstAssetID, groupPubKey)
+	assetSpecifier := asset.NewSpecifierOptionalGroupKey(
+		firstAssetID, assetGroupKey,
+	)
+
+	tapKey := asset.TapCommitmentKey(assetSpecifier)
 
 	return &AssetCommitment{
 		Version:   maxVersion,
@@ -277,6 +275,11 @@ func (c *AssetCommitment) Delete(oldAsset *asset.Asset) error {
 	// Ensure the given asset is of the expected type.
 	if c.AssetType != oldAsset.Type {
 		return ErrAssetTypeMismatch
+	}
+
+	// Deleting from an empty tree is a no-op.
+	if len(c.assets) == 0 {
+		return nil
 	}
 
 	key := oldAsset.AssetCommitmentKey()

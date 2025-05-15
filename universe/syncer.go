@@ -12,11 +12,12 @@ import (
 	"github.com/lightninglabs/taproot-assets/fn"
 	"github.com/lightninglabs/taproot-assets/mssmt"
 	"github.com/lightninglabs/taproot-assets/proof"
+	"github.com/lightninglabs/taproot-assets/taprpc/universerpc"
 	"golang.org/x/sync/errgroup"
 )
 
 const (
-	defaultPageSize = int32(MaxPageSize)
+	defaultPageSize = int32(RequestPageSize)
 )
 
 var (
@@ -195,11 +196,32 @@ func fetchRootsForIDs(ctx context.Context, idsToSync []Identifier,
 		ctx, idsToSync,
 		func(ctx context.Context, id Identifier) error {
 			root, err := diffEngine.RootNode(ctx, id)
-			if err != nil {
+			switch {
+			// We're potentially calling an RPC endpoint, so the
+			// error cannot always be mapped directly using
+			// errors.Is, so we use fn.IsRpcErr. If we do get the
+			// ErrNoUniverseRoot it means the remote universe
+			// doesn't know about that root, which is okay and not
+			// a reason to abort the sync. This could either be the
+			// case because the asset ID was configured manually
+			// and isn't present in all universes, or because it's
+			// actually an incorrect asset ID.
+			case fn.IsRpcErr(err, ErrNoUniverseRoot):
+				log.Debugf("UniverseRoot(%v) not found in "+
+					"remote universe", id.String())
+				return nil
+
+			case err != nil:
 				return err
 			}
 
-			rootsToSync <- root
+			// Older versions of the universe didn't return an error
+			// when the root wasn't found. But the returned root is
+			// empty in that case, so we can check for that.
+			if !IsEmptyRoot(root) {
+				rootsToSync <- root
+			}
+
 			return nil
 		},
 	)
@@ -223,8 +245,7 @@ func (s *SimpleSyncer) syncRoot(ctx context.Context, remoteRoot Root,
 	// If we don't have this root, then we don't have anything to compare
 	// to, so we'll proceed as normal.
 	case errors.Is(err, ErrNoUniverseRoot):
-		// TODO(roasbeef): abstraction leak, error should be in
-		// universe package
+		// Continue below, we don't have this root locally.
 
 	// If the local root matches the remote root, then we're done here.
 	case err == nil && mssmt.IsEqualNode(localRoot, remoteRoot):
@@ -234,7 +255,7 @@ func (s *SimpleSyncer) syncRoot(ctx context.Context, remoteRoot Root,
 		return nil
 
 	case err != nil:
-		return fmt.Errorf("unable to fetch local root: %v", err)
+		return fmt.Errorf("unable to fetch local root: %w", err)
 	}
 
 	log.Infof("UniverseRoot(%v) diverges, performing leaf diff...",
@@ -272,20 +293,9 @@ func (s *SimpleSyncer) syncRoot(ctx context.Context, remoteRoot Root,
 	// local registrar as they're fetched.
 	var (
 		fetchedLeaves = make(chan *Item, len(keysToFetch))
-		newLeafProofs []*Leaf
+		newLeafProofs = make([]*Leaf, 0, len(keysToFetch))
 		batchSyncEG   errgroup.Group
 	)
-
-	// We use an error group to simply the error handling of a goroutine.
-	// This goroutine will handle reading in batches of new leaves to
-	// insert into the DB. We'll fee the output of the goroutines below
-	// into the input fetchedLeaves channel.
-	batchSyncEG.Go(func() error {
-		newLeafProofs, err = s.batchStreamNewItems(
-			ctx, uniID, fetchedLeaves, len(keysToFetch),
-		)
-		return err
-	})
 
 	// If this is a transfer tree, then we'll use these channels to sort
 	// the contents before sending to the batch writer.
@@ -319,6 +329,37 @@ func (s *SimpleSyncer) syncRoot(ctx context.Context, remoteRoot Root,
 			// Otherwise, we'll another step to the pipeline below
 			// for sorting.
 			if isIssuanceTree {
+				// If this is an issuance proof _AND_ it has a
+				// group key reveal, then we'll need to import
+				// it right away. Otherwise, all other issuance
+				// proofs in the batch might fail, as they might
+				// reference the group key in this proof's
+				// group key reveal.
+				reg := s.cfg.LocalRegistrar
+				if hasGroupKeyReveal(leafProof.Leaf.RawProof) {
+					log.Debugf("UniverseRoot(%v): "+
+						"Inserting new group key "+
+						"reveal leaf", uniID.String())
+					_, err = reg.UpsertProofLeaf(
+						ctx, uniID, key, leafProof.Leaf,
+					)
+					if err != nil {
+						return fmt.Errorf("unable to "+
+							"register group "+
+							"anchor proof: %w", err)
+					}
+
+					// Track this manually inserted proof in
+					// the result.
+					newLeafProofs = append(
+						newLeafProofs, leafProof.Leaf,
+					)
+
+					// No need to batch this further, we've
+					// already inserted it.
+					return nil
+				}
+
 				fetchedLeaves <- &Item{
 					ID:   uniID,
 					Key:  key,
@@ -337,6 +378,23 @@ func (s *SimpleSyncer) syncRoot(ctx context.Context, remoteRoot Root,
 	if err != nil {
 		return err
 	}
+
+	// We use an error group to simply the error handling of a goroutine.
+	// This goroutine will handle reading in batches of new leaves to
+	// insert into the DB. We'll fee the output of the goroutines below
+	// into the input fetchedLeaves channel.
+	batchSyncEG.Go(func() error {
+		insertedProofs, err := s.batchStreamNewItems(
+			ctx, uniID, fetchedLeaves, len(keysToFetch),
+		)
+		if err != nil {
+			return err
+		}
+
+		newLeafProofs = append(newLeafProofs, insertedProofs...)
+
+		return nil
+	})
 
 	// If this is a transfer tree, then we'll collect all the items as we
 	// need to sort them to ensure we can validate them in dep order.
@@ -393,6 +451,23 @@ func (s *SimpleSyncer) syncRoot(ctx context.Context, remoteRoot Root,
 		"universe_root=%v", uniID.String(), spew.Sdump(remoteRoot))
 
 	return nil
+}
+
+// hasGroupKeyReveal determines whether a proof has a group key reveal. This is
+// used to determine whether we should insert the proof right away, or batch it
+// with other proofs.
+func hasGroupKeyReveal(rawProof []byte) bool {
+	// We'll decode the proof to determine if it's a group key reveal.
+	var dummyProof proof.Proof
+	record := proof.GroupKeyRevealRecord(&dummyProof.GroupKeyReveal)
+
+	proofReader := bytes.NewReader(rawProof)
+	err := proof.SparseDecode(proofReader, record)
+	if err != nil {
+		return false
+	}
+
+	return dummyProof.GroupKeyReveal != nil
 }
 
 // batchStreamNewItems streams the set of new items to the local registrar in
@@ -471,7 +546,9 @@ func (s *SimpleSyncer) SyncUniverse(ctx context.Context, host ServerAddr,
 // fetchAllRoots fetches all the roots from the remote Universe. This function
 // is used in order to isolate any logic related to the specifics of how we
 // fetch the data from the universe server.
-func (s *SimpleSyncer) fetchAllRoots(ctx context.Context, diffEngine DiffEngine) ([]Root, error) {
+func (s *SimpleSyncer) fetchAllRoots(ctx context.Context,
+	diffEngine DiffEngine) ([]Root, error) {
+
 	offset := int32(0)
 	pageSize := defaultPageSize
 	roots := make([]Root, 0)
@@ -479,6 +556,7 @@ func (s *SimpleSyncer) fetchAllRoots(ctx context.Context, diffEngine DiffEngine)
 	for {
 		log.Debugf("Fetching roots in range: %v to %v", offset,
 			offset+pageSize)
+
 		tempRoots, err := diffEngine.RootNodes(
 			ctx, RootNodesQuery{
 				WithAmountsById: false,
@@ -487,16 +565,17 @@ func (s *SimpleSyncer) fetchAllRoots(ctx context.Context, diffEngine DiffEngine)
 				Limit:           pageSize,
 			},
 		)
-
 		if err != nil {
 			return nil, err
 		}
 
-		if len(tempRoots) == 0 {
+		roots = append(roots, tempRoots...)
+
+		// If we're getting a partial page, then we know we're done.
+		if len(tempRoots) < int(pageSize) {
 			break
 		}
 
-		roots = append(roots, tempRoots...)
 		offset += pageSize
 	}
 
@@ -536,4 +615,39 @@ func (s *SimpleSyncer) fetchAllLeafKeys(ctx context.Context,
 	}
 
 	return leafKeys, nil
+}
+
+// IsEmptyRoot return true if the given root does not have any values set.
+func IsEmptyRoot(root Root) bool {
+	return root.ID == Identifier{} && root.Node == nil &&
+		root.AssetName == "" && len(root.GroupedAssets) == 0
+}
+
+// IsEmptyRootResponse returns true if the given root response does not have
+// any values set.
+func IsEmptyRootResponse(resp *universerpc.QueryRootResponse) bool {
+	// If the response is nil, then it's empty by definition.
+	if resp == nil {
+		return true
+	}
+
+	// If none of the roots are set, then the response is empty. This is
+	// not expected to be the case with the current version, as the roots
+	// are always set, but their content is empty. But future versions might
+	// set it that way.
+	if resp.IssuanceRoot == nil && resp.TransferRoot == nil {
+		return true
+	}
+
+	// If both roots are set, but their IDs are nil, then the response is
+	// empty. This is what the current version returns when the roots are
+	// empty.
+	if resp.IssuanceRoot != nil && resp.TransferRoot != nil {
+		return resp.IssuanceRoot.Id == nil &&
+			resp.TransferRoot.Id == nil
+	}
+
+	// If only one of the roots is set, then the response is likely not
+	// empty, or at least not as per our definition.
+	return false
 }

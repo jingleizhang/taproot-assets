@@ -125,6 +125,20 @@ func (u *uniStatsHarness) assertUniverseStatsEqual(t *testing.T,
 	require.NoError(t, err)
 }
 
+func (u *uniStatsHarness) addEvents(numAssets int) {
+	// Next, we'll log 2 proof events, and a random amount of syncs for
+	// each asset.
+	for i := 0; i < numAssets; i++ {
+		u.logProofEventByIndex(i)
+		u.logProofEventByIndex(i)
+
+		numSyncs := rand.Int() % 10
+		for j := 0; j < numSyncs; j++ {
+			u.logSyncEventByIndex(i)
+		}
+	}
+}
+
 // TestUniverseStatsEvents tests that we're able to properly insert, and also
 // fetch information related to universe sync related events.
 func TestUniverseStatsEvents(t *testing.T) {
@@ -255,6 +269,60 @@ func TestUniverseStatsEvents(t *testing.T) {
 	})
 }
 
+// TestUniverseStatsAsyncCache tests that the cache of the universe aggregate
+// stats is asynchronously populated regardless of what the outcome of the
+// RPC call is.
+func TestUniverseStatsAsyncCache(t *testing.T) {
+	t.Parallel()
+
+	db := NewTestDB(t)
+
+	yesterday := time.Now().UTC().Add(-24 * time.Hour)
+	testClock := clock.NewTestClock(yesterday)
+	statsDB, _ := newUniverseStatsWithDB(db.BaseDB, testClock)
+
+	const numTranches = 3
+
+	sh := newUniStatsHarness(t, numTranches, db.BaseDB, statsDB)
+
+	// Record the number of groups in this asset.
+	var numGroups uint64
+	for i := 0; i < numTranches; i++ {
+		if sh.universeLeaves[i].Leaf.GroupKey != nil {
+			numGroups++
+		}
+	}
+
+	// First let's make sure the cache is empty. This should be the case as
+	// no calls have been made so far.
+	val := sh.db.statsSnapshot.Load()
+	require.Nil(t, val)
+
+	const (
+		quickTimeoutDuration = time.Microsecond * 1
+		defaultTick          = time.Millisecond * 250
+	)
+
+	// We now create a client context with a very quick timeout. This is
+	// meant to quickly fail the RPC call.
+	ctx, cancel := context.WithTimeout(
+		context.Background(), quickTimeoutDuration,
+	)
+	defer cancel()
+
+	// The tiny timeout duration should make the following call result in a
+	// context deadline related error.
+	_, err := sh.db.AggregateSyncStats(ctx)
+	require.ErrorContains(t, err, "context deadline exceeded")
+
+	// Regardless of the above call failing, the cache should asynchronously
+	// get updated in the background, so let's wait until a value is loaded.
+	require.Eventually(t, func() bool {
+		val := sh.db.statsSnapshot.Load()
+		return val != nil
+	}, DefaultStoreTimeout, defaultTick)
+}
+
 // TestUniverseQuerySyncStatsSorting tests that we're able to properly sort the
 // response using any of the available params.
 func TestUniverseQuerySyncStatsSorting(t *testing.T) {
@@ -271,15 +339,7 @@ func TestUniverseQuerySyncStatsSorting(t *testing.T) {
 
 	// Next, we'll log 2 proof events, and a random amount of syncs for
 	// each asset.
-	for i := 0; i < numAssets; i++ {
-		sh.logProofEventByIndex(i)
-		sh.logProofEventByIndex(i)
-
-		numSyncs := rand.Int() % 10
-		for j := 0; j < numSyncs; j++ {
-			sh.logSyncEventByIndex(i)
-		}
-	}
+	sh.addEvents(numAssets)
 
 	// sortCheck is used to generate an IsSorted func bound to the
 	// response, for each sort type below.

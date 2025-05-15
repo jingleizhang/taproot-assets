@@ -1,15 +1,17 @@
 package taprootassets
 
 import (
+	"fmt"
 	"net"
 	"net/url"
 	"time"
 
-	"github.com/btcsuite/btcd/chaincfg"
 	"github.com/lightninglabs/lndclient"
 	"github.com/lightninglabs/taproot-assets/address"
 	"github.com/lightninglabs/taproot-assets/monitoring"
 	"github.com/lightninglabs/taproot-assets/proof"
+	"github.com/lightninglabs/taproot-assets/rfq"
+	"github.com/lightninglabs/taproot-assets/tapchannel"
 	"github.com/lightninglabs/taproot-assets/tapdb"
 	"github.com/lightninglabs/taproot-assets/tapfreighter"
 	"github.com/lightninglabs/taproot-assets/tapgarden"
@@ -75,6 +77,67 @@ type DatabaseConfig struct {
 	FederationDB *tapdb.UniverseFederationDB
 }
 
+// UniversePublicAccessStatus is a type that indicates the status of public
+// access to the universe server.
+type UniversePublicAccessStatus string
+
+const (
+	// UniversePublicAccessStatusNone indicates that no public access is
+	// granted.
+	UniversePublicAccessStatusNone UniversePublicAccessStatus = ""
+
+	// UniversePublicAccessStatusRead indicates that read access is granted.
+	UniversePublicAccessStatusRead UniversePublicAccessStatus = "r"
+
+	// UniversePublicAccessStatusWrite indicates that write access is
+	// granted.
+	UniversePublicAccessStatusWrite UniversePublicAccessStatus = "w"
+
+	// UniversePublicAccessStatusReadWrite indicates that read and write
+	// access is granted.
+	UniversePublicAccessStatusReadWrite UniversePublicAccessStatus = "rw"
+)
+
+// IsReadAccessGranted returns true if the status indicates that read access
+// is granted.
+func (s UniversePublicAccessStatus) IsReadAccessGranted() bool {
+	return s == UniversePublicAccessStatusRead ||
+		s == UniversePublicAccessStatusReadWrite
+}
+
+// IsWriteAccessGranted returns true if the status indicates that write access
+// is granted.
+func (s UniversePublicAccessStatus) IsWriteAccessGranted() bool {
+	return s == UniversePublicAccessStatusWrite ||
+		s == UniversePublicAccessStatusReadWrite
+}
+
+// ParseUniversePublicAccessStatus parses a string into a universe public access
+// status.
+func ParseUniversePublicAccessStatus(
+	s string) (UniversePublicAccessStatus, error) {
+
+	switch s {
+	case "rw", "wr":
+		return UniversePublicAccessStatusReadWrite, nil
+
+	case "r":
+		return UniversePublicAccessStatusRead, nil
+
+	case "w":
+		return UniversePublicAccessStatusWrite, nil
+
+	case "":
+		return UniversePublicAccessStatusNone, nil
+
+	default:
+		// This default case returns an error. It will capture the case
+		// where the CLI argument is present but unset (empty value).
+		return UniversePublicAccessStatusNone, fmt.Errorf("unknown "+
+			"universe public access status: %s", s)
+	}
+}
+
 // Config is the main config of the Taproot Assets server.
 type Config struct {
 	DebugLevel string
@@ -84,8 +147,12 @@ type Config struct {
 	// connecting to itself as a federation member.
 	RuntimeID int64
 
-	// TODO(roasbeef): use the Taproot Asset chain param wrapper here?
-	ChainParams chaincfg.Params
+	// EnableChannelFeatures indicates that tapd is running inside the
+	// Lightning Terminal daemon (litd) and can provide Taproot Asset
+	// channel functionality.
+	EnableChannelFeatures bool
+
+	ChainParams address.ChainParams
 
 	Lnd *lndclient.LndServices
 
@@ -122,13 +189,34 @@ type Config struct {
 
 	UniverseFederation *universe.FederationEnvoy
 
+	// UniFedSyncAllAssets is a flag that indicates whether the
+	// universe federation syncer should default to syncing all assets.
+	UniFedSyncAllAssets bool
+
+	RfqManager *rfq.Manager
+
+	PriceOracle rfq.PriceOracle
+
 	UniverseStats universe.Telemetry
 
-	// UniversePublicAccess is flag which, If true, and the Universe server
-	// is on a public interface, valid proof from remote parties will be
-	// accepted, and proofs will be queryable by remote parties.
-	// This applies to federation syncing as well as RPC insert and query.
-	UniversePublicAccess bool
+	AuxLeafSigner *tapchannel.AuxLeafSigner
+
+	AuxFundingController *tapchannel.FundingController
+
+	AuxTrafficShaper *tapchannel.AuxTrafficShaper
+
+	AuxInvoiceManager *tapchannel.AuxInvoiceManager
+
+	AuxChanCloser *tapchannel.AuxChanCloser
+
+	AuxSweeper *tapchannel.AuxSweeper
+
+	// UniversePublicAccess is a field that indicates the status of public
+	// access (i.e. read/write) to the universe server.
+	//
+	// NOTE: This field does not influence universe federation syncing
+	// behaviour.
+	UniversePublicAccess UniversePublicAccessStatus
 
 	// UniverseQueriesPerSecond is the maximum number of queries per
 	// second across the set of active universe queries that is permitted.
@@ -144,6 +232,10 @@ type Config struct {
 	// LogWriter is the root logger that all of the daemon's subloggers are
 	// hooked up to.
 	LogWriter *build.RotatingLogWriter
+
+	// LogMgr is the sublogger manager that is used to create subloggers for
+	// the daemon.
+	LogMgr *build.SubLoggerManager
 
 	*RPCConfig
 

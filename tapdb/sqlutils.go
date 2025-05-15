@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/btcsuite/btcd/wire"
+	"github.com/lightninglabs/taproot-assets/fn"
 	"github.com/lightninglabs/taproot-assets/internal/test"
 	"github.com/lightninglabs/taproot-assets/tapdb/sqlc"
 	"github.com/stretchr/testify/require"
@@ -46,6 +47,17 @@ func sqlInt32[T constraints.Integer](num T) sql.NullInt32 {
 		Int32: int32(num),
 		Valid: true,
 	}
+}
+
+// sqlOptInt32 turns an option of a numerical integer type into the NullInt32
+// that sql/sqlc uses when an integer field can be permitted to be NULL.
+func sqlOptInt32[T constraints.Integer](num fn.Option[T]) sql.NullInt32 {
+	return fn.MapOptionZ(num, func(num T) sql.NullInt32 {
+		return sql.NullInt32{
+			Int32: int32(num),
+			Valid: true,
+		}
+	})
 }
 
 // sqlInt16 turns a numerical integer type into the NullInt16 that sql/sqlc
@@ -96,12 +108,36 @@ func extractSqlInt32[T constraints.Integer](num sql.NullInt32) T {
 	return T(num.Int32)
 }
 
+// extractOptSqlInt32 turns a NullInt32 into an option of a numerical type.
+func extractOptSqlInt32[T constraints.Integer](num sql.NullInt32) fn.Option[T] {
+	if !num.Valid {
+		return fn.None[T]()
+	}
+
+	result := T(num.Int32)
+	return fn.Some(result)
+}
+
+// extractSqlInt16 turns a NullInt16 into a numerical type. This can be useful
+// when reading directly from the database, as this function handles extracting
+// the inner value from the "option"-like struct.
+func extractSqlInt16[T constraints.Integer](num sql.NullInt16) T {
+	return T(num.Int16)
+}
+
+// extractBool turns a NullBool into a boolean. This can be useful when reading
+// directly from the database, as this function handles extracting the inner
+// value from the "option"-like struct.
+func extractBool(b sql.NullBool) bool {
+	return b.Bool
+}
+
 // readOutPoint reads the next sequence of bytes from r as an OutPoint.
 //
 // NOTE: This function is intended to be used along with the wire.WriteOutPoint
 // function. Once the ReadOutPoint function is exported, then it can be used in
 // place of this.
-func readOutPoint(r io.Reader, pver uint32, version int32, op *wire.OutPoint) error {
+func readOutPoint(r io.Reader, _ uint32, _ uint32, op *wire.OutPoint) error {
 	_, err := io.ReadFull(r, op.Hash[:])
 	if err != nil {
 		return err
@@ -167,7 +203,7 @@ func parseCoalesceNumericType[T constraints.Integer](value any) (T, error) {
 		parsedValue, err := strconv.ParseInt(typedValue, 10, 64)
 		if err != nil {
 			return 0, fmt.Errorf("unable to parse value '%v' as "+
-				"number: %v", value, err)
+				"number: %w", value, err)
 		}
 
 		return T(parsedValue), nil

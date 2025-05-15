@@ -6,15 +6,16 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net/url"
 
 	"github.com/btcsuite/btcd/btcec/v2"
-	"github.com/btcsuite/btcd/btcec/v2/schnorr"
 	"github.com/btcsuite/btcd/btcutil/psbt"
 	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/lightninglabs/taproot-assets/asset"
 	"github.com/lightninglabs/taproot-assets/commitment"
 	"github.com/lightninglabs/taproot-assets/fn"
+	"github.com/lightninglabs/taproot-assets/proof"
 	"github.com/lightningnetwork/lnd/tlv"
 )
 
@@ -65,7 +66,7 @@ func (p *VPacket) EncodeAsPsbt() (*psbt.Packet, error) {
 			},
 			{
 				Key:   PsbtKeyTypeGlobalTapPsbtVersion,
-				Value: []byte{p.Version},
+				Value: []byte{uint8(p.Version)},
 			},
 		},
 	}
@@ -181,7 +182,10 @@ func (i *VInput) encode() (psbt.PInput, error) {
 		},
 		{
 			key:     PsbtKeyTypeInputTapAssetProof,
-			encoder: tlvEncoder(&i.proof, tlv.EVarBytes),
+			encoder: proofEncoder(i.Proof),
+		}, {
+			key:     PsbtKeyTypeInputAltLeaves,
+			encoder: altLeavesEncoder(i.AltLeaves),
 		},
 	}
 
@@ -221,7 +225,7 @@ func (o *VOutput) encode(coinType uint32) (psbt.POutput, *wire.TxOut, error) {
 	// Before we start with any fields that need to go into the Unknowns
 	// slice, we add the information that we can stuff into the wire TX or
 	// existing PSBT fields.
-	assetPkScript, err := payToTaprootScript(o.ScriptKey.PubKey)
+	assetPkScript, err := txscript.PayToTaprootScript(o.ScriptKey.PubKey)
 	if err != nil {
 		return pOut, nil, fmt.Errorf("error creating asset taproot "+
 			"script: %w", err)
@@ -277,10 +281,29 @@ func (o *VOutput) encode(coinType uint32) (psbt.POutput, *wire.TxOut, error) {
 			),
 		},
 		{
-			key: PsbtKeyTypeOutputAssetVersion,
+			key: PsbtKeyTypeOutputTapAssetVersion,
 			encoder: tlvEncoder(
 				&o.AssetVersion, vOutputAssetVersionEncoder,
 			),
+		},
+		{
+			key:     PsbtKeyTypeOutputTapProofDeliveryAddress,
+			encoder: urlEncoder(o.ProofDeliveryAddress),
+		},
+		{
+			key:     PsbtKeyTypeOutputTapAssetProofSuffix,
+			encoder: proofEncoder(o.ProofSuffix),
+		},
+		{
+			key:     PsbtKeyTypeOutputTapAssetLockTime,
+			encoder: tlvEncoder(&o.LockTime, tlv.EUint64),
+		},
+		{
+			key:     PsbtKeyTypeOutputTapAssetRelativeLockTime,
+			encoder: tlvEncoder(&o.RelativeLockTime, tlv.EUint64),
+		}, {
+			key:     PsbtKeyTypeOutputTapAltLeaves,
+			encoder: altLeavesEncoder(o.AltLeaves),
 		},
 	}
 
@@ -334,6 +357,39 @@ func pubKeyEncoder(pubKey *btcec.PublicKey) encoderFunc {
 	}
 
 	return tlvEncoder(&pubKey, tlv.EPubKey)
+}
+
+// proofEncoder is an encoder that does nothing if the given proof is nil.
+func proofEncoder(p *proof.Proof) encoderFunc {
+	return func(key []byte) ([]*customPsbtField, error) {
+		if p == nil {
+			return nil, nil
+		}
+
+		proofBytes, err := p.Bytes()
+		if err != nil {
+			return nil, err
+		}
+
+		return []*customPsbtField{
+			{
+				Key:   fn.CopySlice(key),
+				Value: proofBytes,
+			},
+		}, nil
+	}
+}
+
+// altLeavesEncoder is an encoder that does nothing if the given alt leaf slice
+// is nil or empty.
+func altLeavesEncoder(a []asset.AltLeaf[asset.Asset]) encoderFunc {
+	if len(a) == 0 {
+		return func([]byte) ([]*customPsbtField, error) {
+			return nil, nil
+		}
+	}
+
+	return tlvEncoder(&a, asset.AltLeavesEncoder)
 }
 
 // assetEncoder is an encoder that does nothing if the given asset is nil.
@@ -429,16 +485,6 @@ func tapscriptPreimageEncoder(t *commitment.TapscriptPreimage) encoderFunc {
 	return tlvEncoder(&t, commitment.TapscriptPreimageEncoder)
 }
 
-// payToTaprootScript creates a pk script for a pay-to-taproot output key. We
-// create a copy of the tapscript.PayToTaprootScript function here to avoid a
-// circular dependency.
-func payToTaprootScript(taprootKey *btcec.PublicKey) ([]byte, error) {
-	return txscript.NewScriptBuilder().
-		AddOp(txscript.OP_1).
-		AddData(schnorr.SerializePubKey(taprootKey)).
-		Script()
-}
-
 // vOutputTypeEncoder is a TLV encoder that encodes the given VOutputType to the
 // given writer.
 func vOutputTypeEncoder(w io.Writer, val any, buf *[8]byte) error {
@@ -457,4 +503,30 @@ func vOutputAssetVersionEncoder(w io.Writer, val any, buf *[8]byte) error {
 		return tlv.EUint8T(w, num, buf)
 	}
 	return tlv.NewTypeForEncodingErr(val, "VOutputAssetVersion")
+}
+
+// urlEncoder returns a function that encodes the given URL as a custom PSBT
+// field.
+func urlEncoder(val *url.URL) encoderFunc {
+	return func(key []byte) ([]*customPsbtField, error) {
+		if val == nil {
+			return nil, nil
+		}
+
+		var (
+			b       bytes.Buffer
+			scratch [8]byte
+		)
+		if err := asset.UrlEncoder(&b, val, &scratch); err != nil {
+			return nil, fmt.Errorf("error encoding TLV record: %w",
+				err)
+		}
+
+		return []*customPsbtField{
+			{
+				Key:   fn.CopySlice(key),
+				Value: b.Bytes(),
+			},
+		}, nil
+	}
 }

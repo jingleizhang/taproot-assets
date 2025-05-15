@@ -4,18 +4,24 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"reflect"
 	"testing"
 
+	"github.com/btcsuite/btcd/blockchain"
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcec/v2/schnorr"
+	"github.com/btcsuite/btcd/btcutil/hdkeychain"
 	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/lightninglabs/taproot-assets/fn"
 	"github.com/lightninglabs/taproot-assets/internal/test"
 	"github.com/lightninglabs/taproot-assets/mssmt"
-	"github.com/lightningnetwork/lnd/input"
-	"github.com/lightningnetwork/lnd/keychain"
+	"github.com/lightningnetwork/lnd/tlv"
 	"github.com/stretchr/testify/require"
+	"pgregory.net/rapid"
 )
 
 var (
@@ -31,8 +37,10 @@ var (
 			"821525f66a4a85ea8b71e482a74f382d2ce5ebeee8fdb2172f47" +
 			"7df4900d310536c0",
 	)
-	sig, _     = schnorr.ParseSignature(sigBytes)
-	sigWitness = wire.TxWitness{sig.Serialize()}
+	sig, _                    = schnorr.ParseSignature(sigBytes)
+	sigWitness                = wire.TxWitness{sig.Serialize()}
+	unsupportedTapLeafVersion = txscript.TapscriptLeafVersion(0xf0)
+	testTapLeafScript         = []byte{99, 88, 77, 66, 55, 44}
 
 	generatedTestVectorName = "asset_tlv_encoding_generated.json"
 
@@ -101,135 +109,9 @@ var (
 			GroupPubKey: *pubKey,
 		},
 	}
+
+	assetHexFileName = filepath.Join("testdata", "asset.hex")
 )
-
-// TestGroupKeyIsEqual tests that GroupKey.IsEqual is correct.
-func TestGroupKeyIsEqual(t *testing.T) {
-	t.Parallel()
-
-	testKey := &GroupKey{
-		RawKey: keychain.KeyDescriptor{
-			// Fill in some non-defaults.
-			KeyLocator: keychain.KeyLocator{
-				Family: keychain.KeyFamilyMultiSig,
-				Index:  1,
-			},
-			PubKey: pubKey,
-		},
-		GroupPubKey: *pubKey,
-		Witness:     sigWitness,
-	}
-
-	pubKeyCopy := *pubKey
-
-	tests := []struct {
-		a, b  *GroupKey
-		equal bool
-	}{
-		{
-			a:     nil,
-			b:     nil,
-			equal: true,
-		},
-		{
-			a:     &GroupKey{},
-			b:     &GroupKey{},
-			equal: true,
-		},
-		{
-			a:     nil,
-			b:     &GroupKey{},
-			equal: false,
-		},
-		{
-			a: testKey,
-			b: &GroupKey{
-				GroupPubKey: *pubKey,
-			},
-			equal: false,
-		},
-		{
-			a: testKey,
-			b: &GroupKey{
-				GroupPubKey: testKey.GroupPubKey,
-				Witness:     testKey.Witness,
-			},
-			equal: false,
-		},
-		{
-			a: testKey,
-			b: &GroupKey{
-				RawKey: keychain.KeyDescriptor{
-					KeyLocator: testKey.RawKey.KeyLocator,
-					PubKey:     nil,
-				},
-
-				GroupPubKey: testKey.GroupPubKey,
-				Witness:     testKey.Witness,
-			},
-			equal: false,
-		},
-		{
-			a: testKey,
-			b: &GroupKey{
-				RawKey: keychain.KeyDescriptor{
-					PubKey: &pubKeyCopy,
-				},
-
-				GroupPubKey: testKey.GroupPubKey,
-				Witness:     testKey.Witness,
-			},
-			equal: false,
-		},
-		{
-			a: testKey,
-			b: &GroupKey{
-				RawKey: keychain.KeyDescriptor{
-					KeyLocator: testKey.RawKey.KeyLocator,
-					PubKey:     &pubKeyCopy,
-				},
-
-				GroupPubKey: testKey.GroupPubKey,
-				Witness:     testKey.Witness,
-			},
-			equal: true,
-		},
-		{
-			a: &GroupKey{
-				GroupPubKey: testKey.GroupPubKey,
-				Witness:     testKey.Witness,
-			},
-			b: &GroupKey{
-				GroupPubKey: testKey.GroupPubKey,
-				Witness:     testKey.Witness,
-			},
-			equal: true,
-		},
-		{
-			a: &GroupKey{
-				RawKey: keychain.KeyDescriptor{
-					KeyLocator: testKey.RawKey.KeyLocator,
-				},
-				GroupPubKey: testKey.GroupPubKey,
-				Witness:     testKey.Witness,
-			},
-			b: &GroupKey{
-				RawKey: keychain.KeyDescriptor{
-					KeyLocator: testKey.RawKey.KeyLocator,
-				},
-				GroupPubKey: testKey.GroupPubKey,
-				Witness:     testKey.Witness,
-			},
-			equal: true,
-		},
-	}
-
-	for _, testCase := range tests {
-		testCase := testCase
-		require.Equal(t, testCase.equal, testCase.a.IsEqual(testCase.b))
-		require.Equal(t, testCase.equal, testCase.b.IsEqual(testCase.a))
-	}
-}
 
 // TestGenesisAssetClassification tests that the multiple forms of genesis asset
 // are recognized correctly.
@@ -487,15 +369,261 @@ func TestAssetEncoding(t *testing.T) {
 	})
 
 	assertAssetEncoding("minimal asset", &Asset{
+		ScriptKey: NewScriptKey(pubKey),
+	})
+
+	assertAssetEncoding("minimal asset with unknown odd type", &Asset{
 		Genesis: Genesis{
 			MetaHash: [MetaHashLen]byte{},
 		},
 		ScriptKey: NewScriptKey(pubKey),
+		UnknownOddTypes: tlv.TypeMap{
+			test.TestVectorAllowedUnknownType: []byte(
+				"the great unknown",
+			),
+		},
 	})
 
 	// Write test vectors to file. This is a no-op if the "gen_test_vectors"
 	// build tag is not set.
 	test.WriteTestVectors(t, generatedTestVectorName, testVectors)
+}
+
+// TestAltLeafEncoding runs a property test for AltLeaf validation, encoding,
+// and decoding.
+func TestAltLeafEncoding(t *testing.T) {
+	t.Run("alt leaf encode/decode", rapid.MakeCheck(testAltLeafEncoding))
+}
+
+// testAltLeafEncoding tests the AltLeaf validation logic, and that a valid
+// AltLeaf can be encoded and decoded correctly.
+func testAltLeafEncoding(t *rapid.T) {
+	protoLeaf := AltLeafGen(t).Draw(t, "alt_leaf")
+	validAltLeafErr := protoLeaf.ValidateAltLeaf()
+
+	// If validation passes, the asset must follow all alt leaf constraints.
+	asserts := []AssetAssert{
+		AssetVersionAssert(V0),
+		AssetGenesisAssert(EmptyGenesis),
+		AssetAmountAssert(0),
+		AssetLockTimeAssert(0),
+		AssetRelativeLockTimeAssert(0),
+		AssetHasSplitRootAssert(false),
+		AssetGroupKeyAssert(nil),
+		AssetHasScriptKeyAssert(true),
+	}
+	assertErr := CheckAssetAsserts(&protoLeaf, asserts...)
+
+	// If the validation method and these assertions behave differently,
+	// either the test or the validation method is incorrect.
+	switch {
+	case validAltLeafErr == nil && assertErr != nil:
+		t.Error(assertErr)
+
+	case validAltLeafErr != nil && assertErr == nil:
+		t.Error(validAltLeafErr)
+
+	default:
+	}
+
+	// Don't test encoding for invalid alt leaves.
+	if validAltLeafErr != nil {
+		return
+	}
+
+	// If the alt leaf is valid, check that it can be encoded without error,
+	// and decoded to an identical alt leaf.
+	// fmt.Println("valid leaf")
+	var buf bytes.Buffer
+	if err := protoLeaf.EncodeAltLeaf(&buf); err != nil {
+		t.Error(err)
+	}
+
+	var decodedLeaf Asset
+	altLeafBytes := bytes.NewReader(buf.Bytes())
+	if err := decodedLeaf.DecodeAltLeaf(altLeafBytes); err != nil {
+		t.Error(err)
+	}
+
+	if !protoLeaf.DeepEqual(&decodedLeaf) {
+		t.Errorf("decoded leaf %v does not match input %v", decodedLeaf,
+			protoLeaf)
+	}
+
+	// Asset.DeepEqual does not inspect UnknownOddTypes, so check for their
+	// equality separately.
+	if !reflect.DeepEqual(
+		protoLeaf.UnknownOddTypes, decodedLeaf.UnknownOddTypes,
+	) {
+
+		t.Errorf("decoded leaf unknown types %v does not match input "+
+			"%v", decodedLeaf.UnknownOddTypes,
+			protoLeaf.UnknownOddTypes)
+	}
+}
+
+// TestTapLeafEncoding asserts that we can properly encode and decode tapLeafs
+// through their TLV serialization, and that invalid tapLeafs are rejected.
+func TestTapLeafEncoding(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		leaf  *txscript.TapLeaf
+		valid bool
+	}{
+		{
+			name:  "nil leaf",
+			leaf:  nil,
+			valid: false,
+		},
+		{
+			name:  "empty script",
+			leaf:  fn.Ptr(txscript.NewBaseTapLeaf([]byte{})),
+			valid: false,
+		},
+		{
+			name: "large leaf script",
+			leaf: fn.Ptr(txscript.NewBaseTapLeaf(
+				test.RandBytes(blockchain.MaxBlockWeight),
+			)),
+			valid: true,
+		},
+		{
+			name: "random script with unknown version",
+			leaf: fn.Ptr(txscript.NewTapLeaf(
+				unsupportedTapLeafVersion, testTapLeafScript,
+			)),
+			valid: true,
+		},
+	}
+
+	for _, testCase := range tests {
+		tc := testCase
+
+		t.Run(tc.name, func(t *testing.T) {
+			leafBytes, err := EncodeTapLeaf(tc.leaf)
+			if tc.valid {
+				require.NoError(t, err)
+			} else {
+				require.Error(t, err)
+				return
+			}
+
+			leaf, err := DecodeTapLeaf(leafBytes)
+			require.NoError(t, err)
+
+			require.Equal(t, tc.leaf.LeafVersion, leaf.LeafVersion)
+			require.Equal(t, tc.leaf.Script, leaf.Script)
+		})
+	}
+}
+
+// TestTapBranchEncoding asserts that we can properly encode and decode
+// tapBranches, and that invalid slices of byte slices are rejected.
+func TestTapBranchEncoding(t *testing.T) {
+	tests := []struct {
+		name       string
+		branchData [][]byte
+		valid      bool
+	}{
+		{
+			name:       "empty branch",
+			branchData: [][]byte{},
+			valid:      false,
+		},
+		{
+			name: "branch with invalid child",
+			branchData: [][]byte{
+				pubKeyBytes,
+				hashBytes2[:],
+			},
+			valid: false,
+		},
+		{
+			name: "valid branch",
+			branchData: [][]byte{
+				hashBytes1[:],
+				hashBytes2[:],
+			},
+			valid: true,
+		},
+	}
+
+	for _, testCase := range tests {
+		tc := testCase
+
+		t.Run(tc.name, func(t *testing.T) {
+			branch, err := DecodeTapBranchNodes(tc.branchData)
+
+			if tc.valid {
+				require.NoError(t, err)
+			} else {
+				require.Error(t, err)
+				return
+			}
+
+			branchBytes := EncodeTapBranchNodes(*branch)
+			require.Equal(t, tc.branchData, branchBytes)
+		})
+	}
+}
+
+// TestTapLeafSanity assserts that we reject tapLeafs that fail our sanity
+// checks, and accept valid tapLeafs.
+func TestTapLeafSanity(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		leaf *txscript.TapLeaf
+		sane bool
+	}{
+		{
+			name: "nil leaf",
+			leaf: nil,
+			sane: false,
+		},
+		{
+			name: "unsupported version",
+			leaf: fn.Ptr(txscript.NewTapLeaf(
+				unsupportedTapLeafVersion, testTapLeafScript,
+			)),
+			sane: false,
+		},
+		{
+			name: "empty script",
+			leaf: fn.Ptr(txscript.NewBaseTapLeaf([]byte{})),
+			sane: false,
+		},
+		{
+			name: "large leaf script",
+			leaf: fn.Ptr(txscript.NewBaseTapLeaf(
+				test.RandBytes(blockchain.MaxBlockWeight),
+			)),
+			sane: false,
+		},
+		{
+			name: "valid tapleaf",
+			leaf: fn.Ptr(
+				txscript.NewBaseTapLeaf(testTapLeafScript),
+			),
+			sane: true,
+		},
+	}
+
+	for _, testCase := range tests {
+		tc := testCase
+
+		t.Run(tc.name, func(t *testing.T) {
+			err := CheckTapLeafSanity(tc.leaf)
+			if tc.sane {
+				require.NoError(t, err)
+			} else {
+				require.Error(t, err)
+			}
+		})
+	}
 }
 
 // TestAssetIsBurn asserts that the IsBurn method is correct.
@@ -601,144 +729,7 @@ func TestAssetID(t *testing.T) {
 	require.NotEqual(t, id[:], differentID[:])
 }
 
-// TestAssetGroupKey tests that the asset key group is derived correctly.
-func TestAssetGroupKey(t *testing.T) {
-	t.Parallel()
-
-	privKey, err := btcec.NewPrivateKey()
-	groupPub := privKey.PubKey()
-	require.NoError(t, err)
-	privKeyCopy := btcec.PrivKeyFromScalar(&privKey.Key)
-	genSigner := NewMockGenesisSigner(privKeyCopy)
-	genBuilder := MockGroupTxBuilder{}
-	fakeKeyDesc := test.PubToKeyDesc(groupPub)
-	fakeScriptKey := NewScriptKeyBip86(fakeKeyDesc)
-
-	g := Genesis{
-		FirstPrevOut: wire.OutPoint{
-			Hash:  hashBytes1,
-			Index: 99,
-		},
-		Tag:         "normal asset 1",
-		MetaHash:    [MetaHashLen]byte{1, 2, 3},
-		OutputIndex: 21,
-		Type:        Collectible,
-	}
-	groupTweak := g.ID()
-
-	internalKey := input.TweakPrivKey(privKeyCopy, groupTweak[:])
-	tweakedKey := txscript.TweakTaprootPrivKey(*internalKey, nil)
-
-	// TweakTaprootPrivKey modifies the private key that is passed in! We
-	// need to provide a copy to arrive at the same result.
-	protoAsset := NewAssetNoErr(t, g, 1, 0, 0, fakeScriptKey, nil)
-	groupReq := NewGroupKeyRequestNoErr(t, fakeKeyDesc, g, protoAsset, nil)
-	keyGroup, err := DeriveGroupKey(genSigner, &genBuilder, *groupReq)
-	require.NoError(t, err)
-
-	require.Equal(
-		t, schnorr.SerializePubKey(tweakedKey.PubKey()),
-		schnorr.SerializePubKey(&keyGroup.GroupPubKey),
-	)
-
-	// We should also be able to reproduce the correct tweak with a non-nil
-	// tapscript root.
-	tapTweak := test.RandBytes(32)
-	tweakedKey = txscript.TweakTaprootPrivKey(*internalKey, tapTweak)
-
-	groupReq = NewGroupKeyRequestNoErr(
-		t, test.PubToKeyDesc(privKey.PubKey()), g, protoAsset, tapTweak,
-	)
-	keyGroup, err = DeriveCustomGroupKey(
-		genSigner, &genBuilder, *groupReq, nil, nil,
-	)
-	require.NoError(t, err)
-
-	require.Equal(
-		t, schnorr.SerializePubKey(tweakedKey.PubKey()),
-		schnorr.SerializePubKey(&keyGroup.GroupPubKey),
-	)
-
-	// Group key tweaking should fail when given invalid tweaks.
-	badTweak := test.RandBytes(33)
-	_, err = GroupPubKey(groupPub, badTweak, badTweak)
-	require.Error(t, err)
-
-	_, err = GroupPubKey(groupPub, groupTweak[:], badTweak)
-	require.Error(t, err)
-}
-
-// TestDeriveGroupKey tests that group key derivation fails for assets that are
-// not eligible to be group anchors.
-func TestDeriveGroupKey(t *testing.T) {
-	t.Parallel()
-
-	groupPriv := test.RandPrivKey(t)
-	groupPub := groupPriv.PubKey()
-	groupKeyDesc := test.PubToKeyDesc(groupPub)
-	genSigner := NewMockGenesisSigner(groupPriv)
-	genBuilder := MockGroupTxBuilder{}
-
-	baseGen := RandGenesis(t, Normal)
-	collectGen := RandGenesis(t, Collectible)
-	baseScriptKey := RandScriptKey(t)
-	protoAsset := RandAssetWithValues(t, baseGen, nil, baseScriptKey)
-	nonGenProtoAsset := protoAsset.Copy()
-	nonGenProtoAsset.PrevWitnesses = []Witness{{
-		PrevID: &PrevID{
-			OutPoint: wire.OutPoint{
-				Hash:  hashBytes1,
-				Index: 1,
-			},
-			ID:        hashBytes1,
-			ScriptKey: ToSerialized(pubKey),
-		},
-		TxWitness:       sigWitness,
-		SplitCommitment: nil,
-	}}
-	groupedProtoAsset := protoAsset.Copy()
-	groupedProtoAsset.GroupKey = &GroupKey{
-		GroupPubKey: *groupPub,
-	}
-	groupReq := GroupKeyRequest{
-		RawKey:    groupKeyDesc,
-		AnchorGen: baseGen,
-	}
-
-	// A prototype asset is required for building the genesis virtual TX.
-	_, err := DeriveGroupKey(genSigner, &genBuilder, groupReq)
-	require.ErrorContains(t, err, "grouped asset cannot be nil")
-
-	// The prototype asset must have a genesis witness.
-	groupReq.NewAsset = nonGenProtoAsset
-	_, err = DeriveGroupKey(genSigner, &genBuilder, groupReq)
-	require.ErrorContains(t, err, "asset is not a genesis asset")
-
-	// The prototype asset must not have a group key set.
-	groupReq.NewAsset = groupedProtoAsset
-	_, err = DeriveGroupKey(genSigner, &genBuilder, groupReq)
-	require.ErrorContains(t, err, "asset already has group key")
-
-	// The anchor genesis used for signing must have the same asset type
-	// as the prototype asset being signed.
-	groupReq.AnchorGen = collectGen
-	groupReq.NewAsset = protoAsset
-	_, err = DeriveGroupKey(genSigner, &genBuilder, groupReq)
-	require.ErrorContains(t, err, "asset group type mismatch")
-
-	// The group key request must include an internal key.
-	groupReq.AnchorGen = baseGen
-	groupReq.RawKey.PubKey = nil
-	_, err = DeriveGroupKey(genSigner, &genBuilder, groupReq)
-	require.ErrorContains(t, err, "missing group internal key")
-
-	groupReq.RawKey = groupKeyDesc
-	groupKey, err := DeriveGroupKey(genSigner, &genBuilder, groupReq)
-	require.NoError(t, err)
-	require.NotNil(t, groupKey)
-}
-
-// TestAssetWitness tests that the asset group witness can be serialized and
+// TestAssetWitnesses tests that the asset group witness can be serialized and
 // parsed correctly, and that signature detection works correctly.
 func TestAssetWitnesses(t *testing.T) {
 	t.Parallel()
@@ -887,6 +878,24 @@ func runBIPTestVector(t *testing.T, testVectors *TestVectors) {
 				buf.Bytes(),
 			)
 
+			// Make sure the asset in the test vectors doesn't use
+			// a record type we haven't marked as known/supported
+			// yet. If the following check fails, you need to update
+			// the KnownAssetLeafTypes set.
+			for _, record := range a.encodeRecords(EncodeNormal) {
+				// Test vectors may contain this one type to
+				// demonstrate that it is not rejected.
+				if record.Type() ==
+					test.TestVectorAllowedUnknownType {
+
+					continue
+				}
+
+				require.Contains(
+					tt, KnownAssetLeafTypes, record.Type(),
+				)
+			}
+
 			// Create nice diff if things don't match.
 			if !areEqual {
 				expectedBytes, err := hex.DecodeString(
@@ -981,4 +990,260 @@ func TestNewAssetWithCustomVersion(t *testing.T) {
 	require.NoError(t, err)
 
 	require.Equal(t, int(assetCustomVersion.Version), newVersion)
+}
+
+// TestCopySpendTemplate tests that the spend template is copied correctly.
+func TestCopySpendTemplate(t *testing.T) {
+	newAsset := RandAsset(t, Normal)
+	newAsset.SplitCommitmentRoot = mssmt.NewComputedNode(hashBytes1, 1337)
+	newAsset.RelativeLockTime = 1
+	newAsset.LockTime = 2
+
+	// The template should have the relevant set of fields blanked.
+	spendTemplate := newAsset.CopySpendTemplate()
+	require.Zero(t, spendTemplate.SplitCommitmentRoot)
+	require.Zero(t, spendTemplate.RelativeLockTime)
+	require.Zero(t, spendTemplate.LockTime)
+
+	// If blank these fields of the OG asset, then things should be
+	// identical.
+	newAsset.SplitCommitmentRoot = nil
+	newAsset.RelativeLockTime = 0
+	newAsset.LockTime = 0
+
+	require.True(t, newAsset.DeepEqual(spendTemplate))
+}
+
+// TestExternalKeyPubKey tests that the public key can be derived from an
+// external key.
+func TestExternalKeyPubKey(t *testing.T) {
+	t.Parallel()
+
+	dummyXPub := func() hdkeychain.ExtendedKey {
+		xpubStr := "xpub6BynCcnXLYNnnMUZARkHxbP9pG6h5rES8Zb8aHtGwmFX" +
+			"9DdjJiyT9PNwkSMZfS3CvGRpvV21SkLRM6xhtshvA3DnJbQsvjD" +
+			"yySWGArynQNf"
+		xpub, err := hdkeychain.NewKeyFromString(xpubStr)
+		require.NoError(t, err, "failed to create xpub from string")
+		return *xpub
+	}
+
+	dummyXPubTestnet := func() hdkeychain.ExtendedKey {
+		xpubStr := "tpubDDfTBtwwqxXuCej7pKYfbXeCW3inAtv1cw4knmvYTTHk" +
+			"w3NoKaeCNH5XdY6n6fnBPc1gWEgeurfmBVzJLfBB1hGU64LsHFz" +
+			"Jv4ASqaHyALH"
+		xpub, err := hdkeychain.NewKeyFromString(xpubStr)
+		require.NoError(t, err, "failed to create xpub from string")
+		return *xpub
+	}
+
+	testCases := []struct {
+		name           string
+		externalKey    ExternalKey
+		expectedPubKey string
+		expectError    bool
+		expectedError  string
+	}{
+		{
+			name: "valid BIP-86 external key",
+			externalKey: ExternalKey{
+				XPub:              dummyXPub(),
+				MasterFingerprint: 0x12345678,
+				DerivationPath: []uint32{
+					86 + hdkeychain.HardenedKeyStart,
+					0 + hdkeychain.HardenedKeyStart,
+					0 + hdkeychain.HardenedKeyStart, 0, 0,
+				},
+			},
+			expectError: false,
+
+			// The pubkey was generated with "chantools derivekey
+			// --rootkey xpub... --path "m/0/0" --neuter" command.
+			expectedPubKey: "02c0ca6c5d4dc4899de975f17f1023e424a" +
+				"93a7ba6339cbaf514689f75d51787cc",
+		},
+		{
+			name: "invalid derivation path length",
+			externalKey: ExternalKey{
+				XPub:              dummyXPub(),
+				MasterFingerprint: 0x12345678,
+				DerivationPath: []uint32{
+					86 + hdkeychain.HardenedKeyStart,
+					0 + hdkeychain.HardenedKeyStart,
+					0 + hdkeychain.HardenedKeyStart,
+				},
+			},
+			expectError: true,
+			expectedError: "derivation path must have exactly 5 " +
+				"components",
+		},
+		{
+			name: "invalid BIP-86 derivation path",
+			externalKey: ExternalKey{
+				XPub:              dummyXPub(),
+				MasterFingerprint: 0x12345678,
+				DerivationPath: []uint32{
+					44 + hdkeychain.HardenedKeyStart,
+					0 + hdkeychain.HardenedKeyStart,
+					0 + hdkeychain.HardenedKeyStart, 0, 0,
+				},
+			},
+			expectError: true,
+			expectedError: "xpub must be derived from BIP-0086 " +
+				"(Taproot) derivation path",
+		},
+		{
+			name: "valid BIP-86 external key, custom coin_type",
+			externalKey: ExternalKey{
+				XPub:              dummyXPub(),
+				MasterFingerprint: 0x12345678,
+				DerivationPath: []uint32{
+					86 + hdkeychain.HardenedKeyStart,
+					42 + hdkeychain.HardenedKeyStart,
+					0 + hdkeychain.HardenedKeyStart, 0, 0,
+				},
+			},
+			expectError: false,
+
+			// The pubkey was generated with "chantools derivekey
+			// --rootkey xpub... --path m/0/0 --neuter" command.
+			expectedPubKey: "02c0ca6c5d4dc4899de975f17f1023e424a" +
+				"93a7ba6339cbaf514689f75d51787cc",
+		},
+		{
+			name: "valid BIP-86 external key, custom account",
+			externalKey: ExternalKey{
+				XPub:              dummyXPub(),
+				MasterFingerprint: 0x12345678,
+				DerivationPath: []uint32{
+					86 + hdkeychain.HardenedKeyStart,
+					0 + hdkeychain.HardenedKeyStart,
+					42 + hdkeychain.HardenedKeyStart, 0, 0,
+				},
+			},
+			expectError: false,
+
+			// The pubkey was generated with "chantools derivekey
+			// --rootkey xpub... --path m/0/0 --neuter" command.
+			expectedPubKey: "02c0ca6c5d4dc4899de975f17f1023e424a" +
+				"93a7ba6339cbaf514689f75d51787cc",
+		},
+		{
+			name: "valid BIP-86 external key, change output",
+			externalKey: ExternalKey{
+				XPub:              dummyXPub(),
+				MasterFingerprint: 0x12345678,
+				DerivationPath: []uint32{
+					86 + hdkeychain.HardenedKeyStart,
+					0 + hdkeychain.HardenedKeyStart,
+					0 + hdkeychain.HardenedKeyStart, 1, 0,
+				},
+			},
+			expectError: false,
+
+			// The pubkey was generated with "chantools derivekey
+			// --rootkey xpub... --path m/1/0 --neuter" command.
+			expectedPubKey: "02ce0e73519634aaf1a34cc17afb517a697" +
+				"95c063386030f1b1b724410a84aa709",
+		},
+		{
+			name: "valid BIP-86 external key, change=2",
+			externalKey: ExternalKey{
+				XPub:              dummyXPub(),
+				MasterFingerprint: 0x12345678,
+				DerivationPath: []uint32{
+					86 + hdkeychain.HardenedKeyStart,
+					0 + hdkeychain.HardenedKeyStart,
+					0 + hdkeychain.HardenedKeyStart, 2, 0,
+				},
+			},
+			expectError: false,
+
+			// The pubkey was generated with "chantools derivekey
+			// --rootkey xpub... --path m/2/0 --neuter" command.
+			expectedPubKey: "0278b9669141d21f0598cc44a427c5d03a3" +
+				"5d6aaed5555931a99a1659dfea4ebcf",
+		},
+		{
+			name: "valid BIP-86 external key, index=2",
+			externalKey: ExternalKey{
+				XPub:              dummyXPub(),
+				MasterFingerprint: 0x12345678,
+				DerivationPath: []uint32{
+					86 + hdkeychain.HardenedKeyStart,
+					0 + hdkeychain.HardenedKeyStart,
+					0 + hdkeychain.HardenedKeyStart, 0, 2,
+				},
+			},
+			expectError: false,
+
+			// The pubkey was generated with "chantools derivekey
+			// --rootkey xpub... --path "m/0/2" --neuter" command.
+			expectedPubKey: "0375e49d472c25d1138a5526b9b7a0198e1" +
+				"d692cc3fd0133f260aca446e1244ff9",
+		},
+		{
+			name: "valid BIP-86 external key, testnet",
+			externalKey: ExternalKey{
+				XPub:              dummyXPubTestnet(),
+				MasterFingerprint: 0x12345678,
+				DerivationPath: []uint32{
+					86 + hdkeychain.HardenedKeyStart,
+					1 + hdkeychain.HardenedKeyStart,
+					0 + hdkeychain.HardenedKeyStart, 0, 0,
+				},
+			},
+			expectError: false,
+
+			// The pubkey was generated with "chantools derivekey
+			// --testnet --rootkey xpub... --path "m/0/0" --neuter".
+			expectedPubKey: "0280a3fcbeb7f770af6dd45cb0f4d02e104" +
+				"4eafe0d8b05bcaec79dc0478c7fa0da",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(tt *testing.T) {
+			pubKey, err := tc.externalKey.PubKey()
+
+			if tc.expectError {
+				require.Error(tt, err, tc.name)
+				if tc.expectedError != "" {
+					require.Contains(
+						tt, err.Error(),
+						tc.expectedError,
+					)
+				}
+
+				return
+			}
+
+			require.NoError(tt, err)
+			require.IsType(tt, btcec.PublicKey{}, pubKey)
+			pubKeyHex := hex.EncodeToString(
+				pubKey.SerializeCompressed(),
+			)
+			require.Equal(tt, tc.expectedPubKey, pubKeyHex)
+		})
+	}
+}
+
+// TestDecodeAsset tests that we can decode an asset from a hex file. This is
+// mostly useful for debugging purposes.
+func TestDecodeAsset(t *testing.T) {
+	fileContent, err := os.ReadFile(assetHexFileName)
+	require.NoError(t, err)
+
+	assetBytes, err := hex.DecodeString(string(fileContent))
+	require.NoError(t, err)
+
+	var a Asset
+	err = a.Decode(bytes.NewReader(assetBytes))
+	require.NoError(t, err)
+
+	ta := NewTestFromAsset(t, &a)
+	assetJSON, err := json.MarshalIndent(ta, "", "\t")
+	require.NoError(t, err)
+
+	t.Logf("Decoded asset: %v", string(assetJSON))
 }

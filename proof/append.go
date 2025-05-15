@@ -31,6 +31,10 @@ type TransitionParams struct {
 	// RootTaprootAssetTree is the commitment root that commitments to the
 	// inclusion of the root split asset at the RootOutputIndex.
 	RootTaprootAssetTree *commitment.TapCommitment
+
+	// RootTapscriptSibling is the tapscript sibling of the output at
+	// commits to the asset split root.
+	RootTapscriptSibling *commitment.TapscriptPreimage
 }
 
 // AppendTransition appends a new proof for a state transition to the given
@@ -39,8 +43,7 @@ type TransitionParams struct {
 // the proof for. This method returns both the encoded full provenance (proof
 // chain) and the added latest proof.
 func AppendTransition(blob Blob, params *TransitionParams,
-	headerVerifier HeaderVerifier, groupVerifier GroupVerifier) (Blob,
-	*Proof, error) {
+	vCtx VerifierCtx) (Blob, *Proof, error) {
 
 	// Decode the proof blob into a proper file structure first.
 	f := NewEmptyFile(V0)
@@ -78,7 +81,9 @@ func AppendTransition(blob Blob, params *TransitionParams,
 	if err := f.AppendProof(*newProof); err != nil {
 		return nil, nil, fmt.Errorf("error appending proof: %w", err)
 	}
-	if _, err := f.Verify(ctx, headerVerifier, groupVerifier); err != nil {
+
+	_, err = f.Verify(ctx, vCtx)
+	if err != nil {
 		return nil, nil, fmt.Errorf("error verifying proof: %w", err)
 	}
 
@@ -127,6 +132,16 @@ func CreateTransitionProof(prevOut wire.OutPoint,
 
 	proof.Asset = *params.NewAsset.Copy()
 
+	// Copy any AltLeaves from the anchor commitment to the proof.
+	altLeaves, err := params.TaprootAssetRoot.FetchAltLeaves()
+	if err != nil {
+		return nil, err
+	}
+
+	if len(altLeaves) > 0 {
+		proof.AltLeaves = asset.ToAltLeaves(altLeaves)
+	}
+
 	// With the base information contained, we'll now need to generate our
 	// series of MS-SMT inclusion proofs that prove the existence of the
 	// asset.
@@ -166,7 +181,13 @@ func CreateTransitionProof(prevOut wire.OutPoint,
 		}
 
 		// Make sure the committed asset matches the root asset exactly.
-		if !committedRoot.DeepEqual(rootAsset) {
+		// We allow the TxWitness to mismatch for assets with version 1
+		// as they would not include the witness when the proof is
+		// created.
+		if !committedRoot.DeepEqualAllowSegWitIgnoreTxWitness(
+			rootAsset,
+		) {
+
 			return nil, fmt.Errorf("root asset mismatch")
 		}
 
@@ -174,7 +195,8 @@ func CreateTransitionProof(prevOut wire.OutPoint,
 			OutputIndex: params.RootOutputIndex,
 			InternalKey: params.RootInternalKey,
 			CommitmentProof: &CommitmentProof{
-				Proof: *rootMerkleProof,
+				Proof:              *rootMerkleProof,
+				TapSiblingPreimage: params.RootTapscriptSibling,
 			},
 		}
 	}

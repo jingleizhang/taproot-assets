@@ -10,8 +10,40 @@ var testCases = []*testCase{
 		test: testMintAssets,
 	},
 	{
+		name: "mint batch resume",
+		test: testMintBatchResume,
+	},
+	{
+		name: "mint batch and transfer",
+		test: testMintBatchAndTransfer,
+	},
+	{
+		name: "asset balances",
+		test: testAssetBalances,
+	},
+	{
+		name: "asset meta validation",
+		test: testAssetMeta,
+	},
+	{
 		name: "asset name collision raises mint error",
 		test: testMintAssetNameCollisionError,
+	},
+	{
+		name: "mint assets with tap sibling",
+		test: testMintAssetsWithTapscriptSibling,
+	},
+	{
+		name: "mint fund seal assets",
+		test: testMintFundSealAssets,
+	},
+	{
+		name: "mint external group key chantools",
+		test: testMintExternalGroupKeyChantools,
+	},
+	{
+		name: "mint asset decimal display",
+		test: testMintAssetWithDecimalDisplayMetaField,
 	},
 	{
 		name: "addresses",
@@ -20,6 +52,10 @@ var testCases = []*testCase{
 	{
 		name: "multi address",
 		test: testMultiAddress,
+	},
+	{
+		name: "unknown TLV type",
+		test: testUnknownTlvType,
 	},
 	{
 		name: "address syncer",
@@ -41,7 +77,7 @@ var testCases = []*testCase{
 		test: testReOrgMintAndSend,
 	},
 	{
-		name:             "basic send unidirectional",
+		name:             "basic send unidirectional hashmail courier",
 		test:             testBasicSendUnidirectional,
 		proofCourierType: proof.HashmailCourierType,
 	},
@@ -50,11 +86,16 @@ var testCases = []*testCase{
 		test: testBasicSendUnidirectional,
 	},
 	{
+		name: "min relay fee bump",
+		test: testMinRelayFeeBump,
+	},
+	{
 		name: "restart receiver check balance",
 		test: testRestartReceiverCheckBalance,
 	},
 	{
-		name:             "resume pending package send",
+		name: "resume pending package send hashmail " +
+			"courier",
 		test:             testResumePendingPackageSend,
 		proofCourierType: proof.HashmailCourierType,
 	},
@@ -68,11 +109,20 @@ var testCases = []*testCase{
 		test: testReattemptFailedSendUniCourier,
 	},
 	{
+		name: "reattempt proof transfer on tapd restart",
+		test: testReattemptProofTransferOnTapdRestart,
+	},
+	{
+		name: "spend change output when proof transfer fail",
+		test: testSpendChangeOutputWhenProofTransferFail,
+	},
+	{
 		name: "reattempt failed receive uni courier",
 		test: testReattemptFailedReceiveUniCourier,
 	},
 	{
-		name:             "offline receiver eventually receives",
+		name: "offline receiver eventually receives " +
+			"hashmail courier",
 		test:             testOfflineReceiverEventuallyReceives,
 		proofCourierType: proof.HashmailCourierType,
 	},
@@ -81,7 +131,7 @@ var testCases = []*testCase{
 		test: testSendNoCourierUniverseImport,
 	},
 	{
-		name:             "basic send passive asset",
+		name:             "basic send passive asset hashmail courier",
 		test:             testBasicSendPassiveAsset,
 		proofCourierType: proof.HashmailCourierType,
 	},
@@ -123,7 +173,7 @@ var testCases = []*testCase{
 		test: testMintMultiAssetGroups,
 	},
 	{
-		name:             "sending multi asset groups",
+		name:             "sending multi asset groups hashmail courier",
 		test:             testMultiAssetGroupSend,
 		proofCourierType: proof.HashmailCourierType,
 	},
@@ -152,8 +202,24 @@ var testCases = []*testCase{
 		test: testPsbtNormalInteractiveFullValueSend,
 	},
 	{
+		name: "psbt multi version send",
+		test: testPsbtMultiVersionSend,
+	},
+	{
 		name: "psbt grouped interactive full value send",
 		test: testPsbtGroupedInteractiveFullValueSend,
+	},
+	{
+		name: "psbt relative lock time send",
+		test: testPsbtRelativeLockTimeSend,
+	},
+	{
+		name: "psbt lock time send",
+		test: testPsbtLockTimeSend,
+	},
+	{
+		name: "psbt relative lock time send with proof failure",
+		test: testPsbtRelativeLockTimeSendProofFail,
 	},
 	{
 		name: "psbt normal interactive split send",
@@ -172,8 +238,28 @@ var testCases = []*testCase{
 		test: testPsbtMultiSend,
 	},
 	{
+		name: "psbt sighash none",
+		test: testPsbtSighashNone,
+	},
+	{
+		name: "psbt sighash none invalid",
+		test: testPsbtSighashNoneInvalid,
+	},
+	{
+		name: "psbt trustless swap",
+		test: testPsbtTrustlessSwap,
+	},
+	{
+		name: "psbt external commit",
+		test: testPsbtExternalCommit,
+	},
+	{
 		name: "multi input psbt single asset id",
 		test: testMultiInputPsbtSingleAssetID,
+	},
+	{
+		name: "psbt alt leaf anchoring",
+		test: testPsbtInteractiveAltLeafAnchoring,
 	},
 	{
 		name: "universe REST API",
@@ -218,6 +304,40 @@ var testCases = []*testCase{
 	{
 		name: "mint proof repeat fed sync attempt",
 		test: testMintProofRepeatFedSyncAttempt,
+	},
+
+	// Request for quote (RFQ) tests.
+	{
+		name: "rfq asset buy htlc intercept",
+		test: testRfqAssetBuyHtlcIntercept,
+	},
+	{
+		name: "rfq asset sell htlc intercept",
+		test: testRfqAssetSellHtlcIntercept,
+	},
+	{
+		name: "rfq negotiation group key",
+		test: testRfqNegotiationGroupKey,
+	},
+	{
+		name: "multi signature on all levels",
+		test: testMultiSignature,
+	},
+	{
+		name: "anchor multiple virtual transactions",
+		test: testAnchorMultipleVirtualTransactions,
+	},
+	{
+		name: "channel RPCs",
+		test: testChannelRPCs,
+	},
+	{
+		name: "ownership verification",
+		test: testOwnershipVerification,
+	},
+	{
+		name: "asset signing after lnd restore from seed",
+		test: testRestoreLndFromSeed,
 	},
 }
 

@@ -19,6 +19,7 @@ import (
 	"github.com/lightningnetwork/lnd/lntest"
 	"github.com/lightningnetwork/lnd/lntest/node"
 	"github.com/lightningnetwork/lnd/lntest/wait"
+	"github.com/lightningnetwork/lnd/lntypes"
 	"github.com/lightningnetwork/lnd/lnwallet/chainfee"
 	"github.com/stretchr/testify/require"
 )
@@ -29,7 +30,7 @@ func testRoundTripSend(t *harnessTest) {
 	// First, we'll make a normal assets with enough units to allow us to
 	// send it around a few times.
 	rpcAssets := MintAssetsConfirmBatch(
-		t.t, t.lndHarness.Miner.Client, t.tapd,
+		t.t, t.lndHarness.Miner().Client, t.tapd,
 		[]*mintrpc.MintAssetRequest{simpleAssets[0]},
 	)
 
@@ -39,9 +40,8 @@ func testRoundTripSend(t *harnessTest) {
 
 	// Now that we have the asset created, we'll make a new node that'll
 	// serve as the node which'll receive the assets.
-	secondTapd := setupTapdHarness(
-		t.t, t, t.lndHarness.Bob, t.universeServer,
-	)
+	bobLnd := t.lndHarness.NewNodeWithCoins("Bob", nil)
+	secondTapd := setupTapdHarness(t.t, t, bobLnd, t.universeServer)
 	defer func() {
 		require.NoError(t.t, secondTapd.stop(!*noDelete))
 	}()
@@ -54,7 +54,8 @@ func testRoundTripSend(t *harnessTest) {
 
 	hashLockPreimage := []byte("hash locks are cool")
 	scriptLeaf := test.ScriptHashLock(t.t, hashLockPreimage)
-	sibling := commitment.NewPreimageFromLeaf(scriptLeaf)
+	sibling, err := commitment.NewPreimageFromLeaf(scriptLeaf)
+	require.NoError(t.t, err)
 	siblingBytes, _, err := commitment.MaybeEncodeTapscriptPreimage(sibling)
 	require.NoError(t.t, err)
 
@@ -67,13 +68,13 @@ func testRoundTripSend(t *harnessTest) {
 	require.NoError(t.t, err)
 
 	AssertAddrCreated(t.t, secondTapd, rpcAssets[0], bobAddr)
-	sendResp := sendAssetsToAddr(t, t.tapd, bobAddr)
+	sendResp, _ := sendAssetsToAddr(t, t.tapd, bobAddr)
 	sendRespJSON, err := formatProtoJSON(sendResp)
 	require.NoError(t.t, err)
 	t.Logf("Got response from sending assets: %v", sendRespJSON)
 
 	ConfirmAndAssertOutboundTransfer(
-		t.t, t.lndHarness.Miner.Client, t.tapd, sendResp,
+		t.t, t.lndHarness.Miner().Client, t.tapd, sendResp,
 		genInfo.AssetId, []uint64{bobAmt, bobAmt}, 0, 1,
 	)
 	AssertNonInteractiveRecvComplete(t.t, secondTapd, 1)
@@ -87,13 +88,13 @@ func testRoundTripSend(t *harnessTest) {
 	require.NoError(t.t, err)
 
 	AssertAddrCreated(t.t, t.tapd, rpcAssets[0], aliceAddr)
-	sendResp = sendAssetsToAddr(t, secondTapd, aliceAddr)
+	sendResp, _ = sendAssetsToAddr(t, secondTapd, aliceAddr)
 	sendRespJSON, err = formatProtoJSON(sendResp)
 	require.NoError(t.t, err)
 	t.Logf("Got response from sending assets: %v", sendRespJSON)
 
 	ConfirmAndAssertOutboundTransfer(
-		t.t, t.lndHarness.Miner.Client, secondTapd,
+		t.t, t.lndHarness.Miner().Client, secondTapd,
 		sendResp, genInfo.AssetId, []uint64{aliceAmt, aliceAmt}, 0, 1,
 	)
 	AssertNonInteractiveRecvComplete(t.t, t.tapd, 1)
@@ -127,7 +128,7 @@ func testRoundTripSend(t *harnessTest) {
 	// recipient's output is the second one.
 	bobToAliceOutput := transferResp.Transfers[0].Outputs[1]
 	bobToAliceAnchor := bobToAliceOutput.Anchor
-	outpoint, err := ParseOutPoint(bobToAliceAnchor.Outpoint)
+	outpoint, err := wire.NewOutPointFromString(bobToAliceAnchor.Outpoint)
 	require.NoError(t.t, err)
 
 	internalKey, err := btcec.ParsePubKey(bobToAliceAnchor.InternalKey)
@@ -142,7 +143,7 @@ func testRoundTripSend(t *harnessTest) {
 
 	// Spend the output again, this time back to a p2wkh address.
 	_, p2wkhPkScript := newAddrWithScript(
-		t.lndHarness, t.lndHarness.Alice,
+		t.lndHarness, t.tapd.cfg.LndNode,
 		lnrpc.AddressType_WITNESS_PUBKEY_HASH,
 	)
 
@@ -154,10 +155,12 @@ func testRoundTripSend(t *harnessTest) {
 	// control block. The control block will be weighted by the passed
 	// tapscript, so we only need to add the length of the other two items.
 	estimator.AddTapscriptInput(
-		len(hashLockPreimage)+len(scriptLeaf.Script)+1, tapscript,
+		lntypes.WeightUnit(
+			len(hashLockPreimage)+len(scriptLeaf.Script)+1,
+		), tapscript,
 	)
 	estimator.AddP2WKHOutput()
-	estimatedWeight := int64(estimator.Weight())
+	estimatedWeight := estimator.Weight()
 	requiredFee := feeRate.FeeForWeight(estimatedWeight)
 
 	tx := wire.NewMsgTx(2)
@@ -183,16 +186,16 @@ func testRoundTripSend(t *harnessTest) {
 	var buf bytes.Buffer
 	err = tx.Serialize(&buf)
 	require.NoError(t.t, err)
-	t.lndHarness.Alice.RPC.PublishTransaction(&walletrpc.Transaction{
+	t.tapd.cfg.LndNode.RPC.PublishTransaction(&walletrpc.Transaction{
 		TxHex: buf.Bytes(),
 	})
 
 	// Mine one block which should contain the sweep transaction.
 	block := t.lndHarness.MineBlocksAndAssertNumTxes(1, 1)[0]
 	sweepTxHash := tx.TxHash()
-	t.lndHarness.Miner.AssertTxInBlock(block, &sweepTxHash)
+	t.lndHarness.Miner().AssertTxInBlock(block, sweepTxHash)
 
-	unspent := t.lndHarness.Alice.RPC.ListUnspent(
+	unspent := t.tapd.cfg.LndNode.RPC.ListUnspent(
 		&walletrpc.ListUnspentRequest{
 			MinConfs: 1,
 		},

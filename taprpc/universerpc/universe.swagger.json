@@ -691,7 +691,7 @@
             "in": "body",
             "required": true,
             "schema": {
-              "$ref": "#/definitions/universerpcAssetProof"
+              "$ref": "#/definitions/UniverseInsertProofBody"
             }
           }
         ],
@@ -853,7 +853,129 @@
             "in": "body",
             "required": true,
             "schema": {
-              "$ref": "#/definitions/universerpcAssetProof"
+              "$ref": "#/definitions/UniverseInsertProofBody"
+            }
+          }
+        ],
+        "tags": [
+          "Universe"
+        ]
+      }
+    },
+    "/v1/taproot-assets/universe/proofs/push/asset-id/{key.id.asset_id_str}/{key.leaf_key.op.hash_str}/{key.leaf_key.op.index}/{key.leaf_key.script_key_str}": {
+      "post": {
+        "summary": "tapcli: `universe proofs push`\nPushProof attempts to query the local universe for a proof specified by a\nUniverseKey. If found, a connection is made to a remote Universe server to\nattempt to upload the asset leaf.",
+        "operationId": "Universe_PushProof",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/universerpcPushProofResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "key.id.asset_id_str",
+            "description": "The 32-byte asset ID encoded as a hex string (use this for REST).",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "key.leaf_key.op.hash_str",
+            "description": "The output as a hex encoded (and reversed!) string.",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "key.leaf_key.op.index",
+            "description": "The index of the output.",
+            "in": "path",
+            "required": true,
+            "type": "integer",
+            "format": "int32"
+          },
+          {
+            "name": "key.leaf_key.script_key_str",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/UniversePushProofBody"
+            }
+          }
+        ],
+        "tags": [
+          "Universe"
+        ]
+      }
+    },
+    "/v1/taproot-assets/universe/proofs/push/group-key/{key.id.group_key_str}/{key.leaf_key.op.hash_str}/{key.leaf_key.op.index}/{key.leaf_key.script_key_str}": {
+      "post": {
+        "summary": "tapcli: `universe proofs push`\nPushProof attempts to query the local universe for a proof specified by a\nUniverseKey. If found, a connection is made to a remote Universe server to\nattempt to upload the asset leaf.",
+        "operationId": "Universe_PushProof2",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/universerpcPushProofResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "key.id.group_key_str",
+            "description": "The 32-byte asset group key encoded as hex string (use this for\nREST).",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "key.leaf_key.op.hash_str",
+            "description": "The output as a hex encoded (and reversed!) string.",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "key.leaf_key.op.index",
+            "description": "The index of the output.",
+            "in": "path",
+            "required": true,
+            "type": "integer",
+            "format": "int32"
+          },
+          {
+            "name": "key.leaf_key.script_key_str",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/UniversePushProofBody"
             }
           }
         ],
@@ -1299,17 +1421,128 @@
     }
   },
   "definitions": {
+    "UniverseInsertProofBody": {
+      "type": "object",
+      "properties": {
+        "key": {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "object",
+              "properties": {
+                "asset_id": {
+                  "type": "string",
+                  "format": "byte",
+                  "description": "The 32-byte asset ID specified as raw bytes (gRPC only)."
+                },
+                "asset_id_str": {
+                  "type": "string",
+                  "description": "The 32-byte asset ID encoded as a hex string (use this for REST)."
+                },
+                "group_key": {
+                  "type": "string",
+                  "format": "byte",
+                  "description": "The 32-byte asset group key specified as raw bytes (gRPC only)."
+                },
+                "proof_type": {
+                  "$ref": "#/definitions/universerpcProofType"
+                }
+              },
+              "description": "The ID of the asset to query for.",
+              "title": "The ID of the asset to query for."
+            },
+            "leaf_key": {
+              "type": "object",
+              "properties": {
+                "op_str": {
+                  "type": "string"
+                },
+                "op": {
+                  "type": "object"
+                },
+                "script_key_bytes": {
+                  "type": "string",
+                  "format": "byte"
+                }
+              },
+              "description": "The asset key to query for.",
+              "title": "The asset key to query for."
+            }
+          },
+          "description": "The ID of the asset to insert the proof for.",
+          "title": "The ID of the asset to insert the proof for."
+        },
+        "asset_leaf": {
+          "$ref": "#/definitions/universerpcAssetLeaf",
+          "description": "The asset leaf to insert into the Universe tree."
+        }
+      }
+    },
+    "UniversePushProofBody": {
+      "type": "object",
+      "properties": {
+        "key": {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "object",
+              "properties": {
+                "asset_id": {
+                  "type": "string",
+                  "format": "byte",
+                  "description": "The 32-byte asset ID specified as raw bytes (gRPC only)."
+                },
+                "asset_id_str": {
+                  "type": "string",
+                  "description": "The 32-byte asset ID encoded as a hex string (use this for REST)."
+                },
+                "group_key": {
+                  "type": "string",
+                  "format": "byte",
+                  "description": "The 32-byte asset group key specified as raw bytes (gRPC only)."
+                },
+                "proof_type": {
+                  "$ref": "#/definitions/universerpcProofType"
+                }
+              },
+              "description": "The ID of the asset to query for.",
+              "title": "The ID of the asset to query for."
+            },
+            "leaf_key": {
+              "type": "object",
+              "properties": {
+                "op_str": {
+                  "type": "string"
+                },
+                "op": {
+                  "type": "object"
+                },
+                "script_key_bytes": {
+                  "type": "string",
+                  "format": "byte"
+                }
+              },
+              "description": "The asset key to query for.",
+              "title": "The asset key to query for."
+            }
+          },
+          "description": "The ID of the asset to push the proof for.",
+          "title": "The ID of the asset to push the proof for."
+        },
+        "server": {
+          "$ref": "#/definitions/universerpcUniverseFederationServer",
+          "description": "The universe server to push the proof to."
+        }
+      }
+    },
     "protobufAny": {
       "type": "object",
       "properties": {
-        "type_url": {
+        "@type": {
           "type": "string"
-        },
-        "value": {
-          "type": "string",
-          "format": "byte"
         }
-      }
+      },
+      "additionalProperties": {}
     },
     "rpcStatus": {
       "type": "object",
@@ -1324,6 +1557,7 @@
         "details": {
           "type": "array",
           "items": {
+            "type": "object",
             "$ref": "#/definitions/protobufAny"
           }
         }
@@ -1364,6 +1598,11 @@
           "type": "integer",
           "format": "int64",
           "description": "The height of the block which contains the anchor transaction."
+        },
+        "block_timestamp": {
+          "type": "string",
+          "format": "int64",
+          "description": "The UTC Unix timestamp of the block containing the anchor transaction."
         }
       }
     },
@@ -1418,6 +1657,7 @@
         "prev_witnesses": {
           "type": "array",
           "items": {
+            "type": "object",
             "$ref": "#/definitions/taprpcPrevWitness"
           }
         },
@@ -1438,6 +1678,22 @@
         "is_burn": {
           "type": "boolean",
           "description": "Indicates whether this transfer was an asset burn. If true, the number of\nassets in this output are destroyed and can no longer be spent."
+        },
+        "script_key_declared_known": {
+          "type": "boolean",
+          "description": "Deprecated, use script_key_type instead!\nIndicates whether this script key has either been derived by the local\nwallet or was explicitly declared to be known by using the\nDeclareScriptKey RPC. Knowing the key conceptually means the key belongs\nto the local wallet or is at least known by a software that operates on\nthe local wallet. The flag is never serialized in proofs, so this is\nnever explicitly set for keys foreign to the local wallet. Therefore, if\nthis method returns true for a script key, it means the asset with the\nscript key will be shown in the wallet balance."
+        },
+        "script_key_has_script_path": {
+          "type": "boolean",
+          "description": "Deprecated, use script_key_type instead!\nIndicates whether the script key is known to have a Tapscript spend path,\nmeaning that the Taproot merkle root tweak is not empty. This will only\never be true if either script_key_is_local or script_key_internals_known\nis true as well, since the presence of a Tapscript spend path cannot be\ndetermined for script keys that aren't known to the wallet of the local\ntapd node."
+        },
+        "decimal_display": {
+          "$ref": "#/definitions/taprpcDecimalDisplay",
+          "description": "This field defines a decimal display value that may be present. If this\nfield is null, it means the presence of a decimal display field is\nunknown in the current context."
+        },
+        "script_key_type": {
+          "$ref": "#/definitions/taprpcScriptKeyType",
+          "description": "The type of the script key. This type is either user-declared when custom\nscript keys are added, or automatically determined by the daemon for\nstandard operations (e.g. BIP-86 keys, burn keys, tombstone keys, channel\nrelated keys)."
         }
       }
     },
@@ -1458,8 +1714,41 @@
           "type": "string",
           "format": "byte",
           "description": "A witness that authorizes a specific asset to be part of the asset group\nspecified by the above key."
+        },
+        "tapscript_root": {
+          "type": "string",
+          "format": "byte",
+          "description": "The root hash of a tapscript tree, which enables future issuance authorized\nwith a script witness."
         }
       }
+    },
+    "taprpcAssetMeta": {
+      "type": "object",
+      "properties": {
+        "data": {
+          "type": "string",
+          "format": "byte",
+          "description": "The raw data of the asset meta data. Based on the type below, this may be\nstructured data such as a text file or PDF. The size of the data is limited\nto 1MiB."
+        },
+        "type": {
+          "$ref": "#/definitions/taprpcAssetMetaType",
+          "description": "The type of the asset meta data."
+        },
+        "meta_hash": {
+          "type": "string",
+          "format": "byte",
+          "description": "The hash of the meta. This is the hash of the TLV serialization of the meta\nitself."
+        }
+      }
+    },
+    "taprpcAssetMetaType": {
+      "type": "string",
+      "enum": [
+        "META_TYPE_OPAQUE",
+        "META_TYPE_JSON"
+      ],
+      "default": "META_TYPE_OPAQUE",
+      "description": " - META_TYPE_OPAQUE: Opaque is used for asset meta blobs that have no true structure and instead\nshould be interpreted as opaque blobs.\n - META_TYPE_JSON: JSON is used for asset meta blobs that are to be interpreted as valid JSON\nstrings."
     },
     "taprpcAssetType": {
       "type": "string",
@@ -1478,6 +1767,16 @@
       ],
       "default": "ASSET_VERSION_V0",
       "description": " - ASSET_VERSION_V0: ASSET_VERSION_V0 is the default asset version. This version will include\nthe witness vector in the leaf for a tap commitment.\n - ASSET_VERSION_V1: ASSET_VERSION_V1 is the asset version that leaves out the witness vector\nfrom the MS-SMT leaf encoding."
+    },
+    "taprpcDecimalDisplay": {
+      "type": "object",
+      "properties": {
+        "decimal_display": {
+          "type": "integer",
+          "format": "int64",
+          "description": "Decimal display dictates the number of decimal places to shift the amount to\nthe left converting from Taproot Asset integer representation to a\nUX-recognizable fractional quantity.\n\nFor example, if the decimal_display value is 2 and there's 100 of those\nassets, then a wallet would display the amount as \"1.00\". This field is\nintended as information for wallets that display balances and has no impact\non the behavior of the daemon or any other part of the protocol. This value\nis encoded in the MetaData field as a JSON field, therefore it is only\ncompatible with assets that have a JSON MetaData field."
+        }
+      }
     },
     "taprpcGenesisInfo": {
       "type": "object",
@@ -1508,11 +1807,30 @@
           "type": "integer",
           "format": "int64",
           "description": "The index of the output that carries the unique Taproot Asset commitment in\nthe genesis transaction."
+        }
+      }
+    },
+    "taprpcGenesisReveal": {
+      "type": "object",
+      "properties": {
+        "genesis_base_reveal": {
+          "$ref": "#/definitions/taprpcGenesisInfo",
+          "description": "The base genesis information in the genesis reveal."
+        }
+      }
+    },
+    "taprpcGroupKeyReveal": {
+      "type": "object",
+      "properties": {
+        "raw_group_key": {
+          "type": "string",
+          "format": "byte",
+          "description": "The raw group key which is a normal public key."
         },
-        "version": {
-          "type": "integer",
-          "format": "int32",
-          "description": "The version of the Taproot Asset commitment that created this asset."
+        "tapscript_root": {
+          "type": "string",
+          "format": "byte",
+          "description": "The tapscript root included in the tweaked group key, which may be empty."
         }
       }
     },
@@ -1554,6 +1872,19 @@
         }
       }
     },
+    "taprpcScriptKeyType": {
+      "type": "string",
+      "enum": [
+        "SCRIPT_KEY_UNKNOWN",
+        "SCRIPT_KEY_BIP86",
+        "SCRIPT_KEY_SCRIPT_PATH_EXTERNAL",
+        "SCRIPT_KEY_BURN",
+        "SCRIPT_KEY_TOMBSTONE",
+        "SCRIPT_KEY_CHANNEL"
+      ],
+      "default": "SCRIPT_KEY_UNKNOWN",
+      "description": " - SCRIPT_KEY_UNKNOWN: The type of script key is not known. This should only be stored for assets\nwhere we don't know the internal key of the script key (e.g. for\nimported proofs).\n - SCRIPT_KEY_BIP86: The script key is a normal BIP-86 key. This means that the internal key is\nturned into a Taproot output key by applying a BIP-86 tweak to it.\n - SCRIPT_KEY_SCRIPT_PATH_EXTERNAL: The script key is a key that contains a script path that is defined by the\nuser and is therefore external to the tapd wallet. Spending this key\nrequires providing a specific witness and must be signed through the vPSBT\nsigning flow.\n - SCRIPT_KEY_BURN: The script key is a specific un-spendable key that indicates a burnt asset.\nAssets with this key type can never be spent again, as a burn key is a\ntweaked NUMS key that nobody knows the private key for.\n - SCRIPT_KEY_TOMBSTONE: The script key is a specific un-spendable key that indicates a tombstone\noutput. This is only the case for zero-value assets that result from a\nnon-interactive (TAP address) send where no change was left over.\n - SCRIPT_KEY_CHANNEL: The script key is used for an asset that resides within a Taproot Asset\nChannel. That means the script key is either a funding key (OP_TRUE), a\ncommitment output key (to_local, to_remote, htlc), or a HTLC second-level\ntransaction output key. Keys related to channels are not shown in asset\nbalances (unless specifically requested) and are never used for coin\nselection."
+    },
     "taprpcSplitCommitment": {
       "type": "object",
       "properties": {
@@ -1568,6 +1899,7 @@
         "servers": {
           "type": "array",
           "items": {
+            "type": "object",
             "$ref": "#/definitions/universerpcUniverseFederationServer"
           }
         }
@@ -1632,6 +1964,7 @@
         "asset_keys": {
           "type": "array",
           "items": {
+            "type": "object",
             "$ref": "#/definitions/universerpcAssetKey"
           },
           "description": "The set of asset leaf keys for the given asset ID or group key."
@@ -1644,22 +1977,10 @@
         "leaves": {
           "type": "array",
           "items": {
+            "type": "object",
             "$ref": "#/definitions/universerpcAssetLeaf"
           },
           "description": "The set of asset leaves for the given asset ID or group key."
-        }
-      }
-    },
-    "universerpcAssetProof": {
-      "type": "object",
-      "properties": {
-        "key": {
-          "$ref": "#/definitions/universerpcUniverseKey",
-          "description": "The ID of the asset to insert the proof for."
-        },
-        "asset_leaf": {
-          "$ref": "#/definitions/universerpcAssetLeaf",
-          "description": "The asset leaf to insert into the Universe tree."
         }
       }
     },
@@ -1668,7 +1989,7 @@
       "properties": {
         "req": {
           "$ref": "#/definitions/universerpcUniverseKey",
-          "description": "The request original request for the issuance proof."
+          "description": "The original request for the issuance proof."
         },
         "universe_root": {
           "$ref": "#/definitions/universerpcUniverseRoot",
@@ -1691,6 +2012,10 @@
           "type": "string",
           "format": "byte",
           "description": "MultiverseInclusionProof is the inclusion proof for the asset leaf in the\nmultiverse."
+        },
+        "issuance_data": {
+          "$ref": "#/definitions/universerpcIssuanceData",
+          "description": "The issuance related data for an issuance asset leaf. This is empty for\nany other type of asset leaf."
         }
       }
     },
@@ -1872,12 +2197,30 @@
         }
       }
     },
+    "universerpcIssuanceData": {
+      "type": "object",
+      "properties": {
+        "meta_reveal": {
+          "$ref": "#/definitions/taprpcAssetMeta",
+          "description": "The reveal meta data associated with the proof, if available."
+        },
+        "genesis_reveal": {
+          "$ref": "#/definitions/taprpcGenesisReveal",
+          "description": "GenesisReveal is an optional field that is the Genesis information for\nthe asset. This is required for minting proofs."
+        },
+        "group_key_reveal": {
+          "$ref": "#/definitions/taprpcGroupKeyReveal",
+          "description": "GroupKeyReveal is an optional field that includes the information needed\nto derive the tweaked group key."
+        }
+      }
+    },
     "universerpcListFederationServersResponse": {
       "type": "object",
       "properties": {
         "servers": {
           "type": "array",
           "items": {
+            "type": "object",
             "$ref": "#/definitions/universerpcUniverseFederationServer"
           }
         }
@@ -1908,6 +2251,7 @@
         "specific_ids": {
           "type": "array",
           "items": {
+            "type": "object",
             "$ref": "#/definitions/universerpcID"
           },
           "description": "An optional list of universe IDs to include in the multiverse root. If\nnone are specified, then all known universes of the given proof type are\nincluded. NOTE: The proof type within the IDs must either be unspecified\nor match the proof type above."
@@ -1946,12 +2290,22 @@
       ],
       "default": "PROOF_TYPE_UNSPECIFIED"
     },
+    "universerpcPushProofResponse": {
+      "type": "object",
+      "properties": {
+        "key": {
+          "$ref": "#/definitions/universerpcUniverseKey",
+          "description": "The ID of the asset a push was requested for."
+        }
+      }
+    },
     "universerpcQueryEventsResponse": {
       "type": "object",
       "properties": {
         "events": {
           "type": "array",
           "items": {
+            "type": "object",
             "$ref": "#/definitions/universerpcGroupedUniverseEvents"
           }
         }
@@ -1963,12 +2317,14 @@
         "global_sync_configs": {
           "type": "array",
           "items": {
+            "type": "object",
             "$ref": "#/definitions/universerpcGlobalFederationSyncConfig"
           }
         },
         "asset_sync_configs": {
           "type": "array",
           "items": {
+            "type": "object",
             "$ref": "#/definitions/universerpcAssetFederationSyncConfig"
           }
         }
@@ -1993,12 +2349,14 @@
         "global_sync_configs": {
           "type": "array",
           "items": {
+            "type": "object",
             "$ref": "#/definitions/universerpcGlobalFederationSyncConfig"
           }
         },
         "asset_sync_configs": {
           "type": "array",
           "items": {
+            "type": "object",
             "$ref": "#/definitions/universerpcAssetFederationSyncConfig"
           }
         }
@@ -2050,6 +2408,7 @@
         "sync_targets": {
           "type": "array",
           "items": {
+            "type": "object",
             "$ref": "#/definitions/universerpcSyncTarget"
           },
           "description": "The set of assets to sync. If none are specified, then all assets are\nsynced."
@@ -2062,6 +2421,7 @@
         "synced_universes": {
           "type": "array",
           "items": {
+            "type": "object",
             "$ref": "#/definitions/universerpcSyncedUniverse"
           },
           "description": "The set of synced asset Universes."
@@ -2090,6 +2450,7 @@
         "new_asset_leaves": {
           "type": "array",
           "items": {
+            "type": "object",
             "$ref": "#/definitions/universerpcAssetLeaf"
           },
           "description": "The set of new asset leaves that were synced."
@@ -2102,6 +2463,7 @@
         "asset_stats": {
           "type": "array",
           "items": {
+            "type": "object",
             "$ref": "#/definitions/universerpcAssetStatsSnapshot"
           }
         }

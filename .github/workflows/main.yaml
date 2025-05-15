@@ -3,13 +3,13 @@ name: CI
 on:
   push:
     branches:
-      - "main"
+      - 'main'
   pull_request:
     branches:
-      - "*"
+      - '*'
   merge_group:
     branches:
-      - "main"
+      - 'main'
 
 defaults:
   run:
@@ -19,7 +19,9 @@ env:
   # go needs absolute directories, using the $HOME variable doesn't work here.
   GOPATH: /home/runner/work/go
 
-  GO_VERSION: '1.21.4'
+  GO_VERSION: '1.23.9'
+  
+  LITD_ITEST_BRANCH: 'master'
 
 jobs:
   #######################
@@ -30,7 +32,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: git checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
+
+      - name: Setup go ${{ env.GO_VERSION }}
+        uses: actions/setup-go@v5
+        with:
+          go-version: '${{ env.GO_VERSION }}'
 
       - name: docker image cache
         uses: jpribyl/action-docker-layer-caching@v0.1.1
@@ -44,7 +51,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: git checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
+
+      - name: Setup go ${{ env.GO_VERSION }}
+        uses: actions/setup-go@v5
+        with:
+          go-version: '${{ env.GO_VERSION }}'
 
       - name: Generate RPC stubs and check REST annotations
         run: make rpc-check
@@ -54,10 +66,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: git checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
-      - name: Setup go environment
-        uses: ./.github/actions/setup-go
+      - name: Setup go ${{ env.GO_VERSION }}
+        uses: actions/setup-go@v3
+        with:
+          go-version: '${{ env.GO_VERSION }}'
 
       - name: Run go mod tidy
         run: make mod-check
@@ -67,13 +81,25 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: git checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
-      - name: Setup go environment
-        uses: ./.github/actions/setup-go
+      - name: Setup go ${{ env.GO_VERSION }}
+        uses: actions/setup-go@v5
+        with:
+          go-version: '${{ env.GO_VERSION }}'
 
       - name: Run test vector creation check
         run: make test-vector-check
+
+  migration-check:
+    name: migration version check
+    runs-on: ubuntu-latest
+    steps:
+      - name: git checkout
+        uses: actions/checkout@v4
+
+      - name: Run migration check
+        run: make migration-check
 
   ########################
   # Compilation check.
@@ -83,13 +109,36 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: git checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
-      - name: Setup go environment
-        uses: ./.github/actions/setup-go
+      - name: Setup go ${{ env.GO_VERSION }}
+        uses: actions/setup-go@v5
+        with:
+          go-version: '${{ env.GO_VERSION }}'
 
       - name: compile code
         run: go install -v ./...
+
+      - name: Compile docs examples
+        run: make build-docs-examples
+
+  ########################
+  # sample configuration check
+  ########################
+  sample-conf-check:
+    name: sample configuration check
+    runs-on: ubuntu-latest
+    steps:
+      - name: git checkout
+        uses: actions/checkout@v4
+
+      - name: Setup go ${{ env.GO_VERSION }}
+        uses: actions/setup-go@v5
+        with:
+          go-version: '${{ env.GO_VERSION }}'
+
+      - name: check default values in sample-tapd.conf file
+        run: make sample-conf-check
 
   ########################
   # Docker build check.
@@ -99,7 +148,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: git checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v2
@@ -110,13 +159,13 @@ jobs:
       - name: Build default image
         uses: docker/build-push-action@v4
         with:
-          tags: "default-taproot-assets"
+          tags: 'default-taproot-assets'
 
       - name: Build dev image
         uses: docker/build-push-action@v4
         with:
           file: dev.Dockerfile
-          tags: "dev-taproot-assets"
+          tags: 'dev-taproot-assets'
 
   ########################
   # cross compilation
@@ -126,10 +175,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: git checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
-      - name: setup go ${{ env.GO_VERSION }}
-        uses: ./.github/actions/setup-go
+      - name: Setup go ${{ env.GO_VERSION }}
+        uses: actions/setup-go@v5
+        with:
+          go-version: '${{ env.GO_VERSION }}'
 
       - name: build release for all architectures
         run: make release
@@ -142,10 +193,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: git checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Setup go environment
-        uses: ./.github/actions/setup-go
+      - name: Setup go ${{ env.GO_VERSION }}
+        uses: actions/setup-go@v5
+        with:
+          go-version: '${{ env.GO_VERSION }}'
 
       - name: run lint
         run: make lint
@@ -158,10 +213,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: git checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
-      - name: Setup go environment
-        uses: ./.github/actions/setup-go
+      - name: Setup go ${{ env.GO_VERSION }}
+        uses: actions/setup-go@v5
+        with:
+          go-version: '${{ env.GO_VERSION }}'
 
       - name: run format
         run: make fmt
@@ -182,19 +239,24 @@ jobs:
           - unit dbbackend=postgres
     steps:
       - name: git checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
-      - name: Setup go environment
-        uses: ./.github/actions/setup-go
+      - name: Setup go ${{ env.GO_VERSION }}
+        uses: actions/setup-go@v5
+        with:
+          go-version: '${{ env.GO_VERSION }}'
 
       - name: run ${{ matrix.unit_type }}
         run: make ${{ matrix.unit_type }}
 
       - name: Send coverage
-        uses: shogo82148/actions-goveralls@v1
+        uses: coverallsapp/github-action@v2
         if: matrix.unit_type == 'unit-cover'
+        continue-on-error: true
         with:
-          path-to-profile: coverage.txt
+          file: coverage.txt
+          flag-name: 'unit'
+          format: 'golang'
           parallel: true
 
   ########################
@@ -204,26 +266,41 @@ jobs:
     name: run itests
     runs-on: ubuntu-latest
     steps:
-      - name: git checkout
-        uses: actions/checkout@v3
+      - name: cleanup space
+        run: rm -rf /opt/hostedtoolcache
 
-      - name: Setup go environment
-        uses: ./.github/actions/setup-go
+      - name: git checkout
+        uses: actions/checkout@v4
+
+      - name: Setup go ${{ env.GO_VERSION }}
+        uses: actions/setup-go@v5
+        with:
+          go-version: '${{ env.GO_VERSION }}'
 
       - name: run itest
-        run: make itest
+        run: make itest cover=1
 
       - name: Zip log files on failure
         if: ${{ failure() }}
         run: 7z a logs-itest.zip itest/**/*.log
 
       - name: Upload log files on failure
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         if: ${{ failure() }}
         with:
           name: logs-itest
           path: logs-itest.zip
           retention-days: 5
+
+      - name: Send coverage
+        uses: coverallsapp/github-action@v2
+        if: ${{ success() }}
+        continue-on-error: true
+        with:
+          file: itest/coverage.txt
+          flag-name: 'itest'
+          format: 'golang'
+          parallel: true
 
   ########################
   # run integration tests with Postgres backend
@@ -232,23 +309,101 @@ jobs:
     name: run itests postgres
     runs-on: ubuntu-latest
     steps:
-      - name: git checkout
-        uses: actions/checkout@v3
+      - name: cleanup space
+        run: rm -rf /opt/hostedtoolcache
 
-      - name: Setup go environment
-        uses: ./.github/actions/setup-go
+      - name: git checkout
+        uses: actions/checkout@v4
+
+      - name: Setup go ${{ env.GO_VERSION }}
+        uses: actions/setup-go@v5
+        with:
+          go-version: '${{ env.GO_VERSION }}'
 
       - name: run itest
-        run: make itest dbbackend=postgres
+        run: make itest dbbackend=postgres cover=1
 
       - name: Zip log files on failure
         if: ${{ failure() }}
         run: 7z a logs-itest-postgres.zip itest/**/*.log
 
       - name: Upload log files on failure
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         if: ${{ failure() }}
         with:
           name: logs-itest-postgres
           path: logs-itest-postgres.zip
           retention-days: 5
+
+      - name: Send coverage
+        uses: coverallsapp/github-action@v2
+        if: ${{ success() }}
+        continue-on-error: true
+        with:
+          file: itest/coverage.txt
+          flag-name: 'itest'
+          format: 'golang'
+          parallel: true
+
+  ########################
+  # Run LiTd tests
+  ########################
+  run-lit-tests:
+    name: run LiT tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: cleanup space
+        run: rm -rf /opt/hostedtoolcache
+
+      - name: git checkout
+        uses: actions/checkout@v4
+
+      - name: Setup go ${{ env.GO_VERSION }}
+        uses: actions/setup-go@v5
+        with:
+          go-version: '${{ env.GO_VERSION }}'
+
+      - name: Clone Lit repository
+        uses: actions/checkout@v4
+        with:
+          repository: lightninglabs/lightning-terminal
+          ref: ${{ env.LITD_ITEST_BRANCH }}
+          path: lightning-terminal
+
+      - name: Update go.mod to use the local Tap repository
+        working-directory: ./lightning-terminal
+        run: |
+          go mod edit -replace=github.com/lightninglabs/taproot-assets=../
+          go mod tidy
+
+      - name: Install yarn
+        run: npm install -g yarn
+
+      - name: setup nodejs
+        uses: ./lightning-terminal/.github/actions/setup-node
+        with:
+          node-version: 16.x
+
+      - name: install LiT app dependencies
+        working-directory: ./lightning-terminal/app
+        run: yarn
+
+      - name: Run LiT itests
+        working-directory: ./lightning-terminal
+        run: make itest icase=custom_channels
+
+      - name: Run LiT unit tests
+        working-directory: ./lightning-terminal
+        run: make unit
+
+  # Notify about the completion of all coverage collecting jobs.
+  finish:
+    if: ${{ always() }}
+    needs: [ unit-test ]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: coverallsapp/github-action@v2
+        continue-on-error: true
+        with:
+          parallel-finished: true

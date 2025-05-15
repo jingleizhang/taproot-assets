@@ -1,8 +1,8 @@
 package tapdb
 
 import (
-	"bytes"
 	"context"
+	crand "crypto/rand"
 	"database/sql"
 	"math"
 	"math/rand"
@@ -40,7 +40,7 @@ func withProofType(proofType universe.ProofType) universeIDOptFunc {
 	}
 }
 
-func randUniverseID(t *testing.T, forceGroup bool,
+func randUniverseID(t testing.TB, forceGroup bool,
 	optFunctions ...universeIDOptFunc) universe.Identifier {
 
 	opts := defaultUniverseIdOptions()
@@ -91,7 +91,7 @@ func newTestMultiverse(t *testing.T) (*MultiverseStore, sqlc.Querier) {
 		},
 	)
 
-	return NewMultiverseStore(dbTxer), db
+	return NewMultiverseStore(dbTxer, DefaultMultiverseStoreConfig()), db
 }
 
 func newTestMultiverseWithDb(db *BaseDB) (*MultiverseStore, sqlc.Querier) {
@@ -101,7 +101,7 @@ func newTestMultiverseWithDb(db *BaseDB) (*MultiverseStore, sqlc.Querier) {
 		},
 	)
 
-	return NewMultiverseStore(dbTxer), db
+	return NewMultiverseStore(dbTxer, DefaultMultiverseStoreConfig()), db
 }
 
 func newTestUniverseWithDb(db *BaseDB,
@@ -156,7 +156,7 @@ func TestUniverseEmptyTree(t *testing.T) {
 }
 
 func randLeafKey(t *testing.T) universe.LeafKey {
-	return universe.LeafKey{
+	return universe.BaseLeafKey{
 		OutPoint:  test.RandOp(t),
 		ScriptKey: fn.Ptr(asset.NewScriptKey(test.RandPubKey(t))),
 	}
@@ -168,6 +168,14 @@ func randProof(t *testing.T, argAsset *asset.Asset) *proof.Proof {
 		proofAsset = *argAsset
 	}
 
+	var witnessData [32]byte
+	_, err := crand.Read(witnessData[:])
+	require.NoError(t, err)
+
+	var pkScript [32]byte
+	_, err = crand.Read(pkScript[:])
+	require.NoError(t, err)
+
 	return &proof.Proof{
 		PrevOut: wire.OutPoint{},
 		BlockHeader: wire.BlockHeader{
@@ -176,7 +184,11 @@ func randProof(t *testing.T, argAsset *asset.Asset) *proof.Proof {
 		AnchorTx: wire.MsgTx{
 			Version: 2,
 			TxIn: []*wire.TxIn{{
-				Witness: [][]byte{[]byte("foo")},
+				Witness: [][]byte{witnessData[:]},
+			}},
+			TxOut: []*wire.TxOut{{
+				PkScript: pkScript[:],
+				Value:    1000,
 			}},
 		},
 		TxMerkleProof: proof.TxMerkleProof{},
@@ -184,6 +196,7 @@ func randProof(t *testing.T, argAsset *asset.Asset) *proof.Proof {
 		InclusionProof: proof.TaprootProof{
 			InternalKey: test.RandPubKey(t),
 		},
+		AltLeaves: asset.ToAltLeaves(asset.RandAltLeaves(t, true)),
 	}
 }
 
@@ -212,16 +225,17 @@ func randMintingLeaf(t *testing.T, assetGen asset.Genesis,
 
 		leaf.GroupKey = assetGroupKey
 		randProof.Asset.GroupKey = assetGroupKey
-		randProof.GroupKeyReveal = &asset.GroupKeyReveal{
-			RawKey: asset.ToSerialized(groupKey),
-		}
+		randProof.GroupKeyReveal = asset.NewGroupKeyRevealV0(
+			asset.ToSerialized(groupKey), nil,
+		)
 	}
 
 	leaf.Asset = &randProof.Asset
 
-	var proofBuf bytes.Buffer
-	require.NoError(t, randProof.Encode(&proofBuf))
-	leaf.RawProof = proofBuf.Bytes()
+	proofBytes, err := randProof.Bytes()
+	require.NoError(t, err)
+
+	leaf.RawProof = proofBytes
 
 	return leaf
 }
@@ -384,11 +398,12 @@ func TestUniverseIssuanceProofs(t *testing.T) {
 	for idx := range testLeaves {
 		testLeaf := &testLeaves[idx]
 
-		var proofBuf bytes.Buffer
 		randProof := randProof(t, nil)
-		require.NoError(t, randProof.Encode(&proofBuf))
 
-		testLeaf.Leaf.RawProof = proofBuf.Bytes()
+		randProofBytes, err := randProof.Bytes()
+		require.NoError(t, err)
+
+		testLeaf.Leaf.RawProof = randProofBytes
 
 		targetKey := testLeaf.LeafKey
 		issuanceProof, err := baseUniverse.RegisterIssuance(
@@ -541,7 +556,9 @@ func TestUniverseTreeIsolation(t *testing.T) {
 			return db.WithTx(tx)
 		},
 	)
-	multiverse := NewMultiverseStore(multiverseDB)
+	multiverse := NewMultiverseStore(
+		multiverseDB, DefaultMultiverseStoreConfig(),
+	)
 
 	rootNodes, err := multiverse.RootNodes(
 		ctx, universe.RootNodesQuery{
@@ -632,12 +649,13 @@ func TestUniverseLeafQuery(t *testing.T) {
 
 	// We'll create three new leaves, all of them will share the exact same
 	// minting outpoint, but will have distinct script keys.
-	rootMintingPoint := randLeafKey(t).OutPoint
+	rootMintingPoint := randLeafKey(t).LeafOutPoint()
 
 	leafToScriptKey := make(map[asset.SerializedKey]universe.Leaf)
 	for i := 0; i < numLeafs; i++ {
-		targetKey := randLeafKey(t)
-		targetKey.OutPoint = rootMintingPoint
+		baseKey := randLeafKey(t).(universe.BaseLeafKey)
+		baseKey.OutPoint = rootMintingPoint
+		targetKey := baseKey
 
 		leaf := randMintingLeaf(t, assetGen, id.GroupKey)
 		if id.GroupKey != nil {
@@ -650,13 +668,15 @@ func TestUniverseLeafQuery(t *testing.T) {
 				leaf.GroupKey.Witness = sharedWitness
 
 				//nolint:lll
-				//leaf.Proof.Asset.GroupKey.Witness = sharedWitness
+				// leaf.Proof.Asset.GroupKey.Witness = sharedWitness
 				leaf.Asset.GroupKey.Witness = sharedWitness
 				// TODO(roasbeef): circle back
 			}
 		}
 
-		scriptKey := asset.ToSerialized(targetKey.ScriptKey.PubKey)
+		scriptKey := asset.ToSerialized(
+			targetKey.LeafScriptKey().PubKey,
+		)
 
 		leafToScriptKey[scriptKey] = leaf
 
@@ -668,9 +688,11 @@ func TestUniverseLeafQuery(t *testing.T) {
 
 	// If we query for only the minting point, then all three leaves should
 	// be returned.
-	proofs, err := baseUniverse.FetchIssuanceProof(ctx, universe.LeafKey{
-		OutPoint: rootMintingPoint,
-	})
+	proofs, err := baseUniverse.FetchIssuanceProof(
+		ctx, universe.BaseLeafKey{
+			OutPoint: rootMintingPoint,
+		},
+	)
 	require.NoError(t, err)
 	require.Len(t, proofs, numLeafs)
 
@@ -681,12 +703,14 @@ func TestUniverseLeafQuery(t *testing.T) {
 		scriptKey, err := btcec.ParsePubKey(scriptKeyBytes[:])
 		require.NoError(t, err)
 
-		p, err := baseUniverse.FetchIssuanceProof(ctx, universe.LeafKey{
-			OutPoint: rootMintingPoint,
-			ScriptKey: &asset.ScriptKey{
-				PubKey: scriptKey,
+		p, err := baseUniverse.FetchIssuanceProof(
+			ctx, universe.BaseLeafKey{
+				OutPoint: rootMintingPoint,
+				ScriptKey: &asset.ScriptKey{
+					PubKey: scriptKey,
+				},
 			},
-		})
+		)
 		require.NoError(t, err)
 		require.Len(t, p, 1)
 

@@ -22,7 +22,7 @@ func TestNewMintingBlobs(t *testing.T) {
 
 	// First, we'll create a fake, but legit looking set of minting params
 	// to generate a proof with.
-	genesisPrivKey := test.RandPrivKey(t)
+	genesisPrivKey := test.RandPrivKey()
 	genesisScriptKey := test.PubToKeyDesc(genesisPrivKey.PubKey())
 
 	// We'll modify the returned genesis to instead commit to some actual
@@ -36,8 +36,9 @@ func TestNewMintingBlobs(t *testing.T) {
 	assetGenesis := asset.RandGenesis(t, asset.Collectible)
 	assetGenesis.MetaHash = metaReveal.MetaHash()
 	assetGenesis.OutputIndex = 0
+	commitVersion := commitment.RandTapCommitVersion()
 	tapCommitment, _, err := commitment.Mint(
-		assetGenesis, nil, &commitment.AssetDetails{
+		commitVersion, assetGenesis, nil, &commitment.AssetDetails{
 			Type:             asset.Collectible,
 			ScriptKey:        genesisScriptKey,
 			Amount:           nil,
@@ -70,7 +71,7 @@ func TestNewMintingBlobs(t *testing.T) {
 	)
 	taprootScript := test.ComputeTaprootScript(t, taprootKey)
 
-	changeInternalKey := test.RandPrivKey(t).PubKey()
+	changeInternalKey := test.RandPrivKey().PubKey()
 	changeTaprootKey := txscript.ComputeTaprootKeyNoScript(
 		changeInternalKey,
 	)
@@ -127,8 +128,6 @@ func TestNewMintingBlobs(t *testing.T) {
 			}},
 		},
 		GenesisPoint: genesisTx.TxIn[0].PreviousOutPoint,
-	}, MockHeaderVerifier, MockGroupVerifier, MockGroupAnchorVerifier,
-		WithAssetMetaReveals(metaReveals),
-	)
+	}, MockVerifierCtx, WithAssetMetaReveals(metaReveals))
 	require.NoError(t, err)
 }

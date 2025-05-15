@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"flag"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"sync"
@@ -14,14 +15,19 @@ import (
 
 	"github.com/btcsuite/btcd/chaincfg"
 	tap "github.com/lightninglabs/taproot-assets"
+	"github.com/lightninglabs/taproot-assets/cmd/commands"
 	"github.com/lightninglabs/taproot-assets/proof"
+	"github.com/lightninglabs/taproot-assets/rfq"
 	"github.com/lightninglabs/taproot-assets/tapcfg"
 	"github.com/lightninglabs/taproot-assets/tapdb"
 	"github.com/lightninglabs/taproot-assets/taprpc"
 	"github.com/lightninglabs/taproot-assets/taprpc/assetwalletrpc"
 	"github.com/lightninglabs/taproot-assets/taprpc/mintrpc"
+	"github.com/lightninglabs/taproot-assets/taprpc/rfqrpc"
+	tchrpc "github.com/lightninglabs/taproot-assets/taprpc/tapchannelrpc"
 	"github.com/lightninglabs/taproot-assets/taprpc/tapdevrpc"
 	"github.com/lightninglabs/taproot-assets/taprpc/universerpc"
+	lfn "github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/lnrpc"
 	"github.com/lightningnetwork/lnd/lntest/node"
 	"github.com/lightningnetwork/lnd/lntest/wait"
@@ -51,9 +57,9 @@ var (
 	// for sending proofs with the hashmail courier.
 	defaultHashmailBackoffConfig = proof.BackoffCfg{
 		BackoffResetWait: time.Second,
-		NumTries:         5,
+		NumTries:         10,
 		InitialBackoff:   300 * time.Millisecond,
-		MaxBackoff:       600 * time.Millisecond,
+		MaxBackoff:       2 * time.Second,
 	}
 
 	// defaultUniverseRpcBackoffConfig is the default backoff config we'll
@@ -61,9 +67,9 @@ var (
 	defaultUniverseRpcBackoffConfig = proof.BackoffCfg{
 		SkipInitDelay:    true,
 		BackoffResetWait: time.Second,
-		NumTries:         5,
+		NumTries:         10,
 		InitialBackoff:   300 * time.Millisecond,
-		MaxBackoff:       600 * time.Millisecond,
+		MaxBackoff:       2 * time.Second,
 	}
 
 	// defaultProofRetrievalDelay is the default delay we'll use for the
@@ -76,7 +82,7 @@ const (
 	// defaultProofTransferReceiverAckTimeout is the default itest specific
 	// timeout we'll use for waiting for a receiver to acknowledge a proof
 	// transfer.
-	defaultProofTransferReceiverAckTimeout = 5 * time.Second
+	defaultProofTransferReceiverAckTimeout = 500 * time.Millisecond
 )
 
 // tapdHarness is a test harness that holds everything that is needed to
@@ -92,6 +98,8 @@ type tapdHarness struct {
 	taprpc.TaprootAssetsClient
 	assetwalletrpc.AssetWalletClient
 	mintrpc.MintClient
+	rfqrpc.RfqClient
+	tchrpc.TaprootAssetChannelsClient
 	universerpc.UniverseClient
 	tapdevrpc.TapDevClient
 }
@@ -110,6 +118,7 @@ type harnessOpts struct {
 	proofCourier                 proof.CourierHarness
 	custodianProofRetrievalDelay *time.Duration
 	addrAssetSyncerDisable       bool
+	oracleServerAddress          string
 
 	// fedSyncTickerInterval is the interval at which the federation envoy
 	// sync ticker will fire.
@@ -118,12 +127,24 @@ type harnessOpts struct {
 	// sqliteDatabaseFilePath is the path to the SQLite database file to
 	// use.
 	sqliteDatabaseFilePath *string
+
+	// disableSyncCache is a flag that can be set to true to disable the
+	// universe syncer cache.
+	disableSyncCache bool
 }
 
 type harnessOption func(*harnessOpts)
 
 func defaultHarnessOpts() *harnessOpts {
 	return &harnessOpts{}
+}
+
+// withOracleAddress is a functional option that sets the oracle address option
+// to the provided string.
+func withOracleAddress(addr string) harnessOption {
+	return func(ho *harnessOpts) {
+		ho.oracleServerAddress = addr
+	}
 }
 
 // newTapdHarness creates a new tapd server harness with the given
@@ -143,14 +164,6 @@ func newTapdHarness(t *testing.T, ht *harnessTest, cfg tapdConfig,
 			return nil, err
 		}
 	}
-
-	if cfg.LndNode == nil || cfg.LndNode.Cfg == nil {
-		return nil, fmt.Errorf("lnd node configuration cannot be nil")
-	}
-	lndMacPath := filepath.Join(
-		cfg.LndNode.Cfg.DataDir, "chain", "bitcoin", cfg.NetParams.Name,
-		"admin.macaroon",
-	)
 
 	tapCfg := tapcfg.DefaultConfig()
 	tapCfg.LogDir = "."
@@ -190,16 +203,20 @@ func newTapdHarness(t *testing.T, ht *harnessTest, cfg tapdConfig,
 		fmt.Sprintf("127.0.0.1:%d", nextAvailablePort()),
 	}
 
-	tapCfg.Lnd = &tapcfg.LndConfig{
-		Host:         cfg.LndNode.Cfg.RPCAddr(),
-		MacaroonPath: lndMacPath,
-		TLSPath:      cfg.LndNode.Cfg.TLSCertPath,
+	// Update the config with the lnd node's connection info.
+	if err := updateConfigWithNode(&tapCfg, cfg.LndNode); err != nil {
+		return nil, err
 	}
 
-	// Ensure valid proof from tapd nodes will be accepted, and proofs will
-	// be queryable by other tapd nodes. This applies to federation syncing
-	// as well as RPC insert and query.
-	tapCfg.Universe.PublicAccess = true
+	// Configure the universe server to ensure that valid proofs from tapd
+	// nodes will be accepted, and proofs will be queryable by other tapd
+	// nodes.
+	tapCfg.Universe.PublicAccess = string(
+		tap.UniversePublicAccessStatusReadWrite,
+	)
+
+	// Enable federation syncing of all assets by default.
+	tapCfg.Universe.SyncAllAssets = true
 
 	// Set the SQLite database file path if it was specified.
 	if opts.sqliteDatabaseFilePath != nil {
@@ -210,7 +227,23 @@ func newTapdHarness(t *testing.T, ht *harnessTest, cfg tapdConfig,
 	// was not set, this will be false, which is the default.
 	tapCfg.AddrBook.DisableSyncer = opts.addrAssetSyncerDisable
 
-	cfgLogger := tapCfg.LogWriter.GenSubLogger("CONF", nil)
+	switch {
+	case len(opts.oracleServerAddress) > 0:
+		tapCfg.Experimental.Rfq.PriceOracleAddress =
+			opts.oracleServerAddress
+
+	default:
+		// Set the experimental config for the RFQ service.
+		tapCfg.Experimental = &tapcfg.ExperimentalConfig{
+			Rfq: rfq.CliConfig{
+				//nolint:lll
+				PriceOracleAddress:     rfq.MockPriceOracleServiceAddress,
+				MockOracleAssetsPerBTC: 5_820_600,
+			},
+		}
+	}
+
+	cfgLogger := tapCfg.LogMgr.GenSubLogger("CONF", nil)
 	finalCfg, err := tapcfg.ValidateConfig(tapCfg, cfgLogger)
 	if err != nil {
 		return nil, err
@@ -237,7 +270,8 @@ func newTapdHarness(t *testing.T, ht *harnessTest, cfg tapdConfig,
 		BackoffCfg:         &hashmailBackoffCfg,
 	}
 	finalCfg.UniverseRpcCourier = &proof.UniverseRpcCourierCfg{
-		BackoffCfg: &universeRpcBackoffCfg,
+		BackoffCfg:            &universeRpcBackoffCfg,
+		ServiceRequestTimeout: 50 * time.Millisecond,
 	}
 
 	switch typedProofCourier := (opts.proofCourier).(type) {
@@ -270,11 +304,84 @@ func newTapdHarness(t *testing.T, ht *harnessTest, cfg tapdConfig,
 		finalCfg.Universe.SyncInterval = *opts.fedSyncTickerInterval
 	}
 
+	if !opts.disableSyncCache {
+		finalCfg.Universe.MultiverseCaches.SyncerCacheEnabled = true
+	}
+
 	return &tapdHarness{
 		cfg:       &cfg,
 		clientCfg: finalCfg,
 		ht:        ht,
 	}, nil
+}
+
+// ExecTapCLI uses the CLI parser to invoke the specified tapd harness via RPC,
+// passing the provided arguments. It returns the response or an error.
+func ExecTapCLI(ctx context.Context, tapClient *tapdHarness,
+	args ...string) (interface{}, error) {
+
+	if ctx == nil {
+		return nil, fmt.Errorf("context cannot be nil")
+	}
+
+	// Construct a response channel to receive the response from the CLI
+	// command.
+	responseChan := make(chan lfn.Result[interface{}], 1)
+
+	// Construct an app which supports the tapcli command set.
+	opt := []commands.ActionOption{
+		commands.ActionWithCtx(ctx),
+		commands.ActionWithClient(tapClient),
+		commands.ActionWithSilencePrint(true),
+		commands.ActionRespChan(responseChan),
+	}
+
+	app := commands.NewApp(opt...)
+	app.Name = "tapcli-itest"
+
+	// Prepend a dummy path to the args to satisfy the CLI argument parser.
+	args = append([]string{"dummy-path"}, args...)
+
+	// Run the app within the current goroutine. This does not start a
+	// separate process.
+	if err := app.Run(args); err != nil {
+		return nil, err
+	}
+
+	// Wait for a response of context cancellation.
+	select {
+	case respResult := <-responseChan:
+		resp, err := respResult.Unpack()
+		if err != nil {
+			return nil, err
+		}
+
+		return resp, nil
+
+	case <-ctx.Done():
+		// Handle context cancellation.
+		return nil, ctx.Err()
+	}
+}
+
+// updateConfigWithNode updates the tapd configuration with the connection
+// information of the given lnd node.
+func updateConfigWithNode(cfg *tapcfg.Config, lnd *node.HarnessNode) error {
+	if lnd == nil || lnd.Cfg == nil {
+		return fmt.Errorf("lnd node configuration cannot be nil")
+	}
+	lndMacPath := filepath.Join(
+		lnd.Cfg.DataDir, "chain", "bitcoin", cfg.ChainConf.Network,
+		"admin.macaroon",
+	)
+
+	cfg.Lnd = &tapcfg.LndConfig{
+		Host:         lnd.Cfg.RPCAddr(),
+		MacaroonPath: lndMacPath,
+		TLSPath:      lnd.Cfg.TLSCertPath,
+	}
+
+	return nil
 }
 
 // rpcHost returns the RPC host for the tapd server.
@@ -284,17 +391,18 @@ func (hs *tapdHarness) rpcHost() string {
 
 // start spins up the tapd server listening for gRPC connections.
 func (hs *tapdHarness) start(expectErrExit bool) error {
-	cfgLogger := hs.ht.logWriter.GenSubLogger("CONF", func() {})
+	cfgLogger := hs.ht.logMgr.GenSubLogger("CONF", func() {})
 
 	var (
 		err         error
 		mainErrChan = make(chan error, 10)
 	)
+
 	hs.server, err = tapcfg.CreateServerFromConfig(
-		hs.clientCfg, cfgLogger, hs.ht.interceptor, mainErrChan,
+		hs.clientCfg, cfgLogger, hs.ht.interceptor, false, mainErrChan,
 	)
 	if err != nil {
-		return fmt.Errorf("could not create tapd server: %v", err)
+		return fmt.Errorf("could not create tapd server: %w", err)
 	}
 
 	hs.wg.Add(1)
@@ -305,21 +413,33 @@ func (hs *tapdHarness) start(expectErrExit bool) error {
 		}
 	}()
 
-	time.Sleep(1 * time.Second)
+	// Let's wait until the RPC server is actually listening before we
+	// connect our client to it.
+	listenerAddr := hs.clientCfg.RpcConf.RawRPCListeners[0]
+	err = wait.NoError(func() error {
+		_, err := net.Dial("tcp", listenerAddr)
+		return err
+	}, defaultTimeout)
+	if err != nil {
+		return fmt.Errorf("error waiting for server to start: %w", err)
+	}
 
 	// Create our client to interact with the tapd RPC server directly.
-	listenerAddr := hs.clientCfg.RpcConf.RawRPCListeners[0]
 	rpcConn, err := dialServer(
 		listenerAddr, hs.clientCfg.RpcConf.TLSCertPath,
 		hs.clientCfg.RpcConf.MacaroonPath,
 	)
 	if err != nil {
-		return fmt.Errorf("could not connect to %v: %v",
+		return fmt.Errorf("could not connect to %v: %w",
 			listenerAddr, err)
 	}
 	hs.TaprootAssetsClient = taprpc.NewTaprootAssetsClient(rpcConn)
 	hs.AssetWalletClient = assetwalletrpc.NewAssetWalletClient(rpcConn)
 	hs.MintClient = mintrpc.NewMintClient(rpcConn)
+	hs.RfqClient = rfqrpc.NewRfqClient(rpcConn)
+	hs.TaprootAssetChannelsClient = tchrpc.NewTaprootAssetChannelsClient(
+		rpcConn,
+	)
 	hs.UniverseClient = universerpc.NewUniverseClient(rpcConn)
 	hs.TapDevClient = tapdevrpc.NewTapDevClient(rpcConn)
 
@@ -443,7 +563,7 @@ func defaultDialOptions(serverCertPath, macaroonPath string) ([]grpc.DialOption,
 	if macaroonPath != "" {
 		macaroonOptions, err := readMacaroon(macaroonPath)
 		if err != nil {
-			return nil, fmt.Errorf("unable to load macaroon %s: %v",
+			return nil, fmt.Errorf("unable to load macaroon %s: %w",
 				macaroonPath, err)
 		}
 		baseOpts = append(baseOpts, macaroonOptions)
@@ -458,18 +578,18 @@ func readMacaroon(macaroonPath string) (grpc.DialOption, error) {
 	// Load the specified macaroon file.
 	macBytes, err := os.ReadFile(macaroonPath)
 	if err != nil {
-		return nil, fmt.Errorf("unable to read macaroon path : %v", err)
+		return nil, fmt.Errorf("unable to read macaroon path : %w", err)
 	}
 
 	mac := &macaroon.Macaroon{}
 	if err = mac.UnmarshalBinary(macBytes); err != nil {
-		return nil, fmt.Errorf("unable to decode macaroon: %v", err)
+		return nil, fmt.Errorf("unable to decode macaroon: %w", err)
 	}
 
 	// Now we append the macaroon credentials to the dial options.
 	cred, err := macaroons.NewMacaroonCredential(mac)
 	if err != nil {
-		return nil, fmt.Errorf("error creating mac cred: %v", err)
+		return nil, fmt.Errorf("error creating mac cred: %w", err)
 	}
 	return grpc.WithPerRPCCredentials(cred), nil
 }

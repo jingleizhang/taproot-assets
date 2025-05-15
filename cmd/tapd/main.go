@@ -67,10 +67,10 @@ func main() {
 	defer errQueue.Stop()
 
 	server, err := tapcfg.CreateServerFromConfig(
-		cfg, cfgLogger, shutdownInterceptor, errQueue.ChanIn(),
+		cfg, cfgLogger, shutdownInterceptor, false, errQueue.ChanIn(),
 	)
 	if err != nil {
-		err := fmt.Errorf("error creating server: %v", err)
+		err := fmt.Errorf("error creating server: %w", err)
 		_, _ = fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}

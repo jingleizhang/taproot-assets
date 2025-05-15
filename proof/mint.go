@@ -152,6 +152,12 @@ func (p *BaseProofParams) HaveExclusionProof(anchorOutputIndex uint32) bool {
 	return false
 }
 
+// HaveInclusionProof returns true if the inclusion proof is for the given
+// anchor output index.
+func (p *BaseProofParams) HaveInclusionProof(anchorOutputIndex uint32) bool {
+	return p.OutputIndex == int(anchorOutputIndex)
+}
+
 // MintParams holds the set of chain level information needed to make a proof
 // file for the set of assets minted in a batch.
 type MintParams struct {
@@ -187,7 +193,8 @@ type MintingBlobOption func(*mintingBlobOpts)
 // mintingBlobOpts is a set of options that can be used to modify the final
 // proof files created.
 type mintingBlobOpts struct {
-	metaReveals map[asset.SerializedKey]*MetaReveal
+	metaReveals        map[asset.SerializedKey]*MetaReveal
+	tapSiblingPreimage *commitment.TapscriptPreimage
 }
 
 // defaultMintingBlobOpts returns the default set of options for creating a
@@ -208,11 +215,21 @@ func WithAssetMetaReveals(
 	}
 }
 
+// WithSiblingPreimage is a MintingBlobOption that allows the caller to provide
+// a tapscript sibling preimage to be used when building the initial minting
+// blob.
+func WithSiblingPreimage(
+	sibling *commitment.TapscriptPreimage) MintingBlobOption {
+
+	return func(o *mintingBlobOpts) {
+		o.tapSiblingPreimage = sibling
+	}
+}
+
 // NewMintingBlobs takes a set of minting parameters, and produces a series of
 // serialized proof files, which proves the creation/existence of each of the
 // assets within the batch.
-func NewMintingBlobs(params *MintParams, headerVerifier HeaderVerifier,
-	groupVerifier GroupVerifier, anchorVerifier GroupAnchorVerifier,
+func NewMintingBlobs(params *MintParams, vCtx VerifierCtx,
 	blobOpts ...MintingBlobOption) (AssetProofs, error) {
 
 	opts := defaultMintingBlobOpts()
@@ -226,7 +243,7 @@ func NewMintingBlobs(params *MintParams, headerVerifier HeaderVerifier,
 	}
 
 	proofs, err := committedProofs(
-		base, params.TaprootAssetRoot, anchorVerifier, opts,
+		base, params.TaprootAssetRoot, vCtx.GroupAnchorVerifier, opts,
 	)
 	if err != nil {
 		return nil, err
@@ -238,7 +255,12 @@ func NewMintingBlobs(params *MintParams, headerVerifier HeaderVerifier,
 	for key := range proofs {
 		proof := proofs[key]
 
-		_, err := proof.Verify(ctx, nil, headerVerifier, groupVerifier)
+		lookup, err := vCtx.ChainLookupGen.GenProofChainLookup(proof)
+		if err != nil {
+			return nil, err
+		}
+
+		_, err = proof.Verify(ctx, nil, lookup, vCtx)
 		if err != nil {
 			return nil, fmt.Errorf("invalid proof file generated: "+
 				"%w", err)
@@ -273,19 +295,27 @@ func baseProof(params *BaseProofParams, prevOut wire.OutPoint) (*Proof, error) {
 // coreProof creates the basic proof template that contains only fields
 // dependent on anchor transaction confirmation.
 func coreProof(params *BaseProofParams) (*Proof, error) {
-	merkleProof, err := NewTxMerkleProof(
-		params.Block.Transactions, params.TxIndex,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("unable to create merkle proof: %w", err)
+	cProof := &Proof{
+		BlockHeader: params.Block.Header,
+		BlockHeight: params.BlockHeight,
 	}
 
-	return &Proof{
-		BlockHeader:   params.Block.Header,
-		BlockHeight:   params.BlockHeight,
-		AnchorTx:      *params.Tx,
-		TxMerkleProof: *merkleProof,
-	}, nil
+	if params.Tx != nil {
+		var err error
+		cProof.AnchorTx = *params.Tx
+
+		merkleProof, err := NewTxMerkleProof(
+			params.Block.Transactions, params.TxIndex,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("unable to create merkle "+
+				"proof: %w", err)
+		}
+
+		cProof.TxMerkleProof = *merkleProof
+	}
+
+	return cProof, nil
 }
 
 // committedProofs creates a map of proofs, keyed by the script key of each of
@@ -298,6 +328,14 @@ func committedProofs(baseProof *Proof, tapTreeRoot *commitment.TapCommitment,
 	// then encode that as a proof file blob in the blobs map.
 	assets := tapTreeRoot.CommittedAssets()
 	proofs := make(AssetProofs, len(assets))
+
+	// If a sibling preimage was provided for this Tap commitment, we'll
+	// need to include it with every inclusion proof.
+	var batchSiblingPreimage *commitment.TapscriptPreimage
+	if opts.tapSiblingPreimage != nil {
+		batchSiblingPreimage = opts.tapSiblingPreimage
+	}
+
 	for idx := range assets {
 		// First, we'll copy over the base proof and also set the asset
 		// within the proof itself.
@@ -319,11 +357,9 @@ func committedProofs(baseProof *Proof, tapTreeRoot *commitment.TapCommitment,
 		// With the merkle proof obtained, we can now set that in the
 		// main inclusion proof.
 		//
-		// NOTE: We don't add a TapSiblingPreimage here since we assume
-		// that this minting output ONLY commits to the Taproot Asset
-		// commitment.
 		assetProof.InclusionProof.CommitmentProof = &CommitmentProof{
-			Proof: *assetMerkleProof,
+			Proof:              *assetMerkleProof,
+			TapSiblingPreimage: batchSiblingPreimage,
 		}
 
 		scriptKey := asset.ToSerialized(newAsset.ScriptKey.PubKey)
@@ -345,14 +381,21 @@ func committedProofs(baseProof *Proof, tapTreeRoot *commitment.TapCommitment,
 		if newAsset.GroupKey != nil {
 			groupKey := newAsset.GroupKey
 
+			// Check if the asset is the group anchor.
 			err := groupAnchorVerifier(&newAsset.Genesis, groupKey)
 			if err == nil {
-				groupReveal := &asset.GroupKeyReveal{
-					RawKey: asset.ToSerialized(
-						groupKey.RawKey.PubKey,
-					),
-					TapscriptRoot: groupKey.TapscriptRoot,
+				// At this point, we know that the asset is the
+				// group anchor. We'll now create the group key
+				// reveal for this asset.
+				groupReveal, err := asset.NewGroupKeyReveal(
+					*groupKey, newAsset.Genesis.ID(),
+				)
+				if err != nil {
+					return nil, fmt.Errorf("unable to "+
+						"create group key reveal: %w",
+						err)
 				}
+
 				assetProof.GroupKeyReveal = groupReveal
 			}
 		}

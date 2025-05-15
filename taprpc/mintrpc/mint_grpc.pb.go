@@ -25,6 +25,20 @@ type MintClient interface {
 	// batch. This call will block until the operation succeeds (asset is staged
 	// in the batch) or fails.
 	MintAsset(ctx context.Context, in *MintAssetRequest, opts ...grpc.CallOption) (*MintAssetResponse, error)
+	// tapcli `assets mint fund`
+	// FundBatch will attempt to fund the current pending batch with a genesis
+	// input, or create a new funded batch if no batch exists yet. This RPC is only
+	// needed if a custom witness is needed to finalize the batch. Otherwise,
+	// FinalizeBatch can be called directly.
+	FundBatch(ctx context.Context, in *FundBatchRequest, opts ...grpc.CallOption) (*FundBatchResponse, error)
+	// tapcli `assets mint seal`
+	// SealBatch will attempt to seal the current pending batch by creating and
+	// validating asset group witness for all assets in the batch. If a witness
+	// is not provided, a signature will be derived to serve as the witness. This
+	// RPC is only needed if any assets in the batch have a custom asset group key
+	// that require an external signer. Otherwise, FinalizeBatch can be called
+	// directly.
+	SealBatch(ctx context.Context, in *SealBatchRequest, opts ...grpc.CallOption) (*SealBatchResponse, error)
 	// tapcli: `assets mint finalize`
 	// FinalizeBatch will attempt to finalize the current pending batch.
 	FinalizeBatch(ctx context.Context, in *FinalizeBatchRequest, opts ...grpc.CallOption) (*FinalizeBatchResponse, error)
@@ -35,6 +49,10 @@ type MintClient interface {
 	// ListBatches lists the set of batches submitted to the daemon, including
 	// pending and cancelled batches.
 	ListBatches(ctx context.Context, in *ListBatchRequest, opts ...grpc.CallOption) (*ListBatchResponse, error)
+	// tapcli: `events mint`
+	// SubscribeMintEvents allows a caller to subscribe to mint events for asset
+	// creation batches.
+	SubscribeMintEvents(ctx context.Context, in *SubscribeMintEventsRequest, opts ...grpc.CallOption) (Mint_SubscribeMintEventsClient, error)
 }
 
 type mintClient struct {
@@ -48,6 +66,24 @@ func NewMintClient(cc grpc.ClientConnInterface) MintClient {
 func (c *mintClient) MintAsset(ctx context.Context, in *MintAssetRequest, opts ...grpc.CallOption) (*MintAssetResponse, error) {
 	out := new(MintAssetResponse)
 	err := c.cc.Invoke(ctx, "/mintrpc.Mint/MintAsset", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *mintClient) FundBatch(ctx context.Context, in *FundBatchRequest, opts ...grpc.CallOption) (*FundBatchResponse, error) {
+	out := new(FundBatchResponse)
+	err := c.cc.Invoke(ctx, "/mintrpc.Mint/FundBatch", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *mintClient) SealBatch(ctx context.Context, in *SealBatchRequest, opts ...grpc.CallOption) (*SealBatchResponse, error) {
+	out := new(SealBatchResponse)
+	err := c.cc.Invoke(ctx, "/mintrpc.Mint/SealBatch", in, out, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -81,6 +117,38 @@ func (c *mintClient) ListBatches(ctx context.Context, in *ListBatchRequest, opts
 	return out, nil
 }
 
+func (c *mintClient) SubscribeMintEvents(ctx context.Context, in *SubscribeMintEventsRequest, opts ...grpc.CallOption) (Mint_SubscribeMintEventsClient, error) {
+	stream, err := c.cc.NewStream(ctx, &Mint_ServiceDesc.Streams[0], "/mintrpc.Mint/SubscribeMintEvents", opts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &mintSubscribeMintEventsClient{stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+type Mint_SubscribeMintEventsClient interface {
+	Recv() (*MintEvent, error)
+	grpc.ClientStream
+}
+
+type mintSubscribeMintEventsClient struct {
+	grpc.ClientStream
+}
+
+func (x *mintSubscribeMintEventsClient) Recv() (*MintEvent, error) {
+	m := new(MintEvent)
+	if err := x.ClientStream.RecvMsg(m); err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
 // MintServer is the server API for Mint service.
 // All implementations must embed UnimplementedMintServer
 // for forward compatibility
@@ -92,6 +160,20 @@ type MintServer interface {
 	// batch. This call will block until the operation succeeds (asset is staged
 	// in the batch) or fails.
 	MintAsset(context.Context, *MintAssetRequest) (*MintAssetResponse, error)
+	// tapcli `assets mint fund`
+	// FundBatch will attempt to fund the current pending batch with a genesis
+	// input, or create a new funded batch if no batch exists yet. This RPC is only
+	// needed if a custom witness is needed to finalize the batch. Otherwise,
+	// FinalizeBatch can be called directly.
+	FundBatch(context.Context, *FundBatchRequest) (*FundBatchResponse, error)
+	// tapcli `assets mint seal`
+	// SealBatch will attempt to seal the current pending batch by creating and
+	// validating asset group witness for all assets in the batch. If a witness
+	// is not provided, a signature will be derived to serve as the witness. This
+	// RPC is only needed if any assets in the batch have a custom asset group key
+	// that require an external signer. Otherwise, FinalizeBatch can be called
+	// directly.
+	SealBatch(context.Context, *SealBatchRequest) (*SealBatchResponse, error)
 	// tapcli: `assets mint finalize`
 	// FinalizeBatch will attempt to finalize the current pending batch.
 	FinalizeBatch(context.Context, *FinalizeBatchRequest) (*FinalizeBatchResponse, error)
@@ -102,6 +184,10 @@ type MintServer interface {
 	// ListBatches lists the set of batches submitted to the daemon, including
 	// pending and cancelled batches.
 	ListBatches(context.Context, *ListBatchRequest) (*ListBatchResponse, error)
+	// tapcli: `events mint`
+	// SubscribeMintEvents allows a caller to subscribe to mint events for asset
+	// creation batches.
+	SubscribeMintEvents(*SubscribeMintEventsRequest, Mint_SubscribeMintEventsServer) error
 	mustEmbedUnimplementedMintServer()
 }
 
@@ -112,6 +198,12 @@ type UnimplementedMintServer struct {
 func (UnimplementedMintServer) MintAsset(context.Context, *MintAssetRequest) (*MintAssetResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method MintAsset not implemented")
 }
+func (UnimplementedMintServer) FundBatch(context.Context, *FundBatchRequest) (*FundBatchResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method FundBatch not implemented")
+}
+func (UnimplementedMintServer) SealBatch(context.Context, *SealBatchRequest) (*SealBatchResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method SealBatch not implemented")
+}
 func (UnimplementedMintServer) FinalizeBatch(context.Context, *FinalizeBatchRequest) (*FinalizeBatchResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method FinalizeBatch not implemented")
 }
@@ -120,6 +212,9 @@ func (UnimplementedMintServer) CancelBatch(context.Context, *CancelBatchRequest)
 }
 func (UnimplementedMintServer) ListBatches(context.Context, *ListBatchRequest) (*ListBatchResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method ListBatches not implemented")
+}
+func (UnimplementedMintServer) SubscribeMintEvents(*SubscribeMintEventsRequest, Mint_SubscribeMintEventsServer) error {
+	return status.Errorf(codes.Unimplemented, "method SubscribeMintEvents not implemented")
 }
 func (UnimplementedMintServer) mustEmbedUnimplementedMintServer() {}
 
@@ -148,6 +243,42 @@ func _Mint_MintAsset_Handler(srv interface{}, ctx context.Context, dec func(inte
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(MintServer).MintAsset(ctx, req.(*MintAssetRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Mint_FundBatch_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(FundBatchRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(MintServer).FundBatch(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/mintrpc.Mint/FundBatch",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(MintServer).FundBatch(ctx, req.(*FundBatchRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Mint_SealBatch_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SealBatchRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(MintServer).SealBatch(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/mintrpc.Mint/SealBatch",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(MintServer).SealBatch(ctx, req.(*SealBatchRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -206,6 +337,27 @@ func _Mint_ListBatches_Handler(srv interface{}, ctx context.Context, dec func(in
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Mint_SubscribeMintEvents_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(SubscribeMintEventsRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(MintServer).SubscribeMintEvents(m, &mintSubscribeMintEventsServer{stream})
+}
+
+type Mint_SubscribeMintEventsServer interface {
+	Send(*MintEvent) error
+	grpc.ServerStream
+}
+
+type mintSubscribeMintEventsServer struct {
+	grpc.ServerStream
+}
+
+func (x *mintSubscribeMintEventsServer) Send(m *MintEvent) error {
+	return x.ServerStream.SendMsg(m)
+}
+
 // Mint_ServiceDesc is the grpc.ServiceDesc for Mint service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -216,6 +368,14 @@ var Mint_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "MintAsset",
 			Handler:    _Mint_MintAsset_Handler,
+		},
+		{
+			MethodName: "FundBatch",
+			Handler:    _Mint_FundBatch_Handler,
+		},
+		{
+			MethodName: "SealBatch",
+			Handler:    _Mint_SealBatch_Handler,
 		},
 		{
 			MethodName: "FinalizeBatch",
@@ -230,6 +390,12 @@ var Mint_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _Mint_ListBatches_Handler,
 		},
 	},
-	Streams:  []grpc.StreamDesc{},
+	Streams: []grpc.StreamDesc{
+		{
+			StreamName:    "SubscribeMintEvents",
+			Handler:       _Mint_SubscribeMintEvents_Handler,
+			ServerStreams: true,
+		},
+	},
 	Metadata: "mintrpc/mint.proto",
 }

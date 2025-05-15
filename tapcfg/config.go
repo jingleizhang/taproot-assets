@@ -1,3 +1,4 @@
+// nolint:lll
 package tapcfg
 
 import (
@@ -15,13 +16,15 @@ import (
 
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/chaincfg"
-	"github.com/btcsuite/btclog"
+	"github.com/btcsuite/btclog/v2"
 	"github.com/caddyserver/certmagic"
 	"github.com/jessevdk/go-flags"
 	"github.com/lightninglabs/lndclient"
 	tap "github.com/lightninglabs/taproot-assets"
+	"github.com/lightninglabs/taproot-assets/fn"
 	"github.com/lightninglabs/taproot-assets/monitoring"
 	"github.com/lightninglabs/taproot-assets/proof"
+	"github.com/lightninglabs/taproot-assets/rfq"
 	"github.com/lightninglabs/taproot-assets/tapdb"
 	"github.com/lightningnetwork/lnd/build"
 	"github.com/lightningnetwork/lnd/cert"
@@ -51,9 +54,6 @@ const (
 
 	defaultNetwork = "testnet"
 
-	defaultMaxLogFiles    = 3
-	defaultMaxLogFileSize = 10
-
 	defaultMainnetFederationServer = "universe.lightning.finance:10029"
 	defaultTestnetFederationServer = "testnet.universe.lightning.finance:10029"
 
@@ -63,11 +63,6 @@ const (
 	defaultTLSCertDuration = 14 * 30 * 24 * time.Hour
 
 	defaultConfigFileName = "tapd.conf"
-
-	// defaultBatchMintingInterval is the default interval used to
-	// determine when a set of pending assets should be flushed into a new
-	// batch.
-	defaultBatchMintingInterval = time.Minute * 10
 
 	// fallbackHashMailAddr is the fallback address we'll use to deliver
 	// proofs for asynchronous sends.
@@ -103,6 +98,10 @@ const (
 	// use for waiting for a receiver to acknowledge a proof transfer.
 	defaultProofTransferReceiverAckTimeout = time.Hour * 6
 
+	// defaultProofCourierServiceResponseTimeout is the default timeout
+	// we'll use for waiting for a response from the proof courier service.
+	defaultProofCourierServiceResponseTimeout = time.Second * 5
+
 	// defaultUniverseSyncInterval is the default interval that we'll use
 	// to sync Universe state with the federation.
 	defaultUniverseSyncInterval = time.Minute * 10
@@ -114,6 +113,11 @@ const (
 	// defaultReOrgSafeDepth is the default number of confirmations we'll
 	// wait for before considering a transaction safely buried in the chain.
 	defaultReOrgSafeDepth = 6
+
+	// testnetDefaultReOrgSafeDepth is the default number of confirmations
+	// we'll wait before considering a transaction safely buried in the
+	// testnet chain.
+	testnetDefaultReOrgSafeDepth = 120
 
 	// defaultUniverseMaxQps is the default maximum number of queries per
 	// second for the universe server. This permis 100 queries per second
@@ -129,6 +133,10 @@ const (
 	// waits having identified an asset transfer on-chain and before
 	// retrieving the corresponding proof via the proof courier service.
 	defaultProofRetrievalDelay = 5 * time.Second
+
+	// defaultLndRPCTimeout is the default timeout we'll use for RPC
+	// requests to lnd.
+	defaultLndRPCTimeout = 1 * time.Minute
 )
 
 var (
@@ -185,8 +193,8 @@ var (
 	// required in lnd to run tapd.
 	minimalCompatibleVersion = &verrpc.Version{
 		AppMajor: 0,
-		AppMinor: 15,
-		AppPatch: 99,
+		AppMinor: 18,
+		AppPatch: 4,
 
 		// We don't actually require the invoicesrpc calls. But if we
 		// try to use lndclient on an lnd that doesn't have it enabled,
@@ -219,12 +227,12 @@ type RpcConfig struct {
 	TLSExtraDomains    []string      `long:"tlsextradomain" description:"Adds an extra domain to the generated certificate"`
 	TLSAutoRefresh     bool          `long:"tlsautorefresh" description:"Re-generate TLS certificate and key if the IPs or domains are changed"`
 	TLSDisableAutofill bool          `long:"tlsdisableautofill" description:"Do not include the interface IPs or the system hostname in TLS certificate, use first --tlsextradomain as Common Name instead, if set"`
-	TLSCertDuration    time.Duration `long:"tlscertduration" description:"The duration for which the auto-generated TLS certificate will be valid for"`
+	TLSCertDuration    time.Duration `long:"tlscertduration" description:"The duration for which the auto-generated TLS certificate will be valid for. Valid time units are {s, m, h}."`
 
 	DisableRest    bool          `long:"norest" description:"Disable REST API"`
 	DisableRestTLS bool          `long:"no-rest-tls" description:"Disable TLS for REST connections"`
-	WSPingInterval time.Duration `long:"ws-ping-interval" description:"The ping interval for REST based WebSocket connections, set to 0 to disable sending ping messages from the server side"`
-	WSPongWait     time.Duration `long:"ws-pong-wait" description:"The time we wait for a pong response message on REST based WebSocket connections before the connection is closed as inactive"`
+	WSPingInterval time.Duration `long:"ws-ping-interval" description:"The ping interval for REST based WebSocket connections, set to 0 to disable sending ping messages from the server side. Valid time units are {s, m, h}."`
+	WSPongWait     time.Duration `long:"ws-pong-wait" description:"The time we wait for a pong response message on REST based WebSocket connections before the connection is closed as inactive. Valid time units are {s, m, h}."`
 
 	MacaroonPath string `long:"macaroonpath" description:"Path to write the admin macaroon for tapd's RPC and REST services if it doesn't exist"`
 	NoMacaroons  bool   `long:"no-macaroons" description:"Disable macaroon authentication, can only be used if server is not listening on a public interface."`
@@ -257,28 +265,47 @@ type LndConfig struct {
 	MacaroonPath string `long:"macaroonpath" description:"The full path to the single macaroon to use, either the admin.macaroon or a custom baked one. Cannot be specified at the same time as macaroondir. A custom macaroon must contain ALL permissions required for all subservers to work, otherwise permission errors will occur."`
 
 	TLSPath string `long:"tlspath" description:"Path to lnd tls certificate"`
+
+	// RPCTimeout is the timeout we'll use for RPC requests to lnd.
+	RPCTimeout time.Duration `long:"rpctimeout" description:"The timeout to use for RPC requests to lnd; a sufficiently long duration should be chosen to avoid issues with slow responses. Valid time units are {s, m, h}."`
 }
 
 // UniverseConfig is the config that houses any Universe related config
 // values.
 type UniverseConfig struct {
-	SyncInterval time.Duration `long:"syncinterval" description:"Amount of time to wait between universe syncs"`
+	SyncInterval time.Duration `long:"syncinterval" description:"Amount of time to wait between universe syncs. Valid time units are {s, m, h}."`
 
 	FederationServers []string `long:"federationserver" description:"The host:port of a Universe server peer with. These servers will be added as the default set of federation servers. Can be specified multiple times."`
 
-	PublicAccess bool `long:"public-access" description:"If true, and the Universe server is on a public interface, valid proof from remote parties will be accepted, and proofs will be queryable by remote parties. This applies to federation syncing as well as RPC insert and query."`
+	NoDefaultFederation bool `long:"no-default-federation" description:"If set, the default Universe server (available for testnet and mainnet) will not be added to the list of universe servers on startup."`
 
-	StatsCacheDuration time.Duration `long:"stats-cache-duration" description:"The amount of time to cache stats for before refreshing them."`
+	SyncAllAssets bool `long:"sync-all-assets" description:"If set, the federation syncer will default to syncing all assets."`
+
+	PublicAccess string `long:"public-access" description:"The public access mode for the universe server, controlling whether remote parties can read from and/or write to this universe server over RPC if exposed to a public network interface. This can be unset, 'r', 'w', or 'rw'. If unset, public access is not enabled for the universe server. If 'r' is included, public access is allowed for read-only endpoints. If 'w' is included, public access is allowed for write endpoints."`
+
+	StatsCacheDuration time.Duration `long:"stats-cache-duration" description:"The amount of time to cache stats for before refreshing them. Valid time units are {s, m, h}."`
 
 	UniverseQueriesPerSecond rate.Limit `long:"max-qps" description:"The maximum number of queries per second across the set of active universe queries that is permitted. Anything above this starts to get rate limited."`
 
 	UniverseQueriesBurst int `long:"req-burst-budget" description:"The burst budget for the universe query rate limiting."`
+
+	MultiverseCaches *tapdb.MultiverseCacheConfig `group:"multiverse-caches" namespace:"multiverse-caches"`
 }
 
-// AddressConfig is the config that houses any address Book related config
+// AddrBookConfig is the config that houses any address Book related config
 // values.
 type AddrBookConfig struct {
 	DisableSyncer bool `long:"disable-syncer" description:"If true, tapd will not try to sync issuance proofs for unknown assets when creating an address."`
+}
+
+// ExperimentalConfig houses experimental tapd cli configuration options.
+type ExperimentalConfig struct {
+	Rfq rfq.CliConfig `group:"rfq" namespace:"rfq"`
+}
+
+// Validate returns an error if the configuration is invalid.
+func (c *ExperimentalConfig) Validate() error {
+	return c.Rfq.Validate()
 }
 
 // Config is the main config for the tapd cli command.
@@ -292,13 +319,13 @@ type Config struct {
 
 	DataDir        string `long:"datadir" description:"The directory to store tapd's data within"`
 	LogDir         string `long:"logdir" description:"Directory to log output."`
-	MaxLogFiles    int    `long:"maxlogfiles" description:"Maximum logfiles to keep (0 for no rotation)"`
-	MaxLogFileSize int    `long:"maxlogfilesize" description:"Maximum logfile size in MB"`
+	MaxLogFiles    int    `long:"maxlogfiles" hidden:"true" description:"DEPRECATED! Use logging.file.max-files instead. Maximum logfiles to keep (0 for no rotation)"`
+	MaxLogFileSize int    `long:"maxlogfilesize" hidden:"true" description:"DEPRECATED! Use logging.file.max-file-size instead. Maximum logfile size in MB"`
+
+	Logging *build.LogConfig `group:"logging" namespace:"logging"`
 
 	CPUProfile string `long:"cpuprofile" description:"Write CPU profile to the specified file"`
 	Profile    string `long:"profile" description:"Enable HTTP profiling on either a port or host:port"`
-
-	BatchMintingInterval time.Duration `long:"batch-minting-interval" description:"A duration (1m, 2h, etc) that governs how frequently pending assets are gather into a batch to be minted."`
 
 	ReOrgSafeDepth int32 `long:"reorgsafedepth" description:"The number of confirmations we'll wait for before considering a transaction safely buried in the chain."`
 
@@ -307,7 +334,7 @@ type Config struct {
 	HashMailCourier         *proof.HashMailCourierCfg    `group:"hashmailcourier" namespace:"hashmailcourier"`
 	UniverseRpcCourier      *proof.UniverseRpcCourierCfg `group:"universerpccourier" namespace:"universerpccourier"`
 
-	CustodianProofRetrievalDelay time.Duration `long:"custodianproofretrievaldelay" description:"The number of seconds the custodian waits after identifying an asset transfer on-chain and before retrieving the corresponding proof."`
+	CustodianProofRetrievalDelay time.Duration `long:"custodianproofretrievaldelay" description:"The number of seconds the custodian waits after identifying an asset transfer on-chain and before retrieving the corresponding proof. Valid time units are {s, m, h}."`
 
 	ChainConf *ChainConfig
 	RpcConf   *RpcConfig
@@ -324,9 +351,15 @@ type Config struct {
 
 	Prometheus monitoring.PrometheusConfig `group:"prometheus" namespace:"prometheus"`
 
+	Experimental *ExperimentalConfig `group:"experimental" namespace:"experimental"`
+
 	// LogWriter is the root logger that all of the daemon's subloggers are
 	// hooked up to.
 	LogWriter *build.RotatingLogWriter
+
+	// LogMgr is the sublogger manager that is used to create subloggers for
+	// the daemon.
+	LogMgr *build.SubLoggerManager
 
 	// networkDir is the path to the directory of the currently active
 	// network. This path will hold the files related to each different
@@ -344,14 +377,17 @@ type Config struct {
 
 // DefaultConfig returns all default values for the Config struct.
 func DefaultConfig() Config {
+	logWriter := build.NewRotatingLogWriter()
+	defaultLogConfig := build.DefaultLogConfig()
 	return Config{
 		TapdDir:        DefaultTapdDir,
 		ConfigFile:     DefaultConfigFile,
 		DataDir:        defaultDataDir,
 		DebugLevel:     defaultLogLevel,
 		LogDir:         defaultLogDir,
-		MaxLogFiles:    defaultMaxLogFiles,
-		MaxLogFileSize: defaultMaxLogFileSize,
+		MaxLogFiles:    defaultLogConfig.File.MaxLogFiles,
+		MaxLogFileSize: defaultLogConfig.File.MaxLogFileSize,
+		Logging:        defaultLogConfig,
 		net:            &tor.ClearNet{},
 		RpcConf: &RpcConfig{
 			TLSCertPath:       defaultTLSCertPath,
@@ -368,6 +404,7 @@ func DefaultConfig() Config {
 		Lnd: &LndConfig{
 			Host:         "localhost:10009",
 			MacaroonPath: defaultLndMacaroonPath,
+			RPCTimeout:   defaultLndRPCTimeout,
 		},
 		DatabaseBackend: DatabaseBackendSqlite,
 		Sqlite: &tapdb.SqliteConfig{
@@ -378,9 +415,11 @@ func DefaultConfig() Config {
 			Port:               5432,
 			MaxOpenConnections: 10,
 		},
-		LogWriter:               build.NewRotatingLogWriter(),
+		LogWriter: logWriter,
+		LogMgr: build.NewSubLoggerManager(build.NewDefaultLogHandlers(
+			defaultLogConfig, logWriter,
+		)...),
 		Prometheus:              monitoring.DefaultPrometheusConfig(),
-		BatchMintingInterval:    defaultBatchMintingInterval,
 		ReOrgSafeDepth:          defaultReOrgSafeDepth,
 		DefaultProofCourierAddr: defaultProofCourierAddr,
 		HashMailCourier: &proof.HashMailCourierCfg{
@@ -400,6 +439,7 @@ func DefaultConfig() Config {
 				InitialBackoff:   defaultProofTransferInitialBackoff,
 				MaxBackoff:       defaultProofTransferMaxBackoff,
 			},
+			ServiceRequestTimeout: defaultProofCourierServiceResponseTimeout,
 		},
 		CustodianProofRetrievalDelay: defaultProofRetrievalDelay,
 		Universe: &UniverseConfig{
@@ -408,9 +448,17 @@ func DefaultConfig() Config {
 				defaultUniverseMaxQps,
 			),
 			UniverseQueriesBurst: defaultUniverseQueriesBurst,
+			MultiverseCaches: fn.Ptr(
+				tapdb.DefaultMultiverseCacheConfig(),
+			),
 		},
 		AddrBook: &AddrBookConfig{
 			DisableSyncer: false,
+		},
+		Experimental: &ExperimentalConfig{
+			Rfq: rfq.CliConfig{
+				AcceptPriceDeviationPpm: rfq.DefaultAcceptPriceDeviationPpm,
+			},
 		},
 	}
 }
@@ -489,7 +537,7 @@ func LoadConfig(interceptor signal.Interceptor) (*Config, btclog.Logger, error) 
 		return nil, nil, err
 	}
 
-	cfgLogger := cfg.LogWriter.GenSubLogger("CONF", nil)
+	cfgLogger := cfg.LogMgr.GenSubLogger("CONF", nil)
 
 	// Make sure everything we just loaded makes sense.
 	cleanCfg, err := ValidateConfig(cfg, cfgLogger)
@@ -503,11 +551,33 @@ func LoadConfig(interceptor signal.Interceptor) (*Config, btclog.Logger, error) 
 		return nil, nil, err
 	}
 
+	// Initialize the log manager with the actual logging configuration. We
+	// need to support the deprecated max log files and max log file size
+	// options for now.
+	if cleanCfg.MaxLogFiles != build.DefaultMaxLogFiles {
+		cfgLogger.Warnf("Config option 'maxlogfiles' is deprecated, " +
+			"please use 'logging.file.max-files' instead")
+
+		cleanCfg.Logging.File.MaxLogFiles = cleanCfg.MaxLogFiles
+	}
+	if cleanCfg.MaxLogFileSize != build.DefaultMaxLogFileSize {
+		cfgLogger.Warnf("Config option 'maxlogfilesize' is " +
+			"deprecated, please use 'logging.file.max-file-size' " +
+			"instead")
+
+		cleanCfg.Logging.File.MaxLogFileSize = cleanCfg.MaxLogFileSize
+	}
+	cfg.LogMgr = build.NewSubLoggerManager(build.NewDefaultLogHandlers(
+		cleanCfg.Logging, cleanCfg.LogWriter,
+	)...)
+
 	// Initialize logging at the default logging level.
-	tap.SetupLoggers(cfg.LogWriter, interceptor)
-	err = cfg.LogWriter.InitLogRotator(
-		filepath.Join(cleanCfg.LogDir, defaultLogFilename),
-		cleanCfg.MaxLogFileSize, cfg.MaxLogFiles,
+	tap.SetupLoggers(cleanCfg.LogMgr, interceptor)
+
+	err = cleanCfg.LogWriter.InitLogRotator(
+		cleanCfg.Logging.File, filepath.Join(
+			cleanCfg.LogDir, defaultLogFilename,
+		),
 	)
 	if err != nil {
 		_, _ = fmt.Fprintln(os.Stderr, err.Error())
@@ -515,7 +585,7 @@ func LoadConfig(interceptor signal.Interceptor) (*Config, btclog.Logger, error) 
 	}
 
 	// Parse, validate, and set debug log level(s).
-	err = build.ParseAndSetDebugLevels(cfg.DebugLevel, cfg.LogWriter)
+	err = build.ParseAndSetDebugLevels(cleanCfg.DebugLevel, cleanCfg.LogMgr)
 	if err != nil {
 		str := "error parsing debug level: %v"
 		cfgLogger.Warnf(str, err)
@@ -752,7 +822,7 @@ func ValidateConfig(cfg Config, cfgLogger btclog.Logger) (*Config, error) {
 	// Special show command to list supported subsystems and exit.
 	if cfg.DebugLevel == "show" {
 		fmt.Println("Supported subsystems",
-			cfg.LogWriter.SupportedSubsystems())
+			cfg.LogMgr.SupportedSubsystems())
 		os.Exit(0)
 	}
 
@@ -819,6 +889,21 @@ func ValidateConfig(cfg Config, cfgLogger btclog.Logger) (*Config, error) {
 			return nil, mkErr("error enforcing safe "+
 				"authentication on REST ports: %v", err)
 		}
+	}
+
+	// Validate the experimental command line config.
+	err = cfg.Experimental.Validate()
+	if err != nil {
+		return nil, fmt.Errorf("error in experimental command line "+
+			"config: %w", err)
+	}
+
+	// Use a way higher re-org safe depth value for testnet (if the user
+	// didn't specify a custom value).
+	if cfg.ActiveNetParams.Net == chaincfg.TestNet3Params.Net &&
+		cfg.ReOrgSafeDepth == defaultReOrgSafeDepth {
+
+		cfg.ReOrgSafeDepth = testnetDefaultReOrgSafeDepth
 	}
 
 	// All good, return the sanitized result.
@@ -1113,5 +1198,6 @@ func getLnd(network string, cfg *LndConfig,
 		BlockUntilChainSynced: true,
 		BlockUntilUnlocked:    true,
 		CallerCtx:             ctxc,
+		RPCTimeout:            cfg.RPCTimeout,
 	})
 }

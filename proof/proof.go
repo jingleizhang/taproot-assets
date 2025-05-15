@@ -9,6 +9,7 @@ import (
 	"github.com/btcsuite/btcd/blockchain"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/lightninglabs/taproot-assets/asset"
+	"github.com/lightninglabs/taproot-assets/commitment"
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/tlv"
 )
@@ -277,8 +278,6 @@ type Proof struct {
 	// MetaReveal is the set of bytes that were revealed to prove the
 	// derivation of the meta data hash contained in the genesis asset.
 	//
-	// TODO(roasbeef): use even/odd framing here?
-	//
 	// NOTE: This field is optional, and can only be specified if the asset
 	// above is a genesis asset. If specified, then verifiers _should_ also
 	// verify the hashes match up.
@@ -300,14 +299,30 @@ type Proof struct {
 	// provided for minting proofs, and must be empty for non-minting
 	// proofs. This allows for derivation of the asset ID. If the asset is
 	// part of an asset group, the Genesis information is also used for
-	// rederivation of the asset group key.
+	// re-derivation of the asset group key.
 	GenesisReveal *asset.Genesis
 
-	// GroupKeyReveal is an optional set of bytes that represent the public
-	// key and Tapscript root used to derive the final tweaked group key for
-	// the asset group. This field must be provided for issuance proofs of
-	// grouped assets.
-	GroupKeyReveal *asset.GroupKeyReveal
+	// GroupKeyReveal contains the data required to derive the final tweaked
+	// group key for an asset group.
+	//
+	// NOTE: This field is mandatory for the group anchor (i.e., the initial
+	// minting tranche of an asset group). Subsequent minting tranches
+	// require only a valid signature for the previously revealed group key.
+	GroupKeyReveal asset.GroupKeyReveal
+
+	// AltLeaves represent data used to construct an Asset commitment, that
+	// was inserted in the output anchor Tap commitment. These data-carrying
+	// leaves are used for a purpose distinct from representing individual
+	// Taproot Assets.
+	AltLeaves []asset.AltLeaf[asset.Asset]
+
+	// UnknownOddTypes is a map of unknown odd types that were encountered
+	// during decoding. This map is used to preserve unknown types that we
+	// don't know of yet, so we can still encode them back when serializing.
+	// This enables forward compatibility with future versions of the
+	// protocol as it allows new odd (optional) types to be added without
+	// breaking old clients that don't yet fully understand them.
+	UnknownOddTypes tlv.TypeMap
 }
 
 // OutPoint returns the outpoint that commits to the asset associated with this
@@ -321,7 +336,7 @@ func (p *Proof) OutPoint() wire.OutPoint {
 
 // EncodeRecords returns the set of known TLV records to encode a Proof.
 func (p *Proof) EncodeRecords() []tlv.Record {
-	records := make([]tlv.Record, 0, 15)
+	records := make([]tlv.Record, 0, 16)
 	records = append(records, VersionRecord(&p.Version))
 	records = append(records, PrevOutRecord(&p.PrevOut))
 	records = append(records, BlockHeaderRecord(&p.BlockHeader))
@@ -361,7 +376,12 @@ func (p *Proof) EncodeRecords() []tlv.Record {
 			&p.GroupKeyReveal,
 		))
 	}
-	return records
+	if len(p.AltLeaves) > 0 {
+		records = append(records, AltLeavesRecord(&p.AltLeaves))
+	}
+
+	// Add any unknown odd types that were encountered during decoding.
+	return asset.CombineRecords(records, p.UnknownOddTypes)
 }
 
 // DecodeRecords returns the set of known TLV records to decode a Proof.
@@ -382,6 +402,7 @@ func (p *Proof) DecodeRecords() []tlv.Record {
 		BlockHeightRecord(&p.BlockHeight),
 		GenesisRevealRecord(&p.GenesisReveal),
 		GroupKeyRevealRecord(&p.GroupKeyReveal),
+		AltLeavesRecord(&p.AltLeaves),
 	}
 }
 
@@ -427,7 +448,44 @@ func (p *Proof) Decode(r io.Reader) error {
 	// Note, we can't use the DecodeP2P method here, because the additional
 	// inputs records might be larger than 64k each. Instead, we add
 	// individual limits to each record.
-	return stream.Decode(r)
+	unknownOddTypes, err := asset.TlvStrictDecode(
+		stream, r, KnownProofTypes,
+	)
+	if err != nil {
+		return err
+	}
+
+	p.UnknownOddTypes = unknownOddTypes
+
+	return nil
+}
+
+// Bytes returns the serialized proof.
+func (p *Proof) Bytes() ([]byte, error) {
+	var buf bytes.Buffer
+	err := p.Encode(&buf)
+	if err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+// Record returns a TLV record that can be used to encode/decode a Proof to/from
+// a TLV stream.
+//
+// NOTE: This is part of the tlv.RecordProducer interface.
+func (p *Proof) Record() tlv.Record {
+	sizeFunc := func() uint64 {
+		proofBytes, err := p.Bytes()
+		if err != nil {
+			panic(err)
+		}
+		return uint64(len(proofBytes))
+	}
+
+	// Note that we set the type here as zero, as when used with a
+	// tlv.RecordT, the type param will be used as the type.
+	return tlv.MakeDynamicRecord(0, p, sizeFunc, Encoder, Decoder)
 }
 
 // IsUnknownVersion returns true if a proof has a version that is not recognized
@@ -440,6 +498,47 @@ func (p *Proof) IsUnknownVersion() bool {
 		return true
 	}
 }
+
+// ToChainAsset converts the proof to a ChainAsset.
+func (p *Proof) ToChainAsset() (asset.ChainAsset, error) {
+	emptyAsset := asset.ChainAsset{}
+
+	if p.InclusionProof.CommitmentProof == nil {
+		return emptyAsset, fmt.Errorf("inclusion proof is missing " +
+			"commitment proof")
+	}
+
+	commitmentProof := p.InclusionProof.CommitmentProof
+	tsSibling, tsHash, err := commitment.MaybeEncodeTapscriptPreimage(
+		commitmentProof.TapSiblingPreimage,
+	)
+	if err != nil {
+		return emptyAsset, fmt.Errorf("error encoding tapscript "+
+			"sibling: %w", err)
+	}
+
+	tapProof, err := commitmentProof.DeriveByAssetInclusion(&p.Asset)
+	if err != nil {
+		return emptyAsset, fmt.Errorf("error deriving inclusion "+
+			"proof: %w", err)
+	}
+
+	merkleRoot := tapProof.TapscriptRoot(tsHash)
+	return asset.ChainAsset{
+		Asset:                  &p.Asset,
+		AnchorTx:               &p.AnchorTx,
+		AnchorBlockHash:        p.BlockHeader.BlockHash(),
+		AnchorOutpoint:         p.OutPoint(),
+		AnchorBlockHeight:      p.BlockHeight,
+		AnchorBlockTimestamp:   p.BlockHeader.Timestamp.Unix(),
+		AnchorInternalKey:      p.InclusionProof.InternalKey,
+		AnchorMerkleRoot:       merkleRoot[:],
+		AnchorTapscriptSibling: tsSibling,
+	}, nil
+}
+
+// Ensure Proof implements the tlv.RecordProducer interface.
+var _ tlv.RecordProducer = (*Proof)(nil)
 
 // SparseDecode can be used to decode a proof from a reader without decoding
 // and parsing the entire thing. This handles ignoring the magic bytes, and
@@ -465,4 +564,33 @@ func SparseDecode(r io.Reader, records ...tlv.Record) error {
 	}
 
 	return proofStream.Decode(r)
+}
+
+// Decode decodes a proof from a byte slice.
+func Decode(blob []byte) (*Proof, error) {
+	var p Proof
+	err := p.Decode(bytes.NewReader(blob))
+	if err != nil {
+		return nil, err
+	}
+	return &p, nil
+}
+
+// EncodeFile encodes a proof file into a byte slice.
+func EncodeFile(f *File) ([]byte, error) {
+	var b bytes.Buffer
+	if err := f.Encode(&b); err != nil {
+		return nil, err
+	}
+	return b.Bytes(), nil
+}
+
+// DecodeFile decodes a proof file from a byte slice.
+func DecodeFile(blob []byte) (*File, error) {
+	var f File
+	err := f.Decode(bytes.NewReader(blob))
+	if err != nil {
+		return nil, err
+	}
+	return &f, nil
 }

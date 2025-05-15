@@ -4,17 +4,37 @@ import (
 	"bytes"
 	"io"
 
+	"github.com/lightninglabs/taproot-assets/asset"
 	"github.com/lightninglabs/taproot-assets/mssmt"
 	"github.com/lightningnetwork/lnd/tlv"
 )
 
+func TapCommitmentVersionEncoder(w io.Writer, val any, buf *[8]byte) error {
+	if t, ok := val.(*TapCommitmentVersion); ok {
+		return tlv.EUint8T(w, uint8(*t), buf)
+	}
+	return tlv.NewTypeForEncodingErr(val, "Version")
+}
+
+func TapCommitmentVersionDecoder(r io.Reader, val any, buf *[8]byte,
+	l uint64) error {
+
+	if typ, ok := val.(*TapCommitmentVersion); ok {
+		var t uint8
+		if err := tlv.DUint8(r, &t, buf, l); err != nil {
+			return err
+		}
+		*typ = TapCommitmentVersion(t)
+		return nil
+	}
+	return tlv.NewTypeForDecodingErr(val, "Version", l, 1)
+}
+
 func AssetProofEncoder(w io.Writer, val any, buf *[8]byte) error {
 	if t, ok := val.(**AssetProof); ok {
-		records := []tlv.Record{
-			AssetProofVersionRecord(&(*t).Version),
-			AssetProofAssetIDRecord(&(*t).TapKey),
-			AssetProofRecord(&(*t).Proof),
-		}
+		records := asset.CombineRecords(
+			(*t).Records(), (*t).UnknownOddTypes,
+		)
 		stream, err := tlv.NewStream(records...)
 		if err != nil {
 			return err
@@ -37,18 +57,21 @@ func AssetProofDecoder(r io.Reader, val any, buf *[8]byte, l uint64) error {
 			return err
 		}
 		var proof AssetProof
-		records := []tlv.Record{
-			AssetProofVersionRecord(&proof.Version),
-			AssetProofAssetIDRecord(&proof.TapKey),
-			AssetProofRecord(&proof.Proof),
-		}
-		stream, err := tlv.NewStream(records...)
+		stream, err := tlv.NewStream(proof.Records()...)
 		if err != nil {
 			return err
 		}
-		if err := stream.Decode(bytes.NewReader(streamBytes)); err != nil {
+
+		unknownOddTypes, err := asset.TlvStrictDecodeP2P(
+			stream, bytes.NewReader(streamBytes),
+			KnownAssetProofTypes,
+		)
+		if err != nil {
 			return err
 		}
+
+		proof.UnknownOddTypes = unknownOddTypes
+
 		*typ = &proof
 		return nil
 	}
@@ -57,10 +80,9 @@ func AssetProofDecoder(r io.Reader, val any, buf *[8]byte, l uint64) error {
 
 func TaprootAssetProofEncoder(w io.Writer, val any, buf *[8]byte) error {
 	if t, ok := val.(*TaprootAssetProof); ok {
-		records := []tlv.Record{
-			TaprootAssetProofVersionRecord(&(*t).Version),
-			TaprootAssetProofRecord(&(*t).Proof),
-		}
+		records := asset.CombineRecords(
+			(*t).Records(), (*t).UnknownOddTypes,
+		)
 		stream, err := tlv.NewStream(records...)
 		if err != nil {
 			return err
@@ -85,17 +107,21 @@ func TaprootAssetProofDecoder(r io.Reader, val any, buf *[8]byte,
 			return err
 		}
 		var proof TaprootAssetProof
-		records := []tlv.Record{
-			TaprootAssetProofVersionRecord(&proof.Version),
-			TaprootAssetProofRecord(&proof.Proof),
-		}
-		stream, err := tlv.NewStream(records...)
+		stream, err := tlv.NewStream(proof.Records()...)
 		if err != nil {
 			return err
 		}
-		if err := stream.Decode(bytes.NewReader(streamBytes)); err != nil {
+
+		unknownOddTypes, err := asset.TlvStrictDecodeP2P(
+			stream, bytes.NewReader(streamBytes),
+			KnownTaprootAssetProofTypes,
+		)
+		if err != nil {
 			return err
 		}
+
+		proof.UnknownOddTypes = unknownOddTypes
+
 		*typ = proof
 		return nil
 	}
@@ -141,12 +167,12 @@ func TapscriptPreimageEncoder(w io.Writer, val any, buf *[8]byte) error {
 	if t, ok := val.(**TapscriptPreimage); ok {
 		// We'll encode the pre-image as 1 byte for the type of the
 		// pre-image, and then the pre-image itself.
-		siblingType := uint8((*t).SiblingType)
+		siblingType := uint8((*t).siblingType)
 		if err := tlv.EUint8(w, &siblingType, buf); err != nil {
 			return err
 		}
 
-		return tlv.EVarBytes(w, &(*t).SiblingPreimage, buf)
+		return tlv.EVarBytes(w, &(*t).siblingPreimage, buf)
 	}
 
 	return tlv.NewTypeForEncodingErr(val, "*TapscriptPreimage")
@@ -175,10 +201,10 @@ func TapscriptPreimageDecoder(r io.Reader, val any, buf *[8]byte,
 			return err
 		}
 
-		preimage.SiblingType = TapscriptPreimageType(siblingType)
+		preimage.siblingType = TapscriptPreimageType(siblingType)
 
 		// Now we'll read out the pre-image itself.
-		err = tlv.DVarBytes(r, &preimage.SiblingPreimage, buf, l-1)
+		err = tlv.DVarBytes(r, &preimage.siblingPreimage, buf, l-1)
 		if err != nil {
 			return err
 		}

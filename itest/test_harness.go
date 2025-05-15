@@ -20,7 +20,6 @@ import (
 	"github.com/lightninglabs/taproot-assets/taprpc"
 	unirpc "github.com/lightninglabs/taproot-assets/taprpc/universerpc"
 	"github.com/lightningnetwork/lnd/build"
-	"github.com/lightningnetwork/lnd/keychain"
 	"github.com/lightningnetwork/lnd/lntest"
 	"github.com/lightningnetwork/lnd/lntest/node"
 	"github.com/lightningnetwork/lnd/lntest/wait"
@@ -100,6 +99,7 @@ type harnessTest struct {
 	tapd *tapdHarness
 
 	logWriter *build.RotatingLogWriter
+	logMgr    *build.SubLoggerManager
 
 	interceptor signal.Interceptor
 }
@@ -117,6 +117,7 @@ func (h *harnessTest) newHarnessTest(t *testing.T, net *lntest.HarnessTest,
 		universeServer: universeServer,
 		tapd:           tapd,
 		logWriter:      h.logWriter,
+		logMgr:         h.logMgr,
 		interceptor:    h.interceptor,
 	}
 }
@@ -184,13 +185,13 @@ func (h *harnessTest) shutdown(_ *testing.T) error {
 		err := h.proofCourier.Stop()
 		if err != nil {
 			return fmt.Errorf("unable to stop proof courier "+
-				"harness: %v", err)
+				"harness: %w", err)
 		}
 	}
 
 	err = h.tapd.stop(!*noDelete)
 	if err != nil {
-		return fmt.Errorf("unable to stop tapd: %v", err)
+		return fmt.Errorf("unable to stop tapd: %w", err)
 	}
 
 	return nil
@@ -201,14 +202,21 @@ func (h *harnessTest) shutdown(_ *testing.T) error {
 func (h *harnessTest) setupLogging() {
 	h.logWriter = build.NewRotatingLogWriter()
 
+	logConfig := build.DefaultLogConfig()
+	h.logMgr = build.NewSubLoggerManager(
+		build.NewDefaultLogHandlers(logConfig, h.logWriter)...,
+	)
+
 	var err error
 	h.interceptor, err = signal.Intercept()
 	require.NoError(h.t, err)
 
-	tap.SetupLoggers(h.logWriter, h.interceptor)
-	aperture.SetupLoggers(h.logWriter, h.interceptor)
+	tap.SetupLoggers(h.logMgr, h.interceptor)
+	aperture.SetupLoggers(h.logMgr, h.interceptor)
 
-	h.logWriter.SetLogLevels(*logLevel)
+	UseLogger(h.logMgr.GenSubLogger(Subsystem, func() {}))
+
+	h.logMgr.SetLogLevels(*logLevel)
 }
 
 func (h *harnessTest) newLndClient(
@@ -290,11 +298,13 @@ func nextAvailablePort() int {
 // setupHarnesses creates new server and client harnesses that are connected
 // to each other through an in-memory gRPC connection.
 func setupHarnesses(t *testing.T, ht *harnessTest,
-	lndHarness *lntest.HarnessTest,
+	lndHarness *lntest.HarnessTest, uniServerLndHarness *node.HarnessNode,
 	proofCourierType proof.CourierType) (*tapdHarness,
 	*universeServerHarness, proof.CourierHarness) {
 
-	universeServer := newUniverseServerHarness(t, ht, lndHarness.Bob)
+	// Create a new universe server harness and start it.
+	t.Log("Starting universe server harness")
+	universeServer := newUniverseServerHarness(t, ht, uniServerLndHarness)
 
 	t.Logf("Starting universe server harness, listening on %v",
 		universeServer.ListenAddr)
@@ -317,13 +327,16 @@ func setupHarnesses(t *testing.T, ht *harnessTest,
 	// If nothing is specified, we use the universe RPC proof courier by
 	// default.
 	default:
+		t.Logf("Address of universe server as proof courier: %v",
+			universeServer.service.rpcHost())
 		proofCourier = universeServer
 	}
 
-	// Create a tapd that uses Bob and connect it to the universe server.
+	alice := lndHarness.NewNodeWithCoins("Alice", nil)
+
+	// Create a tapd that uses Alice and connect it to the universe server.
 	tapdHarness := setupTapdHarness(
-		t, ht, lndHarness.Alice, universeServer,
-		func(params *tapdHarnessParams) {
+		t, ht, alice, universeServer, func(params *tapdHarnessParams) {
 			params.proofCourier = proofCourier
 		},
 	)
@@ -377,9 +390,31 @@ type tapdHarnessParams struct {
 	// sqliteDatabaseFilePath is the path to the SQLite database file to
 	// use.
 	sqliteDatabaseFilePath *string
+
+	// disableSyncCache indicates whether the sync cache should be disabled.
+	disableSyncCache bool
+
+	// oracleServerAddress defines the oracle server's address that this
+	// tapd harness is going to use.
+	oracleServerAddress string
 }
 
+// Option is a tapd harness option.
 type Option func(*tapdHarnessParams)
+
+// WithOracleServer is a functional option that sets the oracle server address
+// option to the provided string.
+func WithOracleServer(global, override string) Option {
+	return func(th *tapdHarnessParams) {
+		switch {
+		case len(override) > 0:
+			th.oracleServerAddress = override
+
+		case len(global) > 0:
+			th.oracleServerAddress = global
+		}
+	}
+}
 
 // setupTapdHarness creates a new tapd that connects to the given lnd node
 // and to the given universe server.
@@ -412,6 +447,8 @@ func setupTapdHarness(t *testing.T, ht *harnessTest,
 		ho.addrAssetSyncerDisable = params.addrAssetSyncerDisable
 		ho.fedSyncTickerInterval = params.fedSyncTickerInterval
 		ho.sqliteDatabaseFilePath = params.sqliteDatabaseFilePath
+		ho.disableSyncCache = params.disableSyncCache
+		ho.oracleServerAddress = params.oracleServerAddress
 	}
 
 	tapdCfg := tapdConfig{
@@ -471,10 +508,10 @@ func isMempoolEmpty(miner *rpcclient.Client, timeout time.Duration) (bool,
 	}
 }
 
-// waitForNTxsInMempool polls until finding the desired number of transactions
+// WaitForNTxsInMempool polls until finding the desired number of transactions
 // in the provided miner's mempool. An error is returned if this number is not
 // met after the given timeout.
-func waitForNTxsInMempool(miner *rpcclient.Client, n int,
+func WaitForNTxsInMempool(miner *rpcclient.Client, n int,
 	timeout time.Duration) ([]*chainhash.Hash, error) {
 
 	breakTimeout := time.After(timeout)
@@ -522,15 +559,11 @@ func formatProtoJSON(resp proto.Message) (string, error) {
 	return string(jsonBytes), nil
 }
 
-// lndKeyDescToTap converts an lnd key descriptor to a tap key descriptor.
-func lndKeyDescToTap(lnd keychain.KeyDescriptor) *taprpc.KeyDescriptor {
-	return &taprpc.KeyDescriptor{
-		RawKeyBytes: lnd.PubKey.SerializeCompressed(),
-		KeyLoc: &taprpc.KeyLocator{
-			KeyFamily: int32(lnd.Family),
-			KeyIndex:  int32(lnd.Index),
-		},
-	}
+func toJSON(t *testing.T, resp proto.Message) string {
+	jsonStr, err := formatProtoJSON(resp)
+	require.NoError(t, err)
+
+	return jsonStr
 }
 
 // LogfTimestamped logs the given message with the current timestamp.

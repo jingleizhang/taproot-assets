@@ -21,6 +21,7 @@ import (
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/keychain"
 	"github.com/lightningnetwork/lnd/lnrpc/signrpc"
+	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/exp/constraints"
 )
@@ -32,6 +33,8 @@ var (
 
 	HexCompressedPubKeyLen = hex.EncodedLen(btcec.PubKeyBytesLenCompressed)
 	HexTaprootPkScript     = hex.EncodedLen(input.P2TRSize)
+
+	DefaultHashLockWitness = []byte("foobar")
 )
 
 // RandBool rolls a random boolean.
@@ -40,6 +43,15 @@ func RandBool() bool {
 	defer randLock.Unlock()
 
 	return rand.Int()%2 == 0
+}
+
+// RandFlip picks one of two values randomly.
+func RandFlip[T any](t, f T) T {
+	if RandBool() {
+		return t
+	} else {
+		return f
+	}
 }
 
 // RandInt31n returns a random 32-bit integer in the range [0, n).
@@ -86,9 +98,26 @@ func RandOp(t testing.TB) wire.OutPoint {
 	return op
 }
 
-func RandPrivKey(_ testing.TB) *btcec.PrivateKey {
+func RandPrivKey() *btcec.PrivateKey {
 	priv, _ := btcec.PrivKeyFromBytes(RandBytes(32))
 	return priv
+}
+
+func RandKeyLoc() keychain.KeyLocator {
+	return keychain.KeyLocator{
+		Index:  RandInt[uint32](),
+		Family: keychain.KeyFamily(RandInt[uint32]()),
+	}
+}
+
+func RandKeyDesc(t testing.TB) (keychain.KeyDescriptor, *btcec.PrivateKey) {
+	priv, err := btcec.NewPrivateKey()
+	require.NoError(t, err)
+
+	return keychain.KeyDescriptor{
+		PubKey:     priv.PubKey(),
+		KeyLocator: RandKeyLoc(),
+	}, priv
 }
 
 func SchnorrPubKey(t testing.TB, privKey *btcec.PrivateKey) *btcec.PublicKey {
@@ -110,7 +139,20 @@ func SchnorrKeysEqual(t testing.TB, a, b *btcec.PublicKey) bool {
 }
 
 func RandPubKey(t testing.TB) *btcec.PublicKey {
-	return SchnorrPubKey(t, RandPrivKey(t))
+	return SchnorrPubKey(t, RandPrivKey())
+}
+
+func RandCommitmentKeyRing(t *testing.T) lnwallet.CommitmentKeyRing {
+	return lnwallet.CommitmentKeyRing{
+		CommitPoint:         RandPubKey(t),
+		LocalCommitKeyTweak: RandBytes(32),
+		LocalHtlcKeyTweak:   RandBytes(32),
+		LocalHtlcKey:        RandPubKey(t),
+		RemoteHtlcKey:       RandPubKey(t),
+		ToLocalKey:          RandPubKey(t),
+		ToRemoteKey:         RandPubKey(t),
+		RevocationKey:       RandPubKey(t),
+	}
 }
 
 func RandBytes(num int) []byte {
@@ -358,6 +400,22 @@ func RandTxWitnesses(t testing.TB) wire.TxWitness {
 	return w
 }
 
+func RandTapLeaf(customScriptLen *int) txscript.TapLeaf {
+	scriptLen := 500
+
+	// Ensure that we never have an empty script.
+	randScriptLen := RandIntn(scriptLen)
+	if randScriptLen == 0 {
+		randScriptLen = 1
+	}
+
+	if customScriptLen != nil {
+		randScriptLen = *customScriptLen
+	}
+
+	return txscript.NewBaseTapLeaf(RandBytes(randScriptLen))
+}
+
 // ScriptHashLock returns a simple bitcoin script that locks the funds to a hash
 // lock of the given preimage.
 func ScriptHashLock(t *testing.T, preimage []byte) txscript.TapLeaf {
@@ -366,9 +424,9 @@ func ScriptHashLock(t *testing.T, preimage []byte) txscript.TapLeaf {
 	builder.AddOp(txscript.OP_HASH160)
 	builder.AddData(btcutil.Hash160(preimage))
 	builder.AddOp(txscript.OP_EQUALVERIFY)
-	script1, err := builder.Script()
+	script, err := builder.Script()
 	require.NoError(t, err)
-	return txscript.NewBaseTapLeaf(script1)
+	return txscript.NewBaseTapLeaf(script)
 }
 
 // ScriptSchnorrSig returns a simple bitcoin script that locks the funds to a
@@ -377,9 +435,57 @@ func ScriptSchnorrSig(t *testing.T, pubKey *btcec.PublicKey) txscript.TapLeaf {
 	builder := txscript.NewScriptBuilder()
 	builder.AddData(schnorr.SerializePubKey(pubKey))
 	builder.AddOp(txscript.OP_CHECKSIG)
-	script2, err := builder.Script()
+	script, err := builder.Script()
 	require.NoError(t, err)
-	return txscript.NewBaseTapLeaf(script2)
+	return txscript.NewBaseTapLeaf(script)
+}
+
+// ScriptCsv returns a simple bitcoin script that locks the funds with a CSV
+// lock for the given number of blocks.
+func ScriptCsv(t *testing.T, csv int64) txscript.TapLeaf {
+	builder := txscript.NewScriptBuilder()
+	builder.AddInt64(csv)
+	builder.AddOp(txscript.OP_CHECKSEQUENCEVERIFY)
+	script, err := builder.Script()
+	require.NoError(t, err)
+	return txscript.NewBaseTapLeaf(script)
+}
+
+// ScriptCltv returns a simple bitcoin script that locks the funds with a CLTV
+// lock until the given block height.
+func ScriptCltv(t *testing.T, cltv int64) txscript.TapLeaf {
+	builder := txscript.NewScriptBuilder()
+	builder.AddInt64(cltv)
+	builder.AddOp(txscript.OP_CHECKLOCKTIMEVERIFY)
+	script, err := builder.Script()
+	require.NoError(t, err)
+	return txscript.NewBaseTapLeaf(script)
+}
+
+// ScriptCltv0 returns a simple bitcoin script that locks the funds with a CLTV
+// lock until block height 0. The script is explicitly invalid as it should
+// return a clean stack error on evaluation.
+func ScriptCltv0(t *testing.T) txscript.TapLeaf {
+	builder := txscript.NewScriptBuilder()
+	builder.AddInt64(0)
+	builder.AddOp(txscript.OP_CHECKLOCKTIMEVERIFY)
+	builder.AddOp(txscript.OP_TRUE)
+	script, err := builder.Script()
+	require.NoError(t, err)
+	return txscript.NewBaseTapLeaf(script)
+}
+
+// ScriptCsv0 returns a simple bitcoin script that locks the funds with a CSV
+// lock for the zero blocks. The script is explicitly invalid as it should
+// return a clean stack error on evaluation.
+func ScriptCsv0(t *testing.T) txscript.TapLeaf {
+	builder := txscript.NewScriptBuilder()
+	builder.AddInt64(0)
+	builder.AddOp(txscript.OP_CHECKSEQUENCEVERIFY)
+	builder.AddOp(txscript.OP_TRUE)
+	script, err := builder.Script()
+	require.NoError(t, err)
+	return txscript.NewBaseTapLeaf(script)
 }
 
 // ReadTestDataFile reads a file from the testdata directory and returns its
@@ -392,20 +498,18 @@ func ReadTestDataFile(t *testing.T, fileName string) string {
 	return string(fileBytes)
 }
 
-// BuildTapscriptTree builds a Tapscript tree with two leaves, a hash lock
-// script and a signature verification script. It returns only the tapscript
-// tree root.
+// BuildTapscriptTreeNoReveal builds a Tapscript tree with two leaves, a hash
+// lock script and a signature verification script.
 func BuildTapscriptTreeNoReveal(t *testing.T,
-	internalKey *btcec.PublicKey) []byte {
+	internalKey *btcec.PublicKey) txscript.TapBranch {
 
-	hashLockWitness := []byte("foobar")
-	hashLockLeaf := ScriptHashLock(t, hashLockWitness)
+	hashLockLeaf := ScriptHashLock(t, bytes.Clone(DefaultHashLockWitness))
 	sigLeaf := ScriptSchnorrSig(t, internalKey)
 
 	tree := txscript.AssembleTaprootScriptTree(hashLockLeaf, sigLeaf)
-	rootHash := tree.RootNode.TapHash()
-
-	return rootHash[:]
+	return txscript.NewTapBranch(
+		tree.RootNode.Left(), tree.RootNode.Right(),
+	)
 }
 
 // BuildTapscriptTree builds a Tapscript tree with two leaves, a hash lock
@@ -417,9 +521,8 @@ func BuildTapscriptTree(t *testing.T, useHashLock, valid bool,
 
 	// Let's create a taproot asset script now. This is a hash lock with a
 	// simple preimage of "foobar".
-	hashLockWitness := []byte("foobar")
 	invalidHashLockWitness := []byte("not-foobar")
-	hashLockLeaf := ScriptHashLock(t, hashLockWitness)
+	hashLockLeaf := ScriptHashLock(t, bytes.Clone(DefaultHashLockWitness))
 
 	// Let's add a second script output as well to test the partial reveal.
 	sigLeaf := ScriptSchnorrSig(t, internalKey)
@@ -437,7 +540,7 @@ func BuildTapscriptTree(t *testing.T, useHashLock, valid bool,
 		testTapScript = input.TapscriptPartialReveal(
 			internalKey, hashLockLeaf, inclusionProof[:],
 		)
-		scriptWitness = hashLockWitness
+		scriptWitness = DefaultHashLockWitness
 
 		if !valid {
 			scriptWitness = invalidHashLockWitness

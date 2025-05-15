@@ -2,21 +2,22 @@ PKG := github.com/lightninglabs/taproot-assets
 
 BTCD_PKG := github.com/btcsuite/btcd
 LND_PKG := github.com/lightningnetwork/lnd
-GOACC_PKG := github.com/ory/go-acc
 GOIMPORTS_PKG := github.com/rinchsan/gosimports/cmd/gosimports
 TOOLS_DIR := tools
 
 GO_BIN := ${GOPATH}/bin
-GOACC_BIN := $(GO_BIN)/go-acc
 GOIMPORTS_BIN := $(GO_BIN)/gosimports
 MIGRATE_BIN := $(GO_BIN)/migrate
 
-COMMIT := $(shell git describe --tags --dirty)
+# VERSION_GO_FILE is the golang file which defines the current project version.
+VERSION_GO_FILE := "version.go"
 
-GOBUILD := GOEXPERIMENT=loopvar GO111MODULE=on go build -v
-GOINSTALL := GOEXPERIMENT=loopvar GO111MODULE=on go install -v
-GOTEST := GOEXPERIMENT=loopvar GO111MODULE=on go test
-GOMOD := GO111MODULE=on go mod
+COMMIT := $(shell git describe --tags --dirty --always)
+
+GOBUILD := go build -v
+GOINSTALL := go install -v
+GOTEST := go test
+GOMOD := go mod
 
 GOLIST := go list -deps $(PKG)/... | grep '$(PKG)'
 GOLIST_COVER := $$(go list -deps $(PKG)/... | grep '$(PKG)')
@@ -31,8 +32,6 @@ UNAME_S := $(shell uname -s)
 include make/testing_flags.mk
 include make/release_flags.mk
 include make/fuzz_flags.mk
-
-DEV_TAGS := $(if ${tags},$(DEV_TAGS) ${tags},$(DEV_TAGS))
 
 # We only return the part inside the double quote here to avoid escape issues
 # when calling the external release script. The second parameter can be used to
@@ -55,9 +54,10 @@ endif
 DOCKER_TOOLS = docker run \
   -v $(shell bash -c "go env GOCACHE || (mkdir -p /tmp/go-cache; echo /tmp/go-cache)"):/tmp/build/.cache \
   -v $(shell bash -c "go env GOMODCACHE || (mkdir -p /tmp/go-modcache; echo /tmp/go-modcache)"):/tmp/build/.modcache \
+  -v $(shell bash -c "mkdir -p /tmp/go-lint-cache; echo /tmp/go-lint-cache"):/root/.cache/golangci-lint \
   -v $$(pwd):/build taproot-assets-tools
 
-GO_VERSION = 1.21.4
+GO_VERSION = 1.23.9
 
 GREEN := "\\033[0;32m"
 NC := "\\033[0m"
@@ -73,10 +73,6 @@ all: scratch check install
 # DEPENDENCIES
 # ============
 
-$(GOACC_BIN):
-	@$(call print, "Installing go-acc.")
-	cd $(TOOLS_DIR); go install -trimpath $(GOACC_PKG)
-
 $(GOIMPORTS_BIN):
 	@$(call print, "Installing goimports.")
 	cd $(TOOLS_DIR); go install -trimpath $(GOIMPORTS_PKG)
@@ -91,14 +87,27 @@ build:
 	$(GOBUILD) -tags="$(DEV_TAGS)" -o tapcli-debug $(DEV_GCFLAGS) $(DEV_LDFLAGS) $(PKG)/cmd/tapcli
 
 build-itest:
+	@if [ ! -f itest/chantools/chantools ]; then \
+		$(call print, "Building itest chantools."); \
+		rm -rf itest/chantools; \
+		git clone --depth 1 --branch v0.13.5 https://github.com/lightninglabs/chantools.git itest/chantools; \
+		cd itest/chantools && go build ./cmd/chantools; \
+	else \
+		$(call print, "Chantools is already installed and available in itest/chantools."); \
+	fi
+
 	@$(call print, "Building itest btcd.")
 	CGO_ENABLED=0 $(GOBUILD) -tags="integration" -o itest/btcd-itest $(BTCD_PKG)
 
 	@$(call print, "Building itest lnd.")
-	CGO_ENABLED=0 $(GOBUILD) -tags="$(ITEST_TAGS)" -o itest/lnd-itest $(DEV_LDFLAGS) $(LND_PKG)/cmd/lnd
+	CGO_ENABLED=0 $(GOBUILD) -mod=mod -tags="$(ITEST_TAGS)" -o itest/lnd-itest $(DEV_LDFLAGS) $(LND_PKG)/cmd/lnd
 
 build-loadtest:
 	CGO_ENABLED=0 $(GOTEST) -c -tags="$(LOADTEST_TAGS)" -o loadtest $(PKG)/itest/loadtest
+
+build-docs-examples:
+	@$(call print, "Building docs examples.")
+	$(MAKE) -C ./docs/examples build
 
 install:
 	@$(call print, "Installing tapd and tapcli.")
@@ -113,7 +122,18 @@ release-install:
 release:
 	@$(call print, "Releasing tapd and tapcli binaries.")
 	$(VERSION_CHECK)
-	./scripts/release.sh build-release "$(VERSION_TAG)" "$(BUILD_SYSTEM)" "$(RELEASE_TAGS)" "$(RELEASE_LDFLAGS)"
+	./scripts/release.sh build-release "$(VERSION_TAG)" "$(BUILD_SYSTEM)" "$(RELEASE_TAGS)" "$(RELEASE_LDFLAGS)" "$(GO_VERSION)"
+
+release-tag:
+	@$(call print, "Adding release tag.")
+
+	tag=$$(./scripts/get-git-tag-name.sh ${VERSION_GO_FILE}); \
+	exit_status=$$?; \
+	if [ $$exit_status -ne 0 ]; then \
+		echo "Script encountered an error with exit status $$exit_status."; \
+	fi; \
+	echo "Adding git tag: $$tag"; \
+	git tag -as -m "Tag generated using command \`make release-tag\`." "$$tag";
 
 docker-release:
 	@$(call print, "Building release helper docker image.")
@@ -162,9 +182,9 @@ unit-trace:
 	@$(call print, "Running unit tests in trace mode (enabling package loggers on level trace).")
 	$(UNIT_TRACE)
 
-unit-cover: $(GOACC_BIN)
+unit-cover:
 	@$(call print, "Running unit coverage tests.")
-	$(GOACC); $(COVER_HTML)
+	$(UNIT_COVER)
 
 unit-race:
 	@$(call print, "Running unit race tests.")
@@ -177,7 +197,7 @@ itest-trace: build-itest itest-only-trace
 itest-only: aperture-dir
 	@$(call print, "Running integration tests with ${backend} backend.")
 	rm -rf itest/regtest; date
-	$(GOTEST) ./itest -v -tags="$(ITEST_TAGS)" $(TEST_FLAGS) $(ITEST_FLAGS) -btcdexec=./btcd-itest -logdir=regtest
+	$(GOTEST) ./itest -v $(ITEST_COVERAGE) -tags="$(ITEST_TAGS)" $(TEST_FLAGS) $(ITEST_FLAGS) -btcdexec=./btcd-itest -logdir=regtest
 
 itest-only-trace: aperture-dir
 	@$(call print, "Running integration tests with ${backend} backend.")
@@ -198,15 +218,19 @@ endif
 
 flakehunter: build-itest
 	@$(call print, "Flake hunting ${backend} integration tests.")
-	while [ $$? -eq 0 ]; do make itest-only; done
+	while [ $$? -eq 0 ]; do make itest-only-trace; done
 
 flake-unit:
 	@$(call print, "Flake hunting unit tests.")
-	while [ $$? -eq 0 ]; do '$(GOLIST) | $(XARGS) env $(GOTEST) -test.timeout=20m -count=1'; done
+	while [ $$? -eq 0 ]; do make unit nocache=1; done
+
+flake-unit-trace:
+	@$(call print, "Flake hunting unit tests in debug mode.")
+	while [ $$? -eq 0 ]; do make unit-trace nocache=1; done
 
 flake-unit-race:
 	@$(call print, "Flake hunting races in unit tests.")
-	while [ $$? -eq 0 ]; do env CGO_ENABLED=1 GORACE="history_size=7 halt_on_errors=1" $(GOLIST) | $(XARGS) env $(GOTEST) -race -test.timeout=20m -count=1; done
+	while [ $$? -eq 0 ]; do make unit-race nocache=1; done
 
 # =============
 # FUZZING
@@ -225,10 +249,20 @@ gen: rpc sqlc
 sqlc:
 	@$(call print, "Generating sql models and queries in Go")
 	./scripts/gen_sqlc_docker.sh
+	@$(call print, "Merging SQL migrations into consolidated schemas")
+	go run ./cmd/merge-sql-schemas/main.go
 
 sqlc-check: sqlc
 	@$(call print, "Verifying sql code generation.")
-	if test -n "$$(git status --porcelain '*.go')"; then echo "SQL models not properly generated!"; git status --porcelain '*.go'; exit 1; fi
+	@if [ ! -f tapdb/sqlc/schemas/generated_schema.sql ]; then \
+		echo "Missing file: tapdb/sqlc/schemas/generated_schema.sql"; \
+		exit 1; \
+	fi
+	@if test -n "$$(git status --porcelain '*.go')"; then \
+		echo "SQL models not properly generated!"; \
+		git status --porcelain '*.go'; \
+		exit 1; \
+	fi
 
 rpc:
 	@$(call print, "Compiling protos.")
@@ -255,11 +289,11 @@ fmt: $(GOIMPORTS_BIN)
 
 check-go-version-yaml:
 	@$(call print, "Checking for target Go version (v$(GO_VERSION)) in  YAML files (*.yaml, *.yml)")
-	./tools/check-go-version-yaml.sh $(GO_VERSION)
+	./scripts/check-go-version-yaml.sh $(GO_VERSION)
 
 check-go-version-dockerfile:
 	@$(call print, "Checking for target Go version (v$(GO_VERSION)) in Dockerfile files (*Dockerfile)")
-	./tools/check-go-version-dockerfile.sh $(GO_VERSION)
+	./scripts/check-go-version-dockerfile.sh $(GO_VERSION)
 
 lint-source: docker-tools
 	@$(call print, "Linting source.")
@@ -281,6 +315,10 @@ mod-tidy:
 mod-check: mod-tidy
 	@$(call print, "Checking modules.")
 	if test -n "$$(git status | grep -e "go.mod\|go.sum")"; then echo "Running go mod tidy changes go.mod/go.sum"; git status; git diff; exit 1; fi
+
+sample-conf-check:
+	@$(call print, "Checking that default values in the sample-tapd.conf file are set correctly")
+	scripts/check-sample-tapd-conf.sh "$(RELEASE_TAGS)"
 
 gen-deterministic-test-vectors:
 	@$(call print, "Generating deterministic test vectors.")
@@ -307,9 +345,24 @@ test-vector-check: gen-deterministic-test-vectors
 	@$(call print, "Checking deterministic test vectors.")
 	if test -n "$$(git status | grep -e ".json")"; then echo "Test vectors not updated"; git status; git diff; exit 1; fi
 
+migration-check:
+	@$(call print, "Checking migration numbering.")
+	./scripts/check-migration-numbering.sh
+
+	@$(call print, "Checking migration version.")
+	./scripts/check-migration-latest-version.sh
+
 clean:
 	@$(call print, "Cleaning source.$(NC)")
 	$(RM) coverage.txt
+	$(RM) -r itest/regtest
+	$(RM) -r itest/chantools
+	$(RM) itest/btcd-itest
+	$(RM) itest/lnd-itest
+	$(RM) loadtest
+	$(RM) tapd-debug
+	$(RM) tapcli-debug
+	$(RM) -r taproot-assets-v*
 
 .PHONY: all \
 	default \

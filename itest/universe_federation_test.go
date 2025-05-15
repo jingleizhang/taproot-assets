@@ -14,13 +14,13 @@ import (
 // node is offline at the time of the initial sync attempt.
 func testMintProofRepeatFedSyncAttempt(t *harnessTest) {
 	// Create a new minting node, without hooking it up to any existing
-	// Universe server. We will also set the sync ticker to 4 second, so
+	// Universe server. We will also set the sync ticker to 2 second, so
 	// that we can test that the proof push sync is retried and eventually
 	// succeeds after the fed server peer node reappears online.
-	syncTickerInterval := 4 * time.Second
+	syncTickerInterval := 2 * time.Second
+	bobLnd := t.lndHarness.NewNodeWithCoins("Bob", nil)
 	mintingNode := setupTapdHarness(
-		t.t, t, t.lndHarness.Bob, nil,
-		func(params *tapdHarnessParams) {
+		t.t, t, bobLnd, nil, func(params *tapdHarnessParams) {
 			params.fedSyncTickerInterval = &syncTickerInterval
 			params.noDefaultUniverseSync = true
 		},
@@ -67,7 +67,7 @@ func testMintProofRepeatFedSyncAttempt(t *harnessTest) {
 	// Now that federation peer node is inactive, we'll mint some assets.
 	t.Logf("Minting assets on minting node")
 	rpcAssets := MintAssetsConfirmBatch(
-		t.t, t.lndHarness.Miner.Client, mintingNode,
+		t.t, t.lndHarness.Miner().Client, mintingNode,
 		[]*mintrpc.MintAssetRequest{
 			simpleAssets[0], issuableAssets[0],
 		},

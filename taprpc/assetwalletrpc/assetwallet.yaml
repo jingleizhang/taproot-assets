@@ -15,6 +15,14 @@ http:
       post: "/v1/taproot-assets/wallet/virtual-psbt/anchor"
       body: "*"
 
+    - selector: assetwalletrpc.AssetWallet.CommitVirtualPsbts
+      post: "/v1/taproot-assets/wallet/virtual-psbt/commit"
+      body: "*"
+      
+    - selector: assetwalletrpc.AssetWallet.PublishAndLogTransfer
+      post: "/v1/taproot-assets/wallet/virtual-psbt/log-transfer"
+      body: "*"
+
     - selector: assetwalletrpc.AssetWallet.NextInternalKey
       post: "/v1/taproot-assets/wallet/internal-key/next"
       body: "*"
@@ -22,6 +30,12 @@ http:
     - selector: assetwalletrpc.AssetWallet.NextScriptKey
       post: "/v1/taproot-assets/wallet/script-key/next"
       body: "*"
+
+    - selector: assetwalletrpc.AssetWallet.QueryInternalKey
+      get: "/v1/taproot-assets/wallet/internal-key/{internal_key}"
+
+    - selector: assetwalletrpc.AssetWallet.QueryScriptKey
+      get: "/v1/taproot-assets/wallet/script-key/{tweaked_script_key}"
 
     - selector: assetwalletrpc.AssetWallet.ProveAssetOwnership
       post: "/v1/taproot-assets/wallet/ownership/prove"
@@ -33,4 +47,8 @@ http:
 
     - selector: assetwalletrpc.AssetWallet.RemoveUTXOLease
       post: "/v1/taproot-assets/wallet/utxo-lease/delete"
+      body: "*"
+
+    - selector: assetwalletrpc.AssetWallet.DeclareScriptKey
+      post: "/v1/taproot-assets/wallet/script-key/declare"
       body: "*"

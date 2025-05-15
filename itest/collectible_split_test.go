@@ -27,7 +27,7 @@ import (
 func testCollectibleSend(t *harnessTest) {
 	// First, we'll make a collectible with emission enabled.
 	rpcAssets := MintAssetsConfirmBatch(
-		t.t, t.lndHarness.Miner.Client, t.tapd,
+		t.t, t.lndHarness.Miner().Client, t.tapd,
 		[]*mintrpc.MintAssetRequest{
 			issuableAssets[1],
 			// Our "passive" asset.
@@ -51,9 +51,8 @@ func testCollectibleSend(t *harnessTest) {
 
 	// Now that we have the asset created, we'll make a new node that'll
 	// serve as the node which'll receive the assets.
-	secondTapd := setupTapdHarness(
-		t.t, t, t.lndHarness.Bob, t.universeServer,
-	)
+	lndBob := t.lndHarness.NewNodeWithCoins("Bob", nil)
+	secondTapd := setupTapdHarness(t.t, t, lndBob, t.universeServer)
 	defer func() {
 		require.NoError(t.t, secondTapd.stop(!*noDelete))
 	}()
@@ -65,8 +64,6 @@ func testCollectibleSend(t *harnessTest) {
 		senderTransferIdx   = 0
 		receiverTransferIdx = 0
 		fullAmount          = rpcAssets[0].Amount
-		receiverAddr        *taprpc.Addr
-		err                 error
 	)
 
 	for i := 0; i < numSends; i++ {
@@ -74,20 +71,21 @@ func testCollectibleSend(t *harnessTest) {
 		// start with Bob receiving the asset, then sending it back
 		// to the main node, and so on.
 		if i%2 == 0 {
-			receiverAddr, err = secondTapd.NewAddr(
-				ctxb, &taprpc.NewAddrRequest{
+			receiverAddr, events := NewAddrWithEventStream(
+				t.t, secondTapd, &taprpc.NewAddrRequest{
 					AssetId: genInfo.AssetId,
 					Amt:     fullAmount,
 				},
 			)
-			require.NoError(t.t, err)
 
 			AssertAddrCreated(
 				t.t, secondTapd, rpcAssets[0], receiverAddr,
 			)
-			sendResp := sendAssetsToAddr(t, t.tapd, receiverAddr)
+			sendResp, sendEvents := sendAssetsToAddr(
+				t, t.tapd, receiverAddr,
+			)
 			ConfirmAndAssertOutboundTransfer(
-				t.t, t.lndHarness.Miner.Client, t.tapd,
+				t.t, t.lndHarness.Miner().Client, t.tapd,
 				sendResp, genInfo.AssetId,
 				[]uint64{0, fullAmount}, senderTransferIdx,
 				senderTransferIdx+1,
@@ -97,23 +95,26 @@ func testCollectibleSend(t *harnessTest) {
 			AssertNonInteractiveRecvComplete(
 				t.t, secondTapd, senderTransferIdx,
 			)
+			AssertSendEventsComplete(
+				t.t, receiverAddr.ScriptKey, sendEvents,
+			)
+			AssertReceiveEvents(t.t, receiverAddr, events)
 		} else {
-			receiverAddr, err = t.tapd.NewAddr(
-				ctxb, &taprpc.NewAddrRequest{
+			receiverAddr, events := NewAddrWithEventStream(
+				t.t, t.tapd, &taprpc.NewAddrRequest{
 					AssetId: genInfo.AssetId,
 					Amt:     fullAmount,
 				},
 			)
-			require.NoError(t.t, err)
 
 			AssertAddrCreated(
 				t.t, t.tapd, rpcAssets[0], receiverAddr,
 			)
-			sendResp := sendAssetsToAddr(
+			sendResp, sendEvents := sendAssetsToAddr(
 				t, secondTapd, receiverAddr,
 			)
 			ConfirmAndAssertOutboundTransfer(
-				t.t, t.lndHarness.Miner.Client, secondTapd,
+				t.t, t.lndHarness.Miner().Client, secondTapd,
 				sendResp, genInfo.AssetId,
 				[]uint64{0, fullAmount}, receiverTransferIdx,
 				receiverTransferIdx+1,
@@ -122,6 +123,10 @@ func testCollectibleSend(t *harnessTest) {
 			AssertNonInteractiveRecvComplete(
 				t.t, t.tapd, receiverTransferIdx,
 			)
+			AssertSendEventsComplete(
+				t.t, receiverAddr.ScriptKey, sendEvents,
+			)
+			AssertReceiveEvents(t.t, receiverAddr, events)
 		}
 	}
 
@@ -188,14 +193,15 @@ func testCollectibleSend(t *harnessTest) {
 	require.NoError(t.t, err)
 
 	AssertAddrCreated(t.t, secondTapd, rpcAssets[1], bobAddr)
-	sendResp := sendAssetsToAddr(t, t.tapd, bobAddr)
+	sendResp, sendEvents := sendAssetsToAddr(t, t.tapd, bobAddr)
 	ConfirmAndAssertOutboundTransfer(
-		t.t, t.lndHarness.Miner.Client, t.tapd, sendResp,
+		t.t, t.lndHarness.Miner().Client, t.tapd, sendResp,
 		passiveGen.AssetId, []uint64{0, rpcAssets[1].Amount}, 2, 3,
 	)
 
 	// There's only one non-interactive receive event.
 	AssertNonInteractiveRecvComplete(t.t, secondTapd, 3)
+	AssertSendEventsComplete(t.t, bobAddr.ScriptKey, sendEvents)
 }
 
 // testCollectibleGroupSend tests that we can properly send a collectible asset
@@ -262,7 +268,7 @@ func testCollectibleGroupSend(t *harnessTest) {
 		batchSize)
 
 	mintBatch := MintAssetsConfirmBatch(
-		t.t, t.lndHarness.Miner.Client, t.tapd, batchReqs,
+		t.t, t.lndHarness.Miner().Client, t.tapd, batchReqs,
 		WithMintingTimeout(minterTimeout),
 	)
 
@@ -327,9 +333,8 @@ func testCollectibleGroupSend(t *harnessTest) {
 	})
 	require.True(t.t, correctOp)
 
-	secondTapd := setupTapdHarness(
-		t.t, t, t.lndHarness.Bob, t.universeServer,
-	)
+	lndBob := t.lndHarness.NewNodeWithCoins("Bob", nil)
+	secondTapd := setupTapdHarness(t.t, t, lndBob, t.universeServer)
 	defer func() {
 		require.NoError(t.t, secondTapd.stop(!*noDelete))
 	}()
@@ -372,14 +377,14 @@ func testCollectibleGroupSend(t *harnessTest) {
 
 		sendAssets(
 			t.t, ctxt, numAssets, sendType, send, receive,
-			t.lndHarness.Miner.Client,
+			t.lndHarness.Miner().Client,
 		)
 
 		t.Logf("Finished %d of %d send operations", i, numSends)
 	}
 }
 
-// sendAsset sends the given number of assets of the given type from the given
+// sendAssets sends the given number of assets of the given type from the given
 // node to the other node.
 func sendAssets(t *testing.T, ctx context.Context, numAssets uint64,
 	assetType taprpc.AssetType, send, receive *tapdHarness,
@@ -394,14 +399,16 @@ func sendAssets(t *testing.T, ctx context.Context, numAssets uint64,
 
 	// Let's create an address on the receiving node and make sure it's
 	// created correctly.
-	addr, err := receive.NewAddr(ctx, &taprpc.NewAddrRequest{
-		AssetId: sendAsset.AssetGenesis.AssetId,
-		Amt:     numAssets,
-		ProofCourierAddr: fmt.Sprintf(
-			"%s://%s", proof.UniverseRpcCourierType, send.rpcHost(),
-		),
-	})
-	require.NoError(t, err)
+	addr, stream := NewAddrWithEventStream(
+		t, receive, &taprpc.NewAddrRequest{
+			AssetId: sendAsset.AssetGenesis.AssetId,
+			Amt:     numAssets,
+			ProofCourierAddr: fmt.Sprintf(
+				"%s://%s", proof.UniverseRpcCourierType,
+				send.rpcHost(),
+			),
+		},
+	)
 	AssertAddrCreated(t, receive, sendAsset, addr)
 
 	// Before we send the asset, we record the existing transfers on the
@@ -410,7 +417,7 @@ func sendAssets(t *testing.T, ctx context.Context, numAssets uint64,
 	transfersBefore := send.listTransfersSince(t, ctx, nil)
 
 	// Initiate the send now.
-	_, err = send.SendAsset(ctx, &taprpc.SendAssetRequest{
+	_, err := send.SendAsset(ctx, &taprpc.SendAssetRequest{
 		TapAddrs: []string{addr.Encoded},
 	})
 	require.NoError(t, err)
@@ -429,6 +436,7 @@ func sendAssets(t *testing.T, ctx context.Context, numAssets uint64,
 
 	// Now the transfer should go to completed eventually.
 	AssertAddrEvent(t, receive, addr, 1, statusCompleted)
+	AssertReceiveEvents(t, addr, stream)
 }
 
 // pickSendNode picks a node at random, checks whether it has enough assets of

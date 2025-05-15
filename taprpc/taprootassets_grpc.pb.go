@@ -72,6 +72,10 @@ type TaprootAssetsClient interface {
 	// ExportProof exports the latest raw proof file anchored at the specified
 	// script_key.
 	ExportProof(ctx context.Context, in *ExportProofRequest, opts ...grpc.CallOption) (*ProofFile, error)
+	// tapcli: `proofs unpack`
+	// UnpackProofFile unpacks a proof file into a list of the individual raw
+	// proofs in the proof chain.
+	UnpackProofFile(ctx context.Context, in *UnpackProofFileRequest, opts ...grpc.CallOption) (*UnpackProofFileResponse, error)
 	// tapcli: `assets send`
 	// SendAsset uses one or multiple passed Taproot Asset address(es) to attempt
 	// to complete an asset send. The method returns information w.r.t the on chain
@@ -85,19 +89,35 @@ type TaprootAssetsClient interface {
 	// burning is such a destructive and non-reversible operation, some specific
 	// values need to be set in the request to avoid accidental burns.
 	BurnAsset(ctx context.Context, in *BurnAssetRequest, opts ...grpc.CallOption) (*BurnAssetResponse, error)
+	// tapcli: `assets listburns`
+	// ListBurns lists the asset burns that this wallet has performed. These assets
+	// are not recoverable in any way. Filters may be applied to return more
+	// specific results.
+	ListBurns(ctx context.Context, in *ListBurnsRequest, opts ...grpc.CallOption) (*ListBurnsResponse, error)
 	// tapcli: `getinfo`
 	// GetInfo returns the information for the node.
 	GetInfo(ctx context.Context, in *GetInfoRequest, opts ...grpc.CallOption) (*GetInfoResponse, error)
-	// SubscribeSendAssetEventNtfns registers a subscription to the event
-	// notification stream which relates to the asset sending process.
-	SubscribeSendAssetEventNtfns(ctx context.Context, in *SubscribeSendAssetEventNtfnsRequest, opts ...grpc.CallOption) (TaprootAssets_SubscribeSendAssetEventNtfnsClient, error)
-	// SubscribeReceiveAssetEventNtfns registers a subscription to the event
-	// notification stream which relates to the asset receive process.
-	SubscribeReceiveAssetEventNtfns(ctx context.Context, in *SubscribeReceiveAssetEventNtfnsRequest, opts ...grpc.CallOption) (TaprootAssets_SubscribeReceiveAssetEventNtfnsClient, error)
 	// tapcli: `assets meta`
 	// FetchAssetMeta allows a caller to fetch the reveal meta data for an asset
 	// either by the asset ID for that asset, or a meta hash.
 	FetchAssetMeta(ctx context.Context, in *FetchAssetMetaRequest, opts ...grpc.CallOption) (*AssetMeta, error)
+	// tapcli: `events receive`
+	// SubscribeReceiveEvents allows a caller to subscribe to receive events for
+	// incoming asset transfers.
+	SubscribeReceiveEvents(ctx context.Context, in *SubscribeReceiveEventsRequest, opts ...grpc.CallOption) (TaprootAssets_SubscribeReceiveEventsClient, error)
+	// tapcli: `events send`
+	// SubscribeSendEvents allows a caller to subscribe to send events for outgoing
+	// asset transfers.
+	SubscribeSendEvents(ctx context.Context, in *SubscribeSendEventsRequest, opts ...grpc.CallOption) (TaprootAssets_SubscribeSendEventsClient, error)
+	// RegisterTransfer informs the daemon about a new inbound transfer that has
+	// happened. This is used for interactive transfers where no TAP address is
+	// involved and the recipient is aware of the transfer through an out-of-band
+	// protocol but the daemon hasn't been informed about the completion of the
+	// transfer. For this to work, the proof must already be in the recipient's
+	// local universe (e.g. through the use of the universerpc.ImportProof RPC or
+	// the universe proof courier and universe sync mechanisms) and this call
+	// simply instructs the daemon to detect the transfer as an asset it owns.
+	RegisterTransfer(ctx context.Context, in *RegisterTransferRequest, opts ...grpc.CallOption) (*RegisterTransferResponse, error)
 }
 
 type taprootAssetsClient struct {
@@ -234,6 +254,15 @@ func (c *taprootAssetsClient) ExportProof(ctx context.Context, in *ExportProofRe
 	return out, nil
 }
 
+func (c *taprootAssetsClient) UnpackProofFile(ctx context.Context, in *UnpackProofFileRequest, opts ...grpc.CallOption) (*UnpackProofFileResponse, error) {
+	out := new(UnpackProofFileResponse)
+	err := c.cc.Invoke(ctx, "/taprpc.TaprootAssets/UnpackProofFile", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *taprootAssetsClient) SendAsset(ctx context.Context, in *SendAssetRequest, opts ...grpc.CallOption) (*SendAssetResponse, error) {
 	out := new(SendAssetResponse)
 	err := c.cc.Invoke(ctx, "/taprpc.TaprootAssets/SendAsset", in, out, opts...)
@@ -252,6 +281,15 @@ func (c *taprootAssetsClient) BurnAsset(ctx context.Context, in *BurnAssetReques
 	return out, nil
 }
 
+func (c *taprootAssetsClient) ListBurns(ctx context.Context, in *ListBurnsRequest, opts ...grpc.CallOption) (*ListBurnsResponse, error) {
+	out := new(ListBurnsResponse)
+	err := c.cc.Invoke(ctx, "/taprpc.TaprootAssets/ListBurns", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *taprootAssetsClient) GetInfo(ctx context.Context, in *GetInfoRequest, opts ...grpc.CallOption) (*GetInfoResponse, error) {
 	out := new(GetInfoResponse)
 	err := c.cc.Invoke(ctx, "/taprpc.TaprootAssets/GetInfo", in, out, opts...)
@@ -261,73 +299,82 @@ func (c *taprootAssetsClient) GetInfo(ctx context.Context, in *GetInfoRequest, o
 	return out, nil
 }
 
-func (c *taprootAssetsClient) SubscribeSendAssetEventNtfns(ctx context.Context, in *SubscribeSendAssetEventNtfnsRequest, opts ...grpc.CallOption) (TaprootAssets_SubscribeSendAssetEventNtfnsClient, error) {
-	stream, err := c.cc.NewStream(ctx, &TaprootAssets_ServiceDesc.Streams[0], "/taprpc.TaprootAssets/SubscribeSendAssetEventNtfns", opts...)
-	if err != nil {
-		return nil, err
-	}
-	x := &taprootAssetsSubscribeSendAssetEventNtfnsClient{stream}
-	if err := x.ClientStream.SendMsg(in); err != nil {
-		return nil, err
-	}
-	if err := x.ClientStream.CloseSend(); err != nil {
-		return nil, err
-	}
-	return x, nil
-}
-
-type TaprootAssets_SubscribeSendAssetEventNtfnsClient interface {
-	Recv() (*SendAssetEvent, error)
-	grpc.ClientStream
-}
-
-type taprootAssetsSubscribeSendAssetEventNtfnsClient struct {
-	grpc.ClientStream
-}
-
-func (x *taprootAssetsSubscribeSendAssetEventNtfnsClient) Recv() (*SendAssetEvent, error) {
-	m := new(SendAssetEvent)
-	if err := x.ClientStream.RecvMsg(m); err != nil {
-		return nil, err
-	}
-	return m, nil
-}
-
-func (c *taprootAssetsClient) SubscribeReceiveAssetEventNtfns(ctx context.Context, in *SubscribeReceiveAssetEventNtfnsRequest, opts ...grpc.CallOption) (TaprootAssets_SubscribeReceiveAssetEventNtfnsClient, error) {
-	stream, err := c.cc.NewStream(ctx, &TaprootAssets_ServiceDesc.Streams[1], "/taprpc.TaprootAssets/SubscribeReceiveAssetEventNtfns", opts...)
-	if err != nil {
-		return nil, err
-	}
-	x := &taprootAssetsSubscribeReceiveAssetEventNtfnsClient{stream}
-	if err := x.ClientStream.SendMsg(in); err != nil {
-		return nil, err
-	}
-	if err := x.ClientStream.CloseSend(); err != nil {
-		return nil, err
-	}
-	return x, nil
-}
-
-type TaprootAssets_SubscribeReceiveAssetEventNtfnsClient interface {
-	Recv() (*ReceiveAssetEvent, error)
-	grpc.ClientStream
-}
-
-type taprootAssetsSubscribeReceiveAssetEventNtfnsClient struct {
-	grpc.ClientStream
-}
-
-func (x *taprootAssetsSubscribeReceiveAssetEventNtfnsClient) Recv() (*ReceiveAssetEvent, error) {
-	m := new(ReceiveAssetEvent)
-	if err := x.ClientStream.RecvMsg(m); err != nil {
-		return nil, err
-	}
-	return m, nil
-}
-
 func (c *taprootAssetsClient) FetchAssetMeta(ctx context.Context, in *FetchAssetMetaRequest, opts ...grpc.CallOption) (*AssetMeta, error) {
 	out := new(AssetMeta)
 	err := c.cc.Invoke(ctx, "/taprpc.TaprootAssets/FetchAssetMeta", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *taprootAssetsClient) SubscribeReceiveEvents(ctx context.Context, in *SubscribeReceiveEventsRequest, opts ...grpc.CallOption) (TaprootAssets_SubscribeReceiveEventsClient, error) {
+	stream, err := c.cc.NewStream(ctx, &TaprootAssets_ServiceDesc.Streams[0], "/taprpc.TaprootAssets/SubscribeReceiveEvents", opts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &taprootAssetsSubscribeReceiveEventsClient{stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+type TaprootAssets_SubscribeReceiveEventsClient interface {
+	Recv() (*ReceiveEvent, error)
+	grpc.ClientStream
+}
+
+type taprootAssetsSubscribeReceiveEventsClient struct {
+	grpc.ClientStream
+}
+
+func (x *taprootAssetsSubscribeReceiveEventsClient) Recv() (*ReceiveEvent, error) {
+	m := new(ReceiveEvent)
+	if err := x.ClientStream.RecvMsg(m); err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
+func (c *taprootAssetsClient) SubscribeSendEvents(ctx context.Context, in *SubscribeSendEventsRequest, opts ...grpc.CallOption) (TaprootAssets_SubscribeSendEventsClient, error) {
+	stream, err := c.cc.NewStream(ctx, &TaprootAssets_ServiceDesc.Streams[1], "/taprpc.TaprootAssets/SubscribeSendEvents", opts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &taprootAssetsSubscribeSendEventsClient{stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+type TaprootAssets_SubscribeSendEventsClient interface {
+	Recv() (*SendEvent, error)
+	grpc.ClientStream
+}
+
+type taprootAssetsSubscribeSendEventsClient struct {
+	grpc.ClientStream
+}
+
+func (x *taprootAssetsSubscribeSendEventsClient) Recv() (*SendEvent, error) {
+	m := new(SendEvent)
+	if err := x.ClientStream.RecvMsg(m); err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
+func (c *taprootAssetsClient) RegisterTransfer(ctx context.Context, in *RegisterTransferRequest, opts ...grpc.CallOption) (*RegisterTransferResponse, error) {
+	out := new(RegisterTransferResponse)
+	err := c.cc.Invoke(ctx, "/taprpc.TaprootAssets/RegisterTransfer", in, out, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -392,6 +439,10 @@ type TaprootAssetsServer interface {
 	// ExportProof exports the latest raw proof file anchored at the specified
 	// script_key.
 	ExportProof(context.Context, *ExportProofRequest) (*ProofFile, error)
+	// tapcli: `proofs unpack`
+	// UnpackProofFile unpacks a proof file into a list of the individual raw
+	// proofs in the proof chain.
+	UnpackProofFile(context.Context, *UnpackProofFileRequest) (*UnpackProofFileResponse, error)
 	// tapcli: `assets send`
 	// SendAsset uses one or multiple passed Taproot Asset address(es) to attempt
 	// to complete an asset send. The method returns information w.r.t the on chain
@@ -405,19 +456,35 @@ type TaprootAssetsServer interface {
 	// burning is such a destructive and non-reversible operation, some specific
 	// values need to be set in the request to avoid accidental burns.
 	BurnAsset(context.Context, *BurnAssetRequest) (*BurnAssetResponse, error)
+	// tapcli: `assets listburns`
+	// ListBurns lists the asset burns that this wallet has performed. These assets
+	// are not recoverable in any way. Filters may be applied to return more
+	// specific results.
+	ListBurns(context.Context, *ListBurnsRequest) (*ListBurnsResponse, error)
 	// tapcli: `getinfo`
 	// GetInfo returns the information for the node.
 	GetInfo(context.Context, *GetInfoRequest) (*GetInfoResponse, error)
-	// SubscribeSendAssetEventNtfns registers a subscription to the event
-	// notification stream which relates to the asset sending process.
-	SubscribeSendAssetEventNtfns(*SubscribeSendAssetEventNtfnsRequest, TaprootAssets_SubscribeSendAssetEventNtfnsServer) error
-	// SubscribeReceiveAssetEventNtfns registers a subscription to the event
-	// notification stream which relates to the asset receive process.
-	SubscribeReceiveAssetEventNtfns(*SubscribeReceiveAssetEventNtfnsRequest, TaprootAssets_SubscribeReceiveAssetEventNtfnsServer) error
 	// tapcli: `assets meta`
 	// FetchAssetMeta allows a caller to fetch the reveal meta data for an asset
 	// either by the asset ID for that asset, or a meta hash.
 	FetchAssetMeta(context.Context, *FetchAssetMetaRequest) (*AssetMeta, error)
+	// tapcli: `events receive`
+	// SubscribeReceiveEvents allows a caller to subscribe to receive events for
+	// incoming asset transfers.
+	SubscribeReceiveEvents(*SubscribeReceiveEventsRequest, TaprootAssets_SubscribeReceiveEventsServer) error
+	// tapcli: `events send`
+	// SubscribeSendEvents allows a caller to subscribe to send events for outgoing
+	// asset transfers.
+	SubscribeSendEvents(*SubscribeSendEventsRequest, TaprootAssets_SubscribeSendEventsServer) error
+	// RegisterTransfer informs the daemon about a new inbound transfer that has
+	// happened. This is used for interactive transfers where no TAP address is
+	// involved and the recipient is aware of the transfer through an out-of-band
+	// protocol but the daemon hasn't been informed about the completion of the
+	// transfer. For this to work, the proof must already be in the recipient's
+	// local universe (e.g. through the use of the universerpc.ImportProof RPC or
+	// the universe proof courier and universe sync mechanisms) and this call
+	// simply instructs the daemon to detect the transfer as an asset it owns.
+	RegisterTransfer(context.Context, *RegisterTransferRequest) (*RegisterTransferResponse, error)
 	mustEmbedUnimplementedTaprootAssetsServer()
 }
 
@@ -467,23 +534,32 @@ func (UnimplementedTaprootAssetsServer) DecodeProof(context.Context, *DecodeProo
 func (UnimplementedTaprootAssetsServer) ExportProof(context.Context, *ExportProofRequest) (*ProofFile, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method ExportProof not implemented")
 }
+func (UnimplementedTaprootAssetsServer) UnpackProofFile(context.Context, *UnpackProofFileRequest) (*UnpackProofFileResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method UnpackProofFile not implemented")
+}
 func (UnimplementedTaprootAssetsServer) SendAsset(context.Context, *SendAssetRequest) (*SendAssetResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method SendAsset not implemented")
 }
 func (UnimplementedTaprootAssetsServer) BurnAsset(context.Context, *BurnAssetRequest) (*BurnAssetResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method BurnAsset not implemented")
 }
+func (UnimplementedTaprootAssetsServer) ListBurns(context.Context, *ListBurnsRequest) (*ListBurnsResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method ListBurns not implemented")
+}
 func (UnimplementedTaprootAssetsServer) GetInfo(context.Context, *GetInfoRequest) (*GetInfoResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method GetInfo not implemented")
 }
-func (UnimplementedTaprootAssetsServer) SubscribeSendAssetEventNtfns(*SubscribeSendAssetEventNtfnsRequest, TaprootAssets_SubscribeSendAssetEventNtfnsServer) error {
-	return status.Errorf(codes.Unimplemented, "method SubscribeSendAssetEventNtfns not implemented")
-}
-func (UnimplementedTaprootAssetsServer) SubscribeReceiveAssetEventNtfns(*SubscribeReceiveAssetEventNtfnsRequest, TaprootAssets_SubscribeReceiveAssetEventNtfnsServer) error {
-	return status.Errorf(codes.Unimplemented, "method SubscribeReceiveAssetEventNtfns not implemented")
-}
 func (UnimplementedTaprootAssetsServer) FetchAssetMeta(context.Context, *FetchAssetMetaRequest) (*AssetMeta, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method FetchAssetMeta not implemented")
+}
+func (UnimplementedTaprootAssetsServer) SubscribeReceiveEvents(*SubscribeReceiveEventsRequest, TaprootAssets_SubscribeReceiveEventsServer) error {
+	return status.Errorf(codes.Unimplemented, "method SubscribeReceiveEvents not implemented")
+}
+func (UnimplementedTaprootAssetsServer) SubscribeSendEvents(*SubscribeSendEventsRequest, TaprootAssets_SubscribeSendEventsServer) error {
+	return status.Errorf(codes.Unimplemented, "method SubscribeSendEvents not implemented")
+}
+func (UnimplementedTaprootAssetsServer) RegisterTransfer(context.Context, *RegisterTransferRequest) (*RegisterTransferResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method RegisterTransfer not implemented")
 }
 func (UnimplementedTaprootAssetsServer) mustEmbedUnimplementedTaprootAssetsServer() {}
 
@@ -750,6 +826,24 @@ func _TaprootAssets_ExportProof_Handler(srv interface{}, ctx context.Context, de
 	return interceptor(ctx, in, info, handler)
 }
 
+func _TaprootAssets_UnpackProofFile_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(UnpackProofFileRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(TaprootAssetsServer).UnpackProofFile(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/taprpc.TaprootAssets/UnpackProofFile",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(TaprootAssetsServer).UnpackProofFile(ctx, req.(*UnpackProofFileRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _TaprootAssets_SendAsset_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(SendAssetRequest)
 	if err := dec(in); err != nil {
@@ -786,6 +880,24 @@ func _TaprootAssets_BurnAsset_Handler(srv interface{}, ctx context.Context, dec 
 	return interceptor(ctx, in, info, handler)
 }
 
+func _TaprootAssets_ListBurns_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListBurnsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(TaprootAssetsServer).ListBurns(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/taprpc.TaprootAssets/ListBurns",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(TaprootAssetsServer).ListBurns(ctx, req.(*ListBurnsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _TaprootAssets_GetInfo_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(GetInfoRequest)
 	if err := dec(in); err != nil {
@@ -804,48 +916,6 @@ func _TaprootAssets_GetInfo_Handler(srv interface{}, ctx context.Context, dec fu
 	return interceptor(ctx, in, info, handler)
 }
 
-func _TaprootAssets_SubscribeSendAssetEventNtfns_Handler(srv interface{}, stream grpc.ServerStream) error {
-	m := new(SubscribeSendAssetEventNtfnsRequest)
-	if err := stream.RecvMsg(m); err != nil {
-		return err
-	}
-	return srv.(TaprootAssetsServer).SubscribeSendAssetEventNtfns(m, &taprootAssetsSubscribeSendAssetEventNtfnsServer{stream})
-}
-
-type TaprootAssets_SubscribeSendAssetEventNtfnsServer interface {
-	Send(*SendAssetEvent) error
-	grpc.ServerStream
-}
-
-type taprootAssetsSubscribeSendAssetEventNtfnsServer struct {
-	grpc.ServerStream
-}
-
-func (x *taprootAssetsSubscribeSendAssetEventNtfnsServer) Send(m *SendAssetEvent) error {
-	return x.ServerStream.SendMsg(m)
-}
-
-func _TaprootAssets_SubscribeReceiveAssetEventNtfns_Handler(srv interface{}, stream grpc.ServerStream) error {
-	m := new(SubscribeReceiveAssetEventNtfnsRequest)
-	if err := stream.RecvMsg(m); err != nil {
-		return err
-	}
-	return srv.(TaprootAssetsServer).SubscribeReceiveAssetEventNtfns(m, &taprootAssetsSubscribeReceiveAssetEventNtfnsServer{stream})
-}
-
-type TaprootAssets_SubscribeReceiveAssetEventNtfnsServer interface {
-	Send(*ReceiveAssetEvent) error
-	grpc.ServerStream
-}
-
-type taprootAssetsSubscribeReceiveAssetEventNtfnsServer struct {
-	grpc.ServerStream
-}
-
-func (x *taprootAssetsSubscribeReceiveAssetEventNtfnsServer) Send(m *ReceiveAssetEvent) error {
-	return x.ServerStream.SendMsg(m)
-}
-
 func _TaprootAssets_FetchAssetMeta_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(FetchAssetMetaRequest)
 	if err := dec(in); err != nil {
@@ -860,6 +930,66 @@ func _TaprootAssets_FetchAssetMeta_Handler(srv interface{}, ctx context.Context,
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(TaprootAssetsServer).FetchAssetMeta(ctx, req.(*FetchAssetMetaRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _TaprootAssets_SubscribeReceiveEvents_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(SubscribeReceiveEventsRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(TaprootAssetsServer).SubscribeReceiveEvents(m, &taprootAssetsSubscribeReceiveEventsServer{stream})
+}
+
+type TaprootAssets_SubscribeReceiveEventsServer interface {
+	Send(*ReceiveEvent) error
+	grpc.ServerStream
+}
+
+type taprootAssetsSubscribeReceiveEventsServer struct {
+	grpc.ServerStream
+}
+
+func (x *taprootAssetsSubscribeReceiveEventsServer) Send(m *ReceiveEvent) error {
+	return x.ServerStream.SendMsg(m)
+}
+
+func _TaprootAssets_SubscribeSendEvents_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(SubscribeSendEventsRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(TaprootAssetsServer).SubscribeSendEvents(m, &taprootAssetsSubscribeSendEventsServer{stream})
+}
+
+type TaprootAssets_SubscribeSendEventsServer interface {
+	Send(*SendEvent) error
+	grpc.ServerStream
+}
+
+type taprootAssetsSubscribeSendEventsServer struct {
+	grpc.ServerStream
+}
+
+func (x *taprootAssetsSubscribeSendEventsServer) Send(m *SendEvent) error {
+	return x.ServerStream.SendMsg(m)
+}
+
+func _TaprootAssets_RegisterTransfer_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RegisterTransferRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(TaprootAssetsServer).RegisterTransfer(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/taprpc.TaprootAssets/RegisterTransfer",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(TaprootAssetsServer).RegisterTransfer(ctx, req.(*RegisterTransferRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -928,12 +1058,20 @@ var TaprootAssets_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _TaprootAssets_ExportProof_Handler,
 		},
 		{
+			MethodName: "UnpackProofFile",
+			Handler:    _TaprootAssets_UnpackProofFile_Handler,
+		},
+		{
 			MethodName: "SendAsset",
 			Handler:    _TaprootAssets_SendAsset_Handler,
 		},
 		{
 			MethodName: "BurnAsset",
 			Handler:    _TaprootAssets_BurnAsset_Handler,
+		},
+		{
+			MethodName: "ListBurns",
+			Handler:    _TaprootAssets_ListBurns_Handler,
 		},
 		{
 			MethodName: "GetInfo",
@@ -943,16 +1081,20 @@ var TaprootAssets_ServiceDesc = grpc.ServiceDesc{
 			MethodName: "FetchAssetMeta",
 			Handler:    _TaprootAssets_FetchAssetMeta_Handler,
 		},
+		{
+			MethodName: "RegisterTransfer",
+			Handler:    _TaprootAssets_RegisterTransfer_Handler,
+		},
 	},
 	Streams: []grpc.StreamDesc{
 		{
-			StreamName:    "SubscribeSendAssetEventNtfns",
-			Handler:       _TaprootAssets_SubscribeSendAssetEventNtfns_Handler,
+			StreamName:    "SubscribeReceiveEvents",
+			Handler:       _TaprootAssets_SubscribeReceiveEvents_Handler,
 			ServerStreams: true,
 		},
 		{
-			StreamName:    "SubscribeReceiveAssetEventNtfns",
-			Handler:       _TaprootAssets_SubscribeReceiveAssetEventNtfns_Handler,
+			StreamName:    "SubscribeSendEvents",
+			Handler:       _TaprootAssets_SubscribeSendEvents_Handler,
 			ServerStreams: true,
 		},
 	},

@@ -13,11 +13,19 @@ import (
 
 	"github.com/btcsuite/btcd/rpcclient"
 	tap "github.com/lightninglabs/taproot-assets"
+	"github.com/lightninglabs/taproot-assets/cmd/commands"
+	"github.com/lightninglabs/taproot-assets/fn"
 	"github.com/lightninglabs/taproot-assets/itest"
+	"github.com/lightninglabs/taproot-assets/mssmt"
 	"github.com/lightninglabs/taproot-assets/taprpc"
 	"github.com/lightninglabs/taproot-assets/taprpc/assetwalletrpc"
 	"github.com/lightninglabs/taproot-assets/taprpc/mintrpc"
+	"github.com/lightninglabs/taproot-assets/taprpc/rfqrpc"
+	tchrpc "github.com/lightninglabs/taproot-assets/taprpc/tapchannelrpc"
+	"github.com/lightninglabs/taproot-assets/taprpc/tapdevrpc"
 	"github.com/lightninglabs/taproot-assets/taprpc/universerpc"
+	"github.com/lightninglabs/taproot-assets/universe"
+	"github.com/lightningnetwork/lnd/lntest/rpc"
 	"github.com/lightningnetwork/lnd/macaroons"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
@@ -33,10 +41,11 @@ var (
 
 type rpcClient struct {
 	cfg *TapConfig
-	taprpc.TaprootAssetsClient
-	universerpc.UniverseClient
-	mintrpc.MintClient
-	assetwalletrpc.AssetWalletClient
+	lnd *rpc.HarnessRPC
+
+	// RpcClientsBundle is a bundle of all the gRPC clients that are
+	// available to the test harness.
+	commands.RpcClientsBundle
 }
 
 // assetIDWithBalance returns the asset ID of an asset that has at least the
@@ -94,16 +103,26 @@ func (r *rpcClient) listTransfersSince(t *testing.T, ctx context.Context,
 	return resp.Transfers[newIndex:]
 }
 
-func initClients(t *testing.T, ctx context.Context,
-	cfg *Config) (*rpcClient, *rpcClient, *rpcclient.Client) {
-
-	// Create tapd clients.
-	alice := getTapClient(t, ctx, cfg.Alice.Tapd)
+// initAlice is similar to initClients, but only returns the Alice client.
+func initAlice(t *testing.T, ctx context.Context, cfg *Config) *rpcClient {
+	alice := getTapClient(t, ctx, cfg.Alice.Tapd, cfg.Alice.Lnd)
 
 	_, err := alice.GetInfo(ctx, &taprpc.GetInfoRequest{})
 	require.NoError(t, err)
 
-	bob := getTapClient(t, ctx, cfg.Bob.Tapd)
+	return alice
+}
+
+func initClients(t *testing.T, ctx context.Context,
+	cfg *Config) (*rpcClient, *rpcClient, *rpcclient.Client) {
+
+	// Create tapd clients.
+	alice := getTapClient(t, ctx, cfg.Alice.Tapd, cfg.Alice.Lnd)
+
+	_, err := alice.GetInfo(ctx, &taprpc.GetInfoRequest{})
+	require.NoError(t, err)
+
+	bob := getTapClient(t, ctx, cfg.Bob.Tapd, cfg.Bob.Lnd)
 
 	_, err = bob.GetInfo(ctx, &taprpc.GetInfoRequest{})
 	require.NoError(t, err)
@@ -125,7 +144,7 @@ func initClients(t *testing.T, ctx context.Context,
 }
 
 func getTapClient(t *testing.T, ctx context.Context,
-	cfg *TapConfig) *rpcClient {
+	cfg *TapConfig, lndCfg *LndConfig) *rpcClient {
 
 	creds := credentials.NewTLS(&tls.Config{})
 	if cfg.TLSPath != "" {
@@ -165,18 +184,85 @@ func getTapClient(t *testing.T, ctx context.Context,
 	conn, err := grpc.DialContext(ctx, svrAddr, opts...)
 	require.NoError(t, err)
 
+	lnd := getLndClient(t, ctx, lndCfg)
+
 	assetsClient := taprpc.NewTaprootAssetsClient(conn)
-	universeClient := universerpc.NewUniverseClient(conn)
-	mintMintClient := mintrpc.NewMintClient(conn)
 	assetWalletClient := assetwalletrpc.NewAssetWalletClient(conn)
+	devClient := tapdevrpc.NewTapDevClient(conn)
+	mintMintClient := mintrpc.NewMintClient(conn)
+	rfqClient := rfqrpc.NewRfqClient(conn)
+	universeClient := universerpc.NewUniverseClient(conn)
 
 	client := &rpcClient{
-		cfg:                 cfg,
-		TaprootAssetsClient: assetsClient,
-		UniverseClient:      universeClient,
-		MintClient:          mintMintClient,
-		AssetWalletClient:   assetWalletClient,
+		cfg: cfg,
+		lnd: lnd,
+		RpcClientsBundle: &struct {
+			taprpc.TaprootAssetsClient
+			assetwalletrpc.AssetWalletClient
+			mintrpc.MintClient
+			rfqrpc.RfqClient
+			tchrpc.TaprootAssetChannelsClient
+			universerpc.UniverseClient
+			tapdevrpc.TapDevClient
+		}{
+			TaprootAssetsClient: assetsClient,
+			AssetWalletClient:   assetWalletClient,
+			TapDevClient:        devClient,
+			MintClient:          mintMintClient,
+			RfqClient:           rfqClient,
+			UniverseClient:      universeClient,
+		},
 	}
+
+	t.Cleanup(func() {
+		err := conn.Close()
+		require.NoError(t, err)
+	})
+
+	return client
+}
+
+func getLndClient(t *testing.T, ctx context.Context,
+	cfg *LndConfig) *rpc.HarnessRPC {
+
+	creds := credentials.NewTLS(&tls.Config{})
+	if cfg.TLSPath != "" {
+		// Load the certificate file now, if specified.
+		tlsCert, err := os.ReadFile(cfg.TLSPath)
+		require.NoError(t, err)
+
+		cp := x509.NewCertPool()
+		ok := cp.AppendCertsFromPEM(tlsCert)
+		require.True(t, ok)
+
+		creds = credentials.NewClientTLSFromCert(cp, "")
+	}
+
+	// Create a dial options array.
+	opts := []grpc.DialOption{
+		grpc.WithTransportCredentials(creds),
+		grpc.WithDefaultCallOptions(tap.MaxMsgReceiveSize),
+	}
+
+	if cfg.MacPath != "" {
+		macBytes, err := os.ReadFile(cfg.MacPath)
+		require.NoError(t, err)
+
+		mac := &macaroon.Macaroon{}
+		err = mac.UnmarshalBinary(macBytes)
+		require.NoError(t, err)
+
+		macCred, err := macaroons.NewMacaroonCredential(mac)
+		require.NoError(t, err)
+
+		opts = append(opts, grpc.WithPerRPCCredentials(macCred))
+	}
+
+	svrAddr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
+	conn, err := grpc.DialContext(ctx, svrAddr, opts...)
+	require.NoError(t, err)
+
+	client := rpc.NewHarnessRPC(ctx, t, conn, cfg.Name)
 
 	t.Cleanup(func() {
 		err := conn.Close()
@@ -215,4 +301,93 @@ func getBitcoinConn(t *testing.T, cfg *BitcoinConfig) *rpcclient.Client {
 	require.NoError(t, err)
 
 	return client
+}
+
+// stringToAssetType converts a string of an asset type to its respective taprpc
+// type enum value.
+func stringToAssetType(t string) taprpc.AssetType {
+	switch t {
+	case "collectible":
+		return taprpc.AssetType_COLLECTIBLE
+
+	default:
+		return taprpc.AssetType_NORMAL
+	}
+}
+
+// noopBaseUni is a dummy implementation of the universe.DiffEngine and
+// universe.LocalRegistrar interfaces. This is meant to be used by the simple
+// syncer used in the sync loadtest. As we don't care about persistence and we
+// always want to do a full sync, we always return an empty root node to trigger
+// a sync.
+type noopBaseUni struct{}
+
+// RootNode returns the root node of the base universe corresponding to the
+// passed ID.
+func (n noopBaseUni) RootNode(ctx context.Context,
+	id universe.Identifier) (universe.Root, error) {
+
+	return universe.Root{
+		Node: mssmt.EmptyLeafNode,
+	}, nil
+}
+
+// RootNodes returns the set of root nodes for all known base universes assets.
+func (n noopBaseUni) RootNodes(ctx context.Context,
+	q universe.RootNodesQuery) ([]universe.Root, error) {
+
+	return nil, nil
+}
+
+// MultiverseRoot returns the root node of the multiverse for the specified
+// proof type. If the given list of universe IDs is non-empty, then the root
+// will be calculated just for those universes.
+func (n *noopBaseUni) MultiverseRoot(ctx context.Context,
+	proofType universe.ProofType,
+	filterByIDs []universe.Identifier) (fn.Option[universe.MultiverseRoot],
+	error) {
+
+	return fn.None[universe.MultiverseRoot](), nil
+}
+
+// UpsertProofLeaf attempts to upsert a proof for an asset issuance or transfer
+// event. This method will return an error if the passed proof is invalid. If
+// the leaf is already known, then no action is taken and the existing
+// commitment proof returned.
+func (n noopBaseUni) UpsertProofLeaf(ctx context.Context,
+	id universe.Identifier, key universe.LeafKey,
+	leaf *universe.Leaf) (*universe.Proof, error) {
+
+	return nil, nil
+}
+
+// UpsertProofLeafBatch inserts a batch of proof leaves within the target
+// universe tree. We assume the proofs within the batch have already been
+// checked that they don't yet exist in the local database.
+func (n noopBaseUni) UpsertProofLeafBatch(ctx context.Context,
+	items []*universe.Item) error {
+
+	return nil
+}
+
+// Close closes the noopBaseUni, stopping all goroutines and freeing all
+// resources.
+func (n noopBaseUni) Close() error {
+	return nil
+}
+
+// FetchProofLeaf attempts to fetch a proof leaf for the target leaf key
+// and given a universe identifier (assetID/groupKey).
+func (n noopBaseUni) FetchProofLeaf(ctx context.Context, id universe.Identifier,
+	key universe.LeafKey) ([]*universe.Proof, error) {
+
+	return nil, nil
+}
+
+// UniverseLeafKeys returns the set of leaf keys known for the specified
+// universe identifier.
+func (n noopBaseUni) UniverseLeafKeys(ctx context.Context,
+	q universe.UniverseLeafKeysQuery) ([]universe.LeafKey, error) {
+
+	return nil, nil
 }

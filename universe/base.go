@@ -28,6 +28,10 @@ type ArchiveConfig struct {
 	// genesis proof.
 	HeaderVerifier proof.HeaderVerifier
 
+	// MerkleVerifier is used to verify the validity of the transaction
+	// merkle proof.
+	MerkleVerifier proof.MerkleVerifier
+
 	// GroupVerifier is used to verify the validity of the group key for a
 	// genesis proof.
 	GroupVerifier proof.GroupVerifier
@@ -39,6 +43,10 @@ type ArchiveConfig struct {
 	// UniverseStats is used to export statistics related to the set of
 	// external/internal queries to the base universe instance.
 	UniverseStats Telemetry
+
+	// ChainLookupGenerator is the main interface for generating a chain
+	// lookup interface that is required to validate proofs.
+	ChainLookupGenerator proof.ChainLookupGenerator
 
 	// TODO(roasbeef): query re genesis asset known?
 
@@ -284,9 +292,7 @@ func (a *Archive) UpsertProofLeaf(ctx context.Context, id Identifier,
 	// Before we can validate a non-issuance proof we need to fetch the
 	// previous asset snapshot (which is the proof verification result for
 	// the previous/parent proof in the proof file).
-	prevAssetSnapshot, err := a.getPrevAssetSnapshot(
-		ctx, id, newAsset, nil,
-	)
+	prevAssetSnapshot, err := a.getPrevAssetSnapshot(ctx, id, newAsset, nil)
 	if err != nil {
 		return nil, fmt.Errorf("unable to fetch previous asset "+
 			"snapshot: %w", err)
@@ -306,7 +312,7 @@ func (a *Archive) UpsertProofLeaf(ctx context.Context, id Identifier,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("unable to register new "+
-			"issuance: %v", err)
+			"issuance: %w", err)
 	}
 
 	// Log a sync event for the newly inserted leaf in the background as an
@@ -330,12 +336,29 @@ func (a *Archive) verifyIssuanceProof(ctx context.Context, id Identifier,
 	key LeafKey, newProof *proof.Proof,
 	prevAssetSnapshot *proof.AssetSnapshot) (*proof.AssetSnapshot, error) {
 
+	vCtx := proof.VerifierCtx{
+		HeaderVerifier: a.cfg.HeaderVerifier,
+		MerkleVerifier: a.cfg.MerkleVerifier,
+		GroupVerifier:  a.cfg.GroupVerifier,
+		ChainLookupGen: a.cfg.ChainLookupGenerator,
+	}
+
+	lookup, err := a.cfg.ChainLookupGenerator.GenProofChainLookup(newProof)
+	if err != nil {
+		return nil, fmt.Errorf("unable to generate chain lookup: %w",
+			err)
+	}
+
 	assetSnapshot, err := newProof.Verify(
-		ctx, prevAssetSnapshot, a.cfg.HeaderVerifier,
-		a.cfg.GroupVerifier,
+		ctx, prevAssetSnapshot, lookup, vCtx,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("unable to verify proof: %v", err)
+		var skBytes []byte
+		scriptKey := key.LeafScriptKey()
+		skBytes = scriptKey.PubKey.SerializeCompressed()
+		return nil, fmt.Errorf("unable to verify proof (%v, "+
+			"outpoint=%v, scriptKey=%x): %w", id.StringForLog(),
+			key.LeafOutPoint().String(), skBytes, err)
 	}
 
 	newAsset := assetSnapshot.Asset
@@ -359,9 +382,9 @@ func (a *Archive) verifyIssuanceProof(ctx context.Context, id Identifier,
 			id.AssetID, newAsset.ID())
 
 	// The script key should also match exactly.
-	case !newAsset.ScriptKey.PubKey.IsEqual(key.ScriptKey.PubKey):
+	case !newAsset.ScriptKey.PubKey.IsEqual(key.LeafScriptKey().PubKey):
 		return nil, fmt.Errorf("script key mismatch: expected %v, got "+
-			"%v", key.ScriptKey.PubKey.SerializeCompressed(),
+			"%v", key.LeafScriptKey().PubKey.SerializeCompressed(),
 			newAsset.ScriptKey.PubKey.SerializeCompressed())
 	}
 
@@ -389,10 +412,10 @@ func (a *Archive) UpsertProofLeafBatch(ctx context.Context,
 	log.Infof("Verifying %d new proofs for insertion into Universe",
 		len(items))
 
-	// Issuances that also create an asset group, group anchors, must be
-	// verified and stored before any issuances that may be reissuances into
-	// the same asset group. This is required for proper verification of
-	// reissuances, which may be in this batch.
+	// Issuance proofs that also create an asset group (a.k.a. group
+	// anchors) must be verified and stored before any issuance proofs that
+	// may be re-issuances into the same asset group. This is required for
+	// proper verification of re-issuances, which may be in this batch.
 	var anchorItems []*Item
 	nonAnchorItems := make([]*Item, 0, len(items))
 	assetProofs := make(map[LeafKey]*proof.Proof)
@@ -462,7 +485,8 @@ func (a *Archive) UpsertProofLeafBatch(ctx context.Context,
 				}
 
 				assetSnapshot, err := a.verifyIssuanceProof(
-					ctx, i.ID, i.Key, assetProof, prevAssets,
+					ctx, i.ID, i.Key, assetProof,
+					prevAssets,
 				)
 				if err != nil {
 					return err
@@ -474,8 +498,8 @@ func (a *Archive) UpsertProofLeafBatch(ctx context.Context,
 			},
 		)
 		if err != nil {
-			return fmt.Errorf("unable to verify issuance proofs: "+
-				"%w", err)
+			return fmt.Errorf("unable to batch verify issuance "+
+				"proofs: %w", err)
 		}
 
 		return nil
@@ -550,16 +574,14 @@ func (a *Archive) getPrevAssetSnapshot(ctx context.Context,
 	}
 
 	// Parse script key for previous asset.
-	prevScriptKeyPubKey, err := btcec.ParsePubKey(
-		prevID.ScriptKey[:],
-	)
+	prevScriptKeyPubKey, err := btcec.ParsePubKey(prevID.ScriptKey[:])
 	if err != nil {
 		return nil, fmt.Errorf("unable to parse previous "+
-			"script key: %v", err)
+			"script key: %w", err)
 	}
 	prevScriptKey := asset.NewScriptKey(prevScriptKeyPubKey)
 
-	prevLeafKey := LeafKey{
+	prevLeafKey := BaseLeafKey{
 		OutPoint:  prevID.OutPoint,
 		ScriptKey: &prevScriptKey,
 	}

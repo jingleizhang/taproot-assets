@@ -7,13 +7,15 @@ import (
 	"encoding/binary"
 	"fmt"
 
-	"github.com/btcsuite/btclog"
+	"github.com/btcsuite/btclog/v2"
+	"github.com/davecgh/go-spew/spew"
 	"github.com/lightninglabs/lndclient"
 	tap "github.com/lightninglabs/taproot-assets"
 	"github.com/lightninglabs/taproot-assets/address"
 	"github.com/lightninglabs/taproot-assets/asset"
-	"github.com/lightninglabs/taproot-assets/fn"
 	"github.com/lightninglabs/taproot-assets/proof"
+	"github.com/lightninglabs/taproot-assets/rfq"
+	"github.com/lightninglabs/taproot-assets/tapchannel"
 	"github.com/lightninglabs/taproot-assets/tapdb"
 	"github.com/lightninglabs/taproot-assets/tapdb/sqlc"
 	"github.com/lightninglabs/taproot-assets/tapfreighter"
@@ -23,36 +25,35 @@ import (
 	"github.com/lightningnetwork/lnd"
 	"github.com/lightningnetwork/lnd/clock"
 	"github.com/lightningnetwork/lnd/signal"
-	"github.com/lightningnetwork/lnd/ticker"
 )
-
-// databaseBackend is an interface that contains all methods our different
-// database backends implement.
-type databaseBackend interface {
-	tapdb.BatchedQuerier
-	WithTx(tx *sql.Tx) *sqlc.Queries
-}
 
 // genServerConfig generates a server config from the given tapd config.
 //
 // NOTE: The RPCConfig and SignalInterceptor fields must be set by the caller
 // after generating the server config.
 func genServerConfig(cfg *Config, cfgLogger btclog.Logger,
-	lndServices *lndclient.LndServices,
+	lndServices *lndclient.LndServices, enableChannelFeatures bool,
 	mainErrChan chan<- error) (*tap.Config, error) {
 
-	var err error
+	var (
+		err    error
+		db     tapdb.DatabaseBackend
+		dbType sqlc.BackendType
+	)
 
 	// Now that we know where the database will live, we'll go ahead and
 	// open up the default implementation of it.
-	var db databaseBackend
 	switch cfg.DatabaseBackend {
 	case DatabaseBackendSqlite:
+		dbType = sqlc.BackendTypeSqlite
+
 		cfgLogger.Infof("Opening sqlite3 database at: %v",
 			cfg.Sqlite.DatabaseFileName)
 		db, err = tapdb.NewSqliteStore(cfg.Sqlite)
 
 	case DatabaseBackendPostgres:
+		dbType = sqlc.BackendTypePostgres
+
 		cfgLogger.Infof("Opening postgres database at: %v",
 			cfg.Postgres.DSN(true))
 		db, err = tapdb.NewPostgresStore(cfg.Postgres)
@@ -62,7 +63,7 @@ func genServerConfig(cfg *Config, cfgLogger btclog.Logger,
 			cfg.DatabaseBackend)
 	}
 	if err != nil {
-		return nil, fmt.Errorf("unable to open database: %v", err)
+		return nil, fmt.Errorf("unable to open database: %w", err)
 	}
 
 	defaultClock := clock.NewDefaultClock()
@@ -84,6 +85,12 @@ func genServerConfig(cfg *Config, cfgLogger btclog.Logger,
 		},
 	)
 
+	metaDB := tapdb.NewTransactionExecutor(
+		db, func(tx *sql.Tx) tapdb.MetaStore {
+			return db.WithTx(tx)
+		},
+	)
+
 	addrBookDB := tapdb.NewTransactionExecutor(
 		db, func(tx *sql.Tx) tapdb.AddrBook {
 			return db.WithTx(tx)
@@ -93,12 +100,15 @@ func genServerConfig(cfg *Config, cfgLogger btclog.Logger,
 	tapdbAddrBook := tapdb.NewTapAddressBook(
 		addrBookDB, &tapChainParams, defaultClock,
 	)
+	assetStore := tapdb.NewAssetStore(assetDB, metaDB, defaultClock, dbType)
 
 	keyRing := tap.NewLndRpcKeyRing(lndServices)
 	walletAnchor := tap.NewLndRpcWalletAnchor(lndServices)
-	chainBridge := tap.NewLndRpcChainBridge(lndServices)
-
-	assetStore := tapdb.NewAssetStore(assetDB, defaultClock)
+	chainBridge := tap.NewLndRpcChainBridge(lndServices, assetStore)
+	msgTransportClient := tap.NewLndMsgTransportClient(lndServices)
+	lndRouterClient := tap.NewLndRouterClient(lndServices)
+	lndInvoicesClient := tap.NewLndInvoicesClient(lndServices)
+	lndFeatureBitsVerifier := tap.NewLndFeatureBitVerifier(lndServices)
 
 	uniDB := tapdb.NewTransactionExecutor(
 		db, func(tx *sql.Tx) tapdb.BaseUniverseStore {
@@ -110,7 +120,15 @@ func genServerConfig(cfg *Config, cfgLogger btclog.Logger,
 			return db.WithTx(tx)
 		},
 	)
-	multiverse := tapdb.NewMultiverseStore(multiverseDB)
+
+	cfgLogger.Debugf("multiverse_cache=%v",
+		spew.Sdump(cfg.Universe.MultiverseCaches))
+
+	multiverse := tapdb.NewMultiverseStore(
+		multiverseDB, &tapdb.MultiverseStoreConfig{
+			Caches: *cfg.Universe.MultiverseCaches,
+		},
+	)
 
 	uniStatsDB := tapdb.NewTransactionExecutor(
 		db, func(tx *sql.Tx) tapdb.UniverseStatsStore {
@@ -142,10 +160,12 @@ func genServerConfig(cfg *Config, cfgLogger btclog.Logger,
 				uniDB, id,
 			)
 		},
-		HeaderVerifier: headerVerifier,
-		GroupVerifier:  groupVerifier,
-		Multiverse:     multiverse,
-		UniverseStats:  universeStats,
+		HeaderVerifier:       headerVerifier,
+		MerkleVerifier:       proof.DefaultMerkleVerifier,
+		GroupVerifier:        groupVerifier,
+		ChainLookupGenerator: chainBridge,
+		Multiverse:           multiverse,
+		UniverseStats:        universeStats,
 	}
 
 	federationStore := tapdb.NewTransactionExecutor(db,
@@ -159,7 +179,7 @@ func genServerConfig(cfg *Config, cfgLogger btclog.Logger,
 
 	proofFileStore, err := proof.NewFileArchiver(cfg.networkDir)
 	if err != nil {
-		return nil, fmt.Errorf("unable to open disk archive: %v", err)
+		return nil, fmt.Errorf("unable to open disk archive: %w", err)
 	}
 	proofArchive := proof.NewMultiArchiver(
 		&proof.BaseVerifier{}, tapdb.DefaultStoreTimeout,
@@ -169,12 +189,19 @@ func genServerConfig(cfg *Config, cfgLogger btclog.Logger,
 	federationMembers := cfg.Universe.FederationServers
 	switch cfg.ChainConf.Network {
 	case "mainnet":
-		cfgLogger.Infof("Configuring %v as initial Universe "+
-			"federation server", defaultMainnetFederationServer)
+		// Add our default mainnet federation server to the list of
+		// federation servers if not disabled by the user for privacy
+		// reasons.
+		if !cfg.Universe.NoDefaultFederation {
+			cfgLogger.Infof("Configuring %v as initial Universe "+
+				"federation server",
+				defaultMainnetFederationServer)
 
-		federationMembers = append(
-			federationMembers, defaultMainnetFederationServer,
-		)
+			federationMembers = append(
+				federationMembers,
+				defaultMainnetFederationServer,
+			)
+		}
 
 		// For mainnet, we need to overwrite the default universe proof
 		// courier address to use the mainnet server.
@@ -186,12 +213,19 @@ func genServerConfig(cfg *Config, cfgLogger btclog.Logger,
 		}
 
 	case "testnet":
-		cfgLogger.Infof("Configuring %v as initial Universe "+
-			"federation server", defaultTestnetFederationServer)
+		// Add our default testnet federation server to the list of
+		// federation servers if not disabled by the user for privacy
+		// reasons.
+		if !cfg.Universe.NoDefaultFederation {
+			cfgLogger.Infof("Configuring %v as initial Universe "+
+				"federation server",
+				defaultTestnetFederationServer)
 
-		federationMembers = append(
-			federationMembers, defaultTestnetFederationServer,
-		)
+			federationMembers = append(
+				federationMembers,
+				defaultTestnetFederationServer,
+			)
+		}
 
 	default:
 		// For any other network, such as regtest, we can't use a
@@ -217,7 +251,7 @@ func genServerConfig(cfg *Config, cfgLogger btclog.Logger,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("unable to parse fallback proof "+
-			"courier address: %v", err)
+			"courier address: %w", err)
 	}
 
 	// If default proof courier address is set, use it as the default.
@@ -227,7 +261,7 @@ func genServerConfig(cfg *Config, cfgLogger btclog.Logger,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("unable to parse default proof "+
-				"courier address: %v", err)
+				"courier address: %w", err)
 		}
 	}
 
@@ -238,22 +272,13 @@ func genServerConfig(cfg *Config, cfgLogger btclog.Logger,
 		),
 		ProofArchive: proofArchive,
 		NonBuriedAssetFetcher: func(ctx context.Context,
-			minHeight int32) ([]*asset.Asset, error) {
+			minHeight int32) ([]*asset.ChainAsset, error) {
 
-			assets, err := assetStore.FetchAllAssets(
+			return assetStore.FetchAllAssets(
 				ctx, false, true, &tapdb.AssetQueryFilters{
 					MinAnchorHeight: minHeight,
 				},
 			)
-			if err != nil {
-				return nil, err
-			}
-
-			return fn.Map(
-				assets, func(a *tapdb.ChainAsset) *asset.Asset {
-					return a.Asset
-				},
-			), nil
 		},
 		SafeDepth: cfg.ReOrgSafeDepth,
 		ErrChan:   mainErrChan,
@@ -271,7 +296,7 @@ func genServerConfig(cfg *Config, cfgLogger btclog.Logger,
 	var runtimeIDBytes [8]byte
 	_, err = rand.Read(runtimeIDBytes[:])
 	if err != nil {
-		return nil, fmt.Errorf("unable to generate runtime ID: %v", err)
+		return nil, fmt.Errorf("unable to generate runtime ID: %w", err)
 	}
 
 	runtimeID := int64(binary.BigEndian.Uint64(runtimeIDBytes[:]))
@@ -308,14 +333,15 @@ func genServerConfig(cfg *Config, cfgLogger btclog.Logger,
 	virtualTxSigner := tap.NewLndRpcVirtualTxSigner(lndServices)
 	coinSelect := tapfreighter.NewCoinSelect(assetStore)
 	assetWallet := tapfreighter.NewAssetWallet(&tapfreighter.WalletConfig{
-		CoinSelector: coinSelect,
-		AssetProofs:  proofArchive,
-		AddrBook:     tapdbAddrBook,
-		KeyRing:      keyRing,
-		Signer:       virtualTxSigner,
-		TxValidator:  &tap.ValidatorV0{},
-		Wallet:       walletAnchor,
-		ChainParams:  &tapChainParams,
+		CoinSelector:     coinSelect,
+		AssetProofs:      proofArchive,
+		AddrBook:         tapdbAddrBook,
+		KeyRing:          keyRing,
+		Signer:           virtualTxSigner,
+		TxValidator:      &tap.ValidatorV0{},
+		WitnessValidator: &tap.WitnessValidatorV0{},
+		Wallet:           walletAnchor,
+		ChainParams:      &tapChainParams,
 	})
 
 	// Addresses can have different proof couriers configured, but both
@@ -325,21 +351,192 @@ func genServerConfig(cfg *Config, cfgLogger btclog.Logger,
 		HashMailCfg:    cfg.HashMailCourier,
 		UniverseRpcCfg: cfg.UniverseRpcCourier,
 		TransferLog:    assetStore,
+		LocalArchive:   proofArchive,
 	})
 
 	multiNotifier := proof.NewMultiArchiveNotifier(assetStore, multiverse)
 
+	// Determine whether we should use the mock price oracle service or a
+	// real price oracle service.
+	var priceOracle rfq.PriceOracle
+
+	rfqCfg := cfg.Experimental.Rfq
+	switch rfqCfg.PriceOracleAddress {
+	case rfq.MockPriceOracleServiceAddress:
+		switch {
+		case rfqCfg.MockOracleAssetsPerBTC > 0:
+			priceOracle = rfq.NewMockPriceOracle(
+				3600, rfqCfg.MockOracleAssetsPerBTC,
+			)
+
+		case rfqCfg.MockOracleSatsPerAsset > 0:
+			priceOracle = rfq.NewMockPriceOracleSatPerAsset(
+				3600, rfqCfg.MockOracleSatsPerAsset,
+			)
+		}
+
+	case "":
+		// Leave the price oracle as nil, which will cause the RFQ
+		// manager to reject all incoming RFQ requests. It will also
+		// skip setting suggested prices for outgoing quote requests.
+
+	default:
+		priceOracle, err = rfq.NewRpcPriceOracle(
+			rfqCfg.PriceOracleAddress, false,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("unable to create price "+
+				"oracle: %w", err)
+		}
+	}
+
+	// Construct the RFQ manager.
+	rfqManager, err := rfq.NewManager(
+		rfq.ManagerCfg{
+			PeerMessenger:   msgTransportClient,
+			HtlcInterceptor: lndRouterClient,
+			HtlcSubscriber:  lndRouterClient,
+			PriceOracle:     priceOracle,
+			ChannelLister:   walletAnchor,
+			GroupLookup:     tapdbAddrBook,
+			AliasManager:    lndRouterClient,
+			// nolint: lll
+			AcceptPriceDeviationPpm: rfqCfg.AcceptPriceDeviationPpm,
+			// nolint: lll
+			SkipAcceptQuotePriceCheck: rfqCfg.SkipAcceptQuotePriceCheck,
+			ErrChan:                   mainErrChan,
+		},
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	// For the porter, we'll make a multi-notifier comprised of all the
+	// possible proof file sources to ensure it can always fetch input
+	// proofs.
+	porterProofReader := proof.NewMultiArchiveNotifier(
+		assetStore, multiverse, proofFileStore,
+	)
+	chainPorter := tapfreighter.NewChainPorter(
+		&tapfreighter.ChainPorterConfig{
+			Signer:      virtualTxSigner,
+			TxValidator: &tap.ValidatorV0{},
+			ExportLog:   assetStore,
+			ChainBridge: chainBridge,
+			GroupVerifier: tapgarden.GenGroupVerifier(
+				context.Background(), assetMintingStore,
+			),
+			Wallet:                 walletAnchor,
+			KeyRing:                keyRing,
+			AssetWallet:            assetWallet,
+			ProofReader:            porterProofReader,
+			ProofWriter:            proofFileStore,
+			ProofCourierDispatcher: proofCourierDispatcher,
+			ProofWatcher:           reOrgWatcher,
+			ErrChan:                mainErrChan,
+		},
+	)
+
+	auxLeafSigner := tapchannel.NewAuxLeafSigner(
+		&tapchannel.LeafSignerConfig{
+			ChainParams: &tapChainParams,
+			Signer:      assetWallet,
+		},
+	)
+	channelFunder := tap.NewLndPbstChannelFunder(lndServices)
+	auxFundingController := tapchannel.NewFundingController(
+		tapchannel.FundingControllerCfg{
+			HeaderVerifier: headerVerifier,
+			GroupVerifier: tapgarden.GenGroupVerifier(
+				context.Background(), assetMintingStore,
+			),
+			ErrReporter:        msgTransportClient,
+			AssetWallet:        assetWallet,
+			CoinSelector:       coinSelect,
+			AddrBook:           tapdbAddrBook,
+			ChainParams:        tapChainParams,
+			ChainBridge:        chainBridge,
+			GroupKeyIndex:      tapdbAddrBook,
+			PeerMessenger:      msgTransportClient,
+			ChannelFunder:      channelFunder,
+			TxPublisher:        chainBridge,
+			ChainWallet:        walletAnchor,
+			RfqManager:         rfqManager,
+			TxSender:           chainPorter,
+			DefaultCourierAddr: proofCourierAddr,
+			AssetSyncer:        addrBook,
+			FeatureBits:        lndFeatureBitsVerifier,
+			ErrChan:            mainErrChan,
+		},
+	)
+	auxTrafficShaper := tapchannel.NewAuxTrafficShaper(
+		&tapchannel.TrafficShaperConfig{
+			ChainParams: &tapChainParams,
+			RfqManager:  rfqManager,
+		},
+	)
+	auxInvoiceManager := tapchannel.NewAuxInvoiceManager(
+		&tapchannel.InvoiceManagerConfig{
+			ChainParams:         &tapChainParams,
+			InvoiceHtlcModifier: lndInvoicesClient,
+			RfqManager:          rfqManager,
+			LightningClient:     lndServices.Client,
+		},
+	)
+	auxChanCloser := tapchannel.NewAuxChanCloser(
+		tapchannel.AuxChanCloserCfg{
+			ChainParams:        &tapChainParams,
+			AddrBook:           addrBook,
+			TxSender:           chainPorter,
+			DefaultCourierAddr: proofCourierAddr,
+			ProofArchive:       proofArchive,
+			ProofFetcher:       proofCourierDispatcher,
+			HeaderVerifier:     headerVerifier,
+			GroupVerifier: tapgarden.GenGroupVerifier(
+				context.Background(), assetMintingStore,
+			),
+			ChainBridge: chainBridge,
+		},
+	)
+	auxSweeper := tapchannel.NewAuxSweeper(
+		&tapchannel.AuxSweeperCfg{
+			AddrBook:           addrBook,
+			ChainParams:        tapChainParams,
+			Signer:             assetWallet,
+			TxSender:           chainPorter,
+			DefaultCourierAddr: proofCourierAddr,
+			ProofArchive:       proofArchive,
+			ProofFetcher:       proofCourierDispatcher,
+			HeaderVerifier:     headerVerifier,
+			GroupVerifier: tapgarden.GenGroupVerifier(
+				context.Background(), assetMintingStore,
+			),
+			ChainBridge: chainBridge,
+		},
+	)
+
+	// Parse the universe public access status.
+	universePublicAccess, err := tap.ParseUniversePublicAccessStatus(
+		cfg.Universe.PublicAccess,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("unable to parse universe public "+
+			"access status: %w", err)
+	}
+
 	return &tap.Config{
-		DebugLevel:   cfg.DebugLevel,
-		RuntimeID:    runtimeID,
-		Lnd:          lndServices,
-		ChainParams:  cfg.ActiveNetParams,
-		ReOrgWatcher: reOrgWatcher,
+		DebugLevel:            cfg.DebugLevel,
+		RuntimeID:             runtimeID,
+		EnableChannelFeatures: enableChannelFeatures,
+		Lnd:                   lndServices,
+		ChainParams:           tapChainParams,
+		ReOrgWatcher:          reOrgWatcher,
 		AssetMinter: tapgarden.NewChainPlanter(tapgarden.PlanterConfig{
 			GardenKit: tapgarden.GardenKit{
 				Wallet:                walletAnchor,
 				ChainBridge:           chainBridge,
 				Log:                   assetMintingStore,
+				TreeStore:             assetMintingStore,
 				KeyRing:               keyRing,
 				GenSigner:             virtualTxSigner,
 				GenTxBuilder:          &tapscript.GroupTxBuilder{},
@@ -349,59 +546,52 @@ func genServerConfig(cfg *Config, cfgLogger btclog.Logger,
 				ProofWatcher:          reOrgWatcher,
 				UniversePushBatchSize: defaultUniverseSyncBatchSize,
 			},
-			BatchTicker:  ticker.NewForce(cfg.BatchMintingInterval),
+			ChainParams:  tapChainParams,
 			ProofUpdates: proofArchive,
 			ErrChan:      mainErrChan,
 		}),
-		AssetCustodian: tapgarden.NewCustodian(
-			&tapgarden.CustodianConfig{
-				ChainParams:  &tapChainParams,
-				WalletAnchor: walletAnchor,
-				ChainBridge:  chainBridge,
-				GroupVerifier: tapgarden.GenGroupVerifier(
-					context.Background(), assetMintingStore,
-				),
-				AddrBook:               addrBook,
-				ProofArchive:           proofArchive,
-				ProofNotifier:          multiNotifier,
-				ErrChan:                mainErrChan,
-				ProofCourierDispatcher: proofCourierDispatcher,
-				ProofRetrievalDelay:    cfg.CustodianProofRetrievalDelay, ProofWatcher: reOrgWatcher,
-			},
-		),
-		ChainBridge:             chainBridge,
-		AddrBook:                addrBook,
-		AddrBookDisableSyncer:   cfg.AddrBook.DisableSyncer,
-		DefaultProofCourierAddr: proofCourierAddr,
-		ProofArchive:            proofArchive,
-		AssetWallet:             assetWallet,
-		CoinSelect:              coinSelect,
-		ChainPorter: tapfreighter.NewChainPorter(
-			&tapfreighter.ChainPorterConfig{
-				Signer:      virtualTxSigner,
-				TxValidator: &tap.ValidatorV0{},
-				ExportLog:   assetStore,
-				ChainBridge: chainBridge,
-				GroupVerifier: tapgarden.GenGroupVerifier(
-					context.Background(), assetMintingStore,
-				),
-				Wallet:                 walletAnchor,
-				KeyRing:                keyRing,
-				AssetWallet:            assetWallet,
-				AssetProofs:            proofFileStore,
-				ProofCourierDispatcher: proofCourierDispatcher,
-				ProofWatcher:           reOrgWatcher,
-				ErrChan:                mainErrChan,
-			},
-		),
+		// nolint: lll
+		AssetCustodian: tapgarden.NewCustodian(&tapgarden.CustodianConfig{
+			ChainParams:  &tapChainParams,
+			WalletAnchor: walletAnchor,
+			ChainBridge:  chainBridge,
+			GroupVerifier: tapgarden.GenGroupVerifier(
+				context.Background(), assetMintingStore,
+			),
+			AddrBook:               addrBook,
+			ProofArchive:           proofArchive,
+			ProofNotifier:          multiNotifier,
+			ErrChan:                mainErrChan,
+			ProofCourierDispatcher: proofCourierDispatcher,
+			ProofRetrievalDelay:    cfg.CustodianProofRetrievalDelay,
+			ProofWatcher:           reOrgWatcher,
+		}),
+		ChainBridge:              chainBridge,
+		AddrBook:                 addrBook,
+		AddrBookDisableSyncer:    cfg.AddrBook.DisableSyncer,
+		DefaultProofCourierAddr:  proofCourierAddr,
+		ProofArchive:             proofArchive,
+		AssetWallet:              assetWallet,
+		CoinSelect:               coinSelect,
+		ChainPorter:              chainPorter,
 		UniverseArchive:          baseUni,
 		UniverseSyncer:           universeSyncer,
 		UniverseFederation:       universeFederation,
+		UniFedSyncAllAssets:      cfg.Universe.SyncAllAssets,
 		UniverseStats:            universeStats,
-		UniversePublicAccess:     cfg.Universe.PublicAccess,
+		UniversePublicAccess:     universePublicAccess,
 		UniverseQueriesPerSecond: cfg.Universe.UniverseQueriesPerSecond,
 		UniverseQueriesBurst:     cfg.Universe.UniverseQueriesBurst,
+		RfqManager:               rfqManager,
+		PriceOracle:              priceOracle,
+		AuxLeafSigner:            auxLeafSigner,
+		AuxFundingController:     auxFundingController,
+		AuxChanCloser:            auxChanCloser,
+		AuxTrafficShaper:         auxTrafficShaper,
+		AuxInvoiceManager:        auxInvoiceManager,
+		AuxSweeper:               auxSweeper,
 		LogWriter:                cfg.LogWriter,
+		LogMgr:                   cfg.LogMgr,
 		DatabaseConfig: &tap.DatabaseConfig{
 			RootKeyStore: tapdb.NewRootKeyStore(rksDB),
 			MintingStore: assetMintingStore,
@@ -417,7 +607,7 @@ func genServerConfig(cfg *Config, cfgLogger btclog.Logger,
 // CreateServerFromConfig creates a new Taproot Asset server from the given CLI
 // config.
 func CreateServerFromConfig(cfg *Config, cfgLogger btclog.Logger,
-	shutdownInterceptor signal.Interceptor,
+	shutdownInterceptor signal.Interceptor, enableChannelFeatures bool,
 	mainErrChan chan<- error) (*tap.Server, error) {
 
 	// Given the config above, grab the TLS config which includes the set
@@ -427,7 +617,7 @@ func CreateServerFromConfig(cfg *Config, cfgLogger btclog.Logger,
 		cfg, cfgLogger,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("unable to load TLS credentials: %v",
+		return nil, fmt.Errorf("unable to load TLS credentials: %w",
 			err)
 	}
 
@@ -437,16 +627,17 @@ func CreateServerFromConfig(cfg *Config, cfgLogger btclog.Logger,
 		cfg.ChainConf.Network, cfg.Lnd, shutdownInterceptor,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("unable to connect to lnd node: %v", err)
+		return nil, fmt.Errorf("unable to connect to lnd node: %w", err)
 	}
 
 	cfgLogger.Infof("lnd connection initialized")
 
 	serverCfg, err := genServerConfig(
-		cfg, cfgLogger, &lndConn.LndServices, mainErrChan,
+		cfg, cfgLogger, &lndConn.LndServices, enableChannelFeatures,
+		mainErrChan,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("unable to generate server config: %v",
+		return nil, fmt.Errorf("unable to generate server config: %w",
 			err)
 	}
 
@@ -472,21 +663,19 @@ func CreateServerFromConfig(cfg *Config, cfgLogger btclog.Logger,
 		LetsEncryptDomain:          cfg.RpcConf.LetsEncryptDomain,
 	}
 
-	return tap.NewServer(serverCfg), nil
+	return tap.NewServer(&serverCfg.ChainParams, serverCfg), nil
 }
 
-// CreateSubServerFromConfig creates a new Taproot Asset server from the given
-// CLI config.
-func CreateSubServerFromConfig(cfg *Config, cfgLogger btclog.Logger,
-	lndServices *lndclient.LndServices,
-	mainErrChan chan<- error) (*tap.Server, error) {
+// ConfigureSubServer updates a Taproot Asset server with the given CLI config.
+func ConfigureSubServer(srv *tap.Server, cfg *Config, cfgLogger btclog.Logger,
+	lndServices *lndclient.LndServices, litdIntegrated bool,
+	mainErrChan chan<- error) error {
 
 	serverCfg, err := genServerConfig(
-		cfg, cfgLogger, lndServices, mainErrChan,
+		cfg, cfgLogger, lndServices, litdIntegrated, mainErrChan,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("unable to generate server config: %v",
-			err)
+		return fmt.Errorf("unable to generate server config: %w", err)
 	}
 
 	serverCfg.RPCConfig = &tap.RPCConfig{
@@ -494,5 +683,7 @@ func CreateSubServerFromConfig(cfg *Config, cfgLogger btclog.Logger,
 		MacaroonPath: cfg.RpcConf.MacaroonPath,
 	}
 
-	return tap.NewServer(serverCfg), nil
+	srv.UpdateConfig(serverCfg)
+
+	return nil
 }
